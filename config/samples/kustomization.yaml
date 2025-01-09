@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- stable_v1alpha1_kredis.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

@@ -1,0 +1,23 @@
+# permissions for end users to view kredis.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: kredis-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: kredis-viewer-role
+rules:
+- apiGroups:
+  - stable.docker.direa.synology.me
+  resources:
+  - kredis
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - stable.docker.direa.synology.me
+  resources:
+  - kredis/status
+  verbs:
+  - get
