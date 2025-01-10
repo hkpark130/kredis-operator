@@ -73,7 +73,7 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
     foundSecret := &corev1.Secret{}
     secretName := reqKRedis.Spec.SecretName
-	err := r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: reqKRedis.Namespace}, foundSecret)
+	err = r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: reqKRedis.Namespace}, foundSecret)
 	if err != nil {
 		if kerrors.IsNotFound(err) {
 			log.Log.Error(err, "Required Secret defined in spec.secretName is missing", "Secret.Name", secretName)
