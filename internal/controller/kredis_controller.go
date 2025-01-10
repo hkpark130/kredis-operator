@@ -71,31 +71,16 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
-	secretName := "docker-secret" // Secret 이름
     foundSecret := &corev1.Secret{}
-    err = r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: reqKRedis.Namespace}, foundSecret)
-    if err != nil && kerrors.IsNotFound(err) {
-        // Secret이 없는 경우 생성
-        secret := createDockerRegistrySecret(
-            reqKRedis.Namespace,
-            secretName,
-            "docker.direa.synology.me", // Docker 레지스트리 URL
-            "100",                      // Docker 사용자 이름
-            "jiin",                     // Docker 비밀번호
-            "jikim@direa.co.kr",        // Docker 이메일
-        )
-
-        log.Log.Info("Creating a new Docker Registry Secret.", "Secret.Name", secretName)
-        err = r.Client.Create(ctx, secret)
-        if err != nil {
-            log.Log.Error(err, "Failed to create Secret", "Secret.Namespace", secret.Namespace, "Secret.Name", secret.Name)
-            return ctrl.Result{}, err
-        }
-    } else if err != nil {
-        // Secret 가져오기에 실패한 경우
-        log.Log.Error(err, "Failed to get Secret", "Secret.Name", secretName)
-        return ctrl.Result{}, err
-    }
+    secretName := reqKRedis.Spec.SecretName
+	err := r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: reqKRedis.Namespace}, foundSecret)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			log.Log.Error(err, "Required Secret defined in spec.secretName is missing", "Secret.Name", secretName)
+			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		}
+		return ctrl.Result{}, err
+	}
 
 	deployment := &appsv1.Deployment{}
 	err = r.Client.Get(ctx, types.NamespacedName{Name: reqKRedis.Name, Namespace: reqKRedis.Namespace}, deployment)

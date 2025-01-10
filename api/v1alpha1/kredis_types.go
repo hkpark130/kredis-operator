@@ -31,6 +31,7 @@ type KRedisSpec struct {
 	Memory   string                       `json:"memory"`
 	BasePort int32                        `json:"basePort"`
 	Resource map[string]map[string]string `json:"resource"`
+	SecretName string                     `json:"secretName"`
 }
 
 // KRedisStatus defines the observed state of KRedis
