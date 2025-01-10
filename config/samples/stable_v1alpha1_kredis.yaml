@@ -15,4 +15,4 @@ spec:
     requests:
       cpu: "2"
       memory: "2000Mi"
-  secretName: docker-secret
+  secretName: "docker-secret"
