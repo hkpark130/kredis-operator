@@ -1,8 +1,10 @@
 # redis-cluster
 
 ```
-docker build 
-push :latest
+docker build -t redis-cluster:latest .
+# docker login docker.direa.synology.me
+docker tag redis-cluster:latest docker.direa.synology.me/redis-cluster:latest
+docker push docker.direa.synology.me/redis-cluster:latest
 ```
 
 ```
