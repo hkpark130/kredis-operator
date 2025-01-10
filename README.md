@@ -161,6 +161,11 @@ docker tag park-operator public.ecr.aws/x8r0y3u4/park-operator:latest
 docker push public.ecr.aws/x8r0y3u4/park-operator:latest
 ```
 
+# docker secret 배포 (Optional)
+```
+kubectl apply -f ~/hkpark/docker-secret.yml -n kredis-operator-system
+```
+
 # Deploy the controller to the cluster
 ```
 make deploy IMG=docker.direa.synology.me/kredis-operator:latest
