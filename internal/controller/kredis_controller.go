@@ -204,7 +204,7 @@ func (r *KRedisReconciler) deploymentForKRedis(m *stablev1alpha1.KRedis) *appsv1
 						},
 					},
 					Containers: []corev1.Container{{
-						Image: "public.ecr.aws/x8r0y3u4/redis-cluster:latest",
+						Image: "docker.direa.synology.me/redis-cluster:latest",
 						Name:  "kredis",
 						Ports: []corev1.ContainerPort{{
 							ContainerPort: 6379,
