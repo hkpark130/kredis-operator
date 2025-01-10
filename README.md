@@ -183,6 +183,13 @@ make uninstall
 make undeploy
 ```
 
+# 오퍼레이터 수정후 반영까지
+```
+make docker-build docker-push IMG="docker.direa.synology.me/kredis-operator:latest"
+make generate install
+make deploy IMG=docker.direa.synology.me/kredis-operator:latest
+```
+
 ------------------------------------------------
 
 # Metrics-server
