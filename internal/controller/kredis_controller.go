@@ -154,12 +154,12 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
                         Name:  "redis-master",
                         Resources: corev1.ResourceRequirements{
 							Limits: corev1.ResourceList{
-								"cpu":    parseResource(cr.Spec.Resource["limits"], "cpu", "100m"),
-								"memory": parseResource(cr.Spec.Resource["limits"], "memory", "128Mi"),
+								"cpu":    parseResource(cr.Spec.Resource["limits"], "cpu", "1"),
+								"memory": parseResource(cr.Spec.Resource["limits"], "memory", "1Gi"),
 							},
 							Requests: corev1.ResourceList{
-								"cpu":    parseResource(cr.Spec.Resource["requests"], "cpu", "50m"),
-								"memory": parseResource(cr.Spec.Resource["requests"], "memory", "64Mi"),
+								"cpu":    parseResource(cr.Spec.Resource["requests"], "cpu", "500m"),
+								"memory": parseResource(cr.Spec.Resource["requests"], "memory", "512Mi"),
 							},
 						},
                         Env: []corev1.EnvVar{
