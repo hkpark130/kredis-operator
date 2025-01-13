@@ -18,9 +18,11 @@ package controller
 
 import (
 	"context"
-	"encoding/base64"
     "fmt"
 	"time"
+
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 
@@ -151,15 +153,15 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
                         Image: cr.Spec.Image,
                         Name:  "redis-master",
                         Resources: corev1.ResourceRequirements{
-                            Limits: corev1.ResourceList{
-                                "cpu":    resource.MustParse(cr.Spec.Resources.Limits.CPU),
-                                "memory": resource.MustParse(cr.Spec.Resources.Limits.Memory),
-                            },
-                            Requests: corev1.ResourceList{
-                                "cpu":    resource.MustParse(cr.Spec.Resources.Requests.CPU),
-                                "memory": resource.MustParse(cr.Spec.Resources.Requests.Memory),
-                            },
-                        },
+							Limits: corev1.ResourceList{
+								"cpu":    resource.MustParse(cr.Spec.Resource["limits"]["cpu"]),
+								"memory": resource.MustParse(cr.Spec.Resource["limits"]["memory"]),
+							},
+							Requests: corev1.ResourceList{
+								"cpu":    resource.MustParse(cr.Spec.Resource["requests"]["cpu"]),
+								"memory": resource.MustParse(cr.Spec.Resource["requests"]["memory"]),
+							},
+						},
                         Env: []corev1.EnvVar{
                             {
                                 Name:  "MASTER",
@@ -232,7 +234,7 @@ func (r *KRedisReconciler) serviceForKRedis(cr *stablev1alpha1.KRedis) *corev1.S
 func labelsForKRedis(name string) map[string]string {
 	return map[string]string{
 		"app": "kredis", 
-		"kredis_cr": name
+		"kredis_cr": name,
 	}
 }
 
