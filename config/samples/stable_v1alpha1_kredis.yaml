@@ -12,7 +12,10 @@ spec:
   memory: 1gb
   basePort: 10000
   resource:
+    limits:
+      cpu: "1"       # CPU 제한량 e.g., 1, 500m, etc.
+      memory: "1Gi"  # 메모리 제한량 e.g., 1Gi, 512Mi
     requests:
-      cpu: "2"
-      memory: "2000Mi"
+      cpu: "500m"    # CPU 요청량
+      memory: "512Mi" # 메모리 요청량
   secretName: "docker-secret"

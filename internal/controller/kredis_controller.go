@@ -19,7 +19,7 @@ package controller
 import (
 	"context"
     "fmt"
-	"time"
+	// "time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -30,7 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
+	// "k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -154,12 +154,12 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
                         Name:  "redis-master",
                         Resources: corev1.ResourceRequirements{
 							Limits: corev1.ResourceList{
-								"cpu":    resource.MustParse(cr.Spec.Resource["limits"]["cpu"]),
-								"memory": resource.MustParse(cr.Spec.Resource["limits"]["memory"]),
+								"cpu":    parseResource(cr.Spec.Resource["limits"], "cpu", "100m"),
+								"memory": parseResource(cr.Spec.Resource["limits"], "memory", "128Mi"),
 							},
 							Requests: corev1.ResourceList{
-								"cpu":    resource.MustParse(cr.Spec.Resource["requests"]["cpu"]),
-								"memory": resource.MustParse(cr.Spec.Resource["requests"]["memory"]),
+								"cpu":    parseResource(cr.Spec.Resource["requests"], "cpu", "50m"),
+								"memory": parseResource(cr.Spec.Resource["requests"], "memory", "64Mi"),
 							},
 						},
                         Env: []corev1.EnvVar{
@@ -227,6 +227,14 @@ func (r *KRedisReconciler) serviceForKRedis(cr *stablev1alpha1.KRedis) *corev1.S
             }},
         },
     }
+}
+
+func parseResource(resourceMap map[string]string, key string, defaultValue string) resource.Quantity {
+    value, ok := resourceMap[key]
+    if !ok || value == "" {
+        value = defaultValue
+    }
+    return resource.MustParse(value)
 }
 
 // labelsForKRedis returns the labels for selecting the resources
