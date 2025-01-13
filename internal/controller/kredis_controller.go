@@ -60,190 +60,169 @@ type KRedisReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.18.4/pkg/reconcile
 func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = log.FromContext(ctx)
-	reqKRedis := &stablev1alpha1.KRedis{}
-	err := r.Client.Get(ctx, req.NamespacedName, reqKRedis)
-	if err != nil { // custom resource를 가져오지 못 함
-		if kerrors.IsNotFound(err) {
-			log.Log.Info("KRedis resource not found.")
-			return ctrl.Result{}, nil
-		}
-		log.Log.Error(err, "Failed to get KRedis")
-		return ctrl.Result{}, err
-	}
+    log := log.FromContext(ctx)
 
-    foundSecret := &corev1.Secret{}
-    secretName := reqKRedis.Spec.SecretName
-	err = r.Client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: reqKRedis.Namespace}, foundSecret)
-	if err != nil {
-		if kerrors.IsNotFound(err) {
-			log.Log.Error(err, "Required Secret defined in spec.secretName is missing", "Secret.Name", secretName)
-			return ctrl.Result{RequeueAfter: time.Minute}, nil
-		}
-		return ctrl.Result{}, err
-	}
+    // 1. KRedis 객체를 가져옴
+    reqKRedis := &stablev1alpha1.KRedis{}
+    err := r.Client.Get(ctx, req.NamespacedName, reqKRedis)
+    if err != nil {
+        if kerrors.IsNotFound(err) {
+            log.Info("KRedis resource not found.")
+            return ctrl.Result{}, nil
+        }
+        log.Error(err, "Failed to get KRedis resource.")
+        return ctrl.Result{}, err
+    }
 
-	deployment := &appsv1.Deployment{}
-	err = r.Client.Get(ctx, types.NamespacedName{Name: reqKRedis.Name, Namespace: reqKRedis.Namespace}, deployment)
-	if err != nil && kerrors.IsNotFound(err) {
-		// Define a new deployment
-		dep := r.deploymentForKRedis(reqKRedis)
-		log.Log.Info("Creating a new Deployment.", reqKRedis.Name, reqKRedis.Namespace)
-		err = r.Client.Create(ctx, dep)
-		if err != nil {
-			log.Log.Error(err, "Failed to create new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
-			return ctrl.Result{}, err
-		}
+    // 2. Redis Master Deployment 생성
+    masterDep := r.deploymentForMaster(reqKRedis)
+    masterDeployment := &appsv1.Deployment{}
+    err = r.Client.Get(ctx, client.ObjectKey{Name: masterDep.Name, Namespace: masterDep.Namespace}, masterDeployment)
+    if err != nil && kerrors.IsNotFound(err) {
+        log.Info("Creating Master Deployment.", "Namespace", reqKRedis.Namespace, "Name", masterDep.Name)
+        err = r.Client.Create(ctx, masterDep)
+        if err != nil {
+            log.Error(err, "Failed to create Master Deployment.")
+            return ctrl.Result{}, err
+        }
+    } else if err != nil {
+        log.Error(err, "Failed to get Master Deployment.")
+        return ctrl.Result{}, err
+    }
 
-		// Define a new clusterIP
-		svc := r.clusterIPForKRedis(reqKRedis)
-		log.Log.Info("Creating a new ClusterIP.", reqKRedis.Name, reqKRedis.Namespace)
-		err = r.Client.Create(ctx, svc)
-		if err != nil {
-			log.Log.Error(err, "Failed to create new ClusterIP", "ClusterIP.Namespace", svc.Namespace, "ClusterIP.Name", svc.Name)
-			return ctrl.Result{}, err
-		}
+    // 3. Redis Slave Deployments 생성 (마스터 개수만큼 슬레이브 그룹 생성)
+    for i := int32(0); i < reqKRedis.Spec.Masters; i++ {
+        slaveDep := r.deploymentForSlave(reqKRedis, int(i))
+        slaveDeployment := &appsv1.Deployment{}
+        err = r.Client.Get(ctx, client.ObjectKey{Name: slaveDep.Name, Namespace: slaveDep.Namespace}, slaveDeployment)
+        if err != nil && kerrors.IsNotFound(err) {
+            log.Info("Creating Slave Deployment.", "Namespace", reqKRedis.Namespace, "Name", slaveDep.Name)
+            err = r.Client.Create(ctx, slaveDep)
+            if err != nil {
+                log.Error(err, "Failed to create Slave Deployment.")
+                return ctrl.Result{}, err
+            }
+        } else if err != nil {
+            log.Error(err, "Failed to get Slave Deployment.")
+            return ctrl.Result{}, err
+        }
+    }
 
-		// Deployment created successfully - return and requeue
-		return ctrl.Result{Requeue: true}, nil
-	} else if err != nil {
-		log.Log.Error(err, "Failed to get Deployment.")
-		return ctrl.Result{}, err
-	}
+    // 4. Redis Service 생성
+    svc := r.serviceForKRedis(reqKRedis)
+    service := &corev1.Service{}
+    err = r.Client.Get(ctx, client.ObjectKey{Name: svc.Name, Namespace: svc.Namespace}, service)
+    if err != nil && kerrors.IsNotFound(err) {
+        log.Info("Creating Redis Service.", "Namespace", svc.Namespace, "Name", svc.Name)
+        err = r.Client.Create(ctx, svc)
+        if err != nil {
+            log.Error(err, "Failed to create Redis Service.")
+            return ctrl.Result{}, err
+        }
+    } else if err != nil {
+        log.Error(err, "Failed to get Redis Service.")
+        return ctrl.Result{}, err
+    }
 
-	// Ensure the deployment size is the same as the spec
-	size := reqKRedis.Spec.Replicas
-	if *deployment.Spec.Replicas != size {
-		deployment.Spec.Replicas = &size
-		err = r.Client.Update(context.TODO(), deployment)
-		if err != nil {
-			log.Log.Error(err, "Failed to update Deployment.", "Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
-			return ctrl.Result{}, err
-		}
-		// Ask to requeue after 1 minute in order to give enough time for the
-		// pods be created on the cluster side and the operand be able
-		// to do the next update step accurately.
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
-	}
-
-	// Update the KRedis status with the pod names
-	// List the pods for this kredis's deployment
-	podList := &corev1.PodList{}
-	listOpts := []client.ListOption{
-		client.InNamespace(reqKRedis.Namespace),
-		client.MatchingLabels(labelsForKRedis(reqKRedis.Name)),
-	}
-	if err = r.Client.List(ctx, podList, listOpts...); err != nil {
-		log.Log.Error(err, "Failed to list pods", "KRedis.Namespace", reqKRedis.Namespace, "KRedis.Name", reqKRedis.Name)
-		return ctrl.Result{}, err
-	}
-
-	log.Log.Info("Successed!")
-	return ctrl.Result{}, nil
+    log.Info("KRedis Reconcile loop completed successfully.")
+    return ctrl.Result{}, nil
 }
 
-func (r *KRedisReconciler) clusterIPForKRedis(m *stablev1alpha1.KRedis) *corev1.Service {
-	ls := labelsForKRedis(m.Name)
-
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      m.Name,
-			Namespace: m.Namespace,
-			Labels:    ls,
-		},
-		Spec: corev1.ServiceSpec{
-			Type:     corev1.ServiceTypeClusterIP,
-			Selector: ls,
-			Ports: []corev1.ServicePort{
-				{
-					Protocol: corev1.ProtocolTCP,
-					Port:     6379,
-				},
-			},
-		},
-	}
-	// Set kredis instance as the owner and controller
-	ctrl.SetControllerReference(m, svc, r.Scheme)
-	return svc
-}
-
-// deploymentForKRedis returns a kredis Deployment object
-func (r *KRedisReconciler) deploymentForKRedis(m *stablev1alpha1.KRedis) *appsv1.Deployment {
-	ls := labelsForKRedis(m.Name)
-	replicas := m.Spec.Replicas
-
-	dep := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      m.Name,
-			Namespace: m.Namespace,
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: ls,
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: ls,
-				},
-				Spec: corev1.PodSpec{
-					Affinity: &corev1.Affinity{
-						PodAntiAffinity: &corev1.PodAntiAffinity{
-							RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
-								LabelSelector: &metav1.LabelSelector{
-									MatchExpressions: []metav1.LabelSelectorRequirement{
-										{
-											Key:      "app",
-											Operator: metav1.LabelSelectorOpIn,
-											Values:   []string{"kredis"},
-										},
-									},
-								},
-								TopologyKey: "kubernetes.io/hostname",
-							}},
-						},
-					},
-					Containers: []corev1.Container{{
-						Image: "docker.direa.synology.me/redis-cluster:latest",
-						Name:  "kredis",
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: 6379,
-							Name:          "kredis",
-						}},
-					}},
-					ImagePullSecrets: []corev1.LocalObjectReference{
-                        {
-                            Name: "docker-secret", // Secret 이름
-                        },
-                    },
-				},
-			},
-		},
-	}
-	// Set kredis instance as the owner and controller
-	ctrl.SetControllerReference(m, dep, r.Scheme)
-	return dep
-}
-
-func createDockerRegistrySecret(namespace, secretName, dockerServer, dockerUsername, dockerPassword, dockerEmail string) *corev1.Secret {
-    return &corev1.Secret{
+// deploymentForMaster: 마스터 노드를 위한 Deployment 생성
+func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv1.Deployment {
+    labels := labelsForKRedis(cr.Name + "-master")
+    replicas := int32(1)
+    return &appsv1.Deployment{
         ObjectMeta: metav1.ObjectMeta{
-            Name:      secretName,  // Secret의 이름
-            Namespace: namespace,   // Secret이 생성될 네임스페이스
+            Name:      cr.Name + "-master",
+            Namespace: cr.Namespace,
         },
-        Type: corev1.SecretTypeDockerConfigJson,  // Docker 레지스트리 타입
-        Data: map[string][]byte{
-            ".dockerconfigjson": []byte(fmt.Sprintf(`{
-                "auths": {
-                    "%s": {
-                        "username": "%s",
-                        "password": "%s",
-                        "email": "%s",
-                        "auth": "%s"
-                    }
-                }
-            }`, dockerServer, dockerUsername, dockerPassword, dockerEmail,
-                base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", dockerUsername, dockerPassword))))),
+        Spec: appsv1.DeploymentSpec{
+            Replicas: &replicas,
+            Selector: &metav1.LabelSelector{
+                MatchLabels: labels,
+            },
+            Template: corev1.PodTemplateSpec{
+                ObjectMeta: metav1.ObjectMeta{
+                    Labels: labels,
+                },
+                Spec: corev1.PodSpec{
+                    Containers: []corev1.Container{{
+                        Image: cr.Spec.Image,
+                        Name:  "redis-master",
+                        Resources: corev1.ResourceRequirements{
+                            Limits: corev1.ResourceList{
+                                "cpu":    resource.MustParse(cr.Spec.Resources.Limits.CPU),
+                                "memory": resource.MustParse(cr.Spec.Resources.Limits.Memory),
+                            },
+                            Requests: corev1.ResourceList{
+                                "cpu":    resource.MustParse(cr.Spec.Resources.Requests.CPU),
+                                "memory": resource.MustParse(cr.Spec.Resources.Requests.Memory),
+                            },
+                        },
+                        Env: []corev1.EnvVar{
+                            {
+                                Name:  "MASTER",
+                                Value: "true",
+                            },
+                        },
+                        Ports: []corev1.ContainerPort{{
+                            ContainerPort: cr.Spec.BasePort,
+                        }},
+                    }},
+                },
+            },
+        },
+    }
+}
+
+// deploymentForSlave: 슬레이브 노드를 위한 Deployment 생성
+func (r *KRedisReconciler) deploymentForSlave(cr *stablev1alpha1.KRedis, index int) *appsv1.Deployment {
+    labels := labelsForKRedis(fmt.Sprintf("%s-slave-%d", cr.Name, index))
+    replicas := cr.Spec.Replicas
+    return &appsv1.Deployment{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      fmt.Sprintf("%s-slave-%d", cr.Name, index),
+            Namespace: cr.Namespace,
+        },
+        Spec: appsv1.DeploymentSpec{
+            Replicas: &replicas,
+            Selector: &metav1.LabelSelector{
+                MatchLabels: labels,
+            },
+            Template: corev1.PodTemplateSpec{
+                ObjectMeta: metav1.ObjectMeta{
+                    Labels: labels,
+                },
+                Spec: corev1.PodSpec{
+                    Containers: []corev1.Container{{
+                        Image: cr.Spec.Image,
+                        Name:  "redis-slave",
+                        Ports: []corev1.ContainerPort{{
+                            ContainerPort: cr.Spec.BasePort,
+                        }},
+                    }},
+                },
+            },
+        },
+    }
+}
+
+// serviceForKRedis: Redis Cluster를 위한 Service 생성
+func (r *KRedisReconciler) serviceForKRedis(cr *stablev1alpha1.KRedis) *corev1.Service {
+    labels := labelsForKRedis(cr.Name)
+    return &corev1.Service{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      cr.Name,
+            Namespace: cr.Namespace,
+        },
+        Spec: corev1.ServiceSpec{
+            Selector: labels,
+            Ports: []corev1.ServicePort{{
+                Protocol:   corev1.ProtocolTCP,
+                Port:       cr.Spec.BasePort,
+                TargetPort: intstr.FromInt(int(cr.Spec.BasePort)),
+            }},
         },
     }
 }
@@ -251,7 +230,10 @@ func createDockerRegistrySecret(namespace, secretName, dockerServer, dockerUsern
 // labelsForKRedis returns the labels for selecting the resources
 // belonging to the given kredis CR name.
 func labelsForKRedis(name string) map[string]string {
-	return map[string]string{"app": "kredis", "kredis_cr": name}
+	return map[string]string{
+		"app": "kredis", 
+		"kredis_cr": name
+	}
 }
 
 // getPodNames returns the pod names of the array of pods passed in
