@@ -18,7 +18,8 @@ package controller
 
 import (
 	"context"
-    "fmt"
+	"fmt"
+	"strings"
 	// "time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -62,19 +63,19 @@ type KRedisReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.18.4/pkg/reconcile
 func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-    log := log.FromContext(ctx)
+	log := log.FromContext(ctx)
 
-    // 1. KRedis 객체를 가져옴
-    reqKRedis := &stablev1alpha1.KRedis{}
-    err := r.Client.Get(ctx, req.NamespacedName, reqKRedis)
-    if err != nil {
-        if kerrors.IsNotFound(err) {
-            log.Info("KRedis resource not found.")
-            return ctrl.Result{}, nil
-        }
-        log.Error(err, "Failed to get KRedis resource.")
-        return ctrl.Result{}, err
-    }
+	// 1. KRedis 객체를 가져옴
+	reqKRedis := &stablev1alpha1.KRedis{}
+	err := r.Client.Get(ctx, req.NamespacedName, reqKRedis)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			log.Info("KRedis resource not found.")
+			return ctrl.Result{}, nil
+		}
+		log.Error(err, "Failed to get KRedis resource.")
+		return ctrl.Result{}, err
+	}
 
 	// 1-1. Masters, Replicas 는 최소 1개 이상!
 	if reqKRedis.Spec.Masters <= 0 || reqKRedis.Spec.Replicas <= 0 {
@@ -83,83 +84,83 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
-    // 2. Redis Master Deployment 생성
-    masterDep := r.deploymentForMaster(reqKRedis)
-    masterDeployment := &appsv1.Deployment{}
-    err = r.Client.Get(ctx, client.ObjectKey{Name: masterDep.Name, Namespace: masterDep.Namespace}, masterDeployment)
-    if err != nil && kerrors.IsNotFound(err) {
-        log.Info("Creating Master Deployment.", "Namespace", reqKRedis.Namespace, "Name", masterDep.Name)
-        err = r.Client.Create(ctx, masterDep)
-        if err != nil {
-            log.Error(err, "Failed to create Master Deployment.")
-            return ctrl.Result{}, err
-        }
-    } else if err != nil {
-        log.Error(err, "Failed to get Master Deployment.")
-        return ctrl.Result{}, err
-    }
+	// 2. Redis Master Deployment 생성
+	masterDep := r.deploymentForMaster(reqKRedis)
+	masterDeployment := &appsv1.Deployment{}
+	err = r.Client.Get(ctx, client.ObjectKey{Name: masterDep.Name, Namespace: masterDep.Namespace}, masterDeployment)
+	if err != nil && kerrors.IsNotFound(err) {
+		log.Info("Creating Master Deployment.", "Namespace", reqKRedis.Namespace, "Name", masterDep.Name)
+		err = r.Client.Create(ctx, masterDep)
+		if err != nil {
+			log.Error(err, "Failed to create Master Deployment.")
+			return ctrl.Result{}, err
+		}
+	} else if err != nil {
+		log.Error(err, "Failed to get Master Deployment.")
+		return ctrl.Result{}, err
+	}
 
-    // 3. Redis Slave Deployments 생성 (마스터 개수만큼 슬레이브 그룹 생성)
-    for i := int32(0); i < reqKRedis.Spec.Masters; i++ {
-        slaveDep := r.deploymentForSlave(reqKRedis, int(i))
-        slaveDeployment := &appsv1.Deployment{}
-        err = r.Client.Get(ctx, client.ObjectKey{Name: slaveDep.Name, Namespace: slaveDep.Namespace}, slaveDeployment)
-        if err != nil && kerrors.IsNotFound(err) {
-            log.Info("Creating Slave Deployment.", "Namespace", reqKRedis.Namespace, "Name", slaveDep.Name)
-            err = r.Client.Create(ctx, slaveDep)
-            if err != nil {
-                log.Error(err, "Failed to create Slave Deployment.")
-                return ctrl.Result{}, err
-            }
-        } else if err != nil {
-            log.Error(err, "Failed to get Slave Deployment.")
-            return ctrl.Result{}, err
-        }
-    }
+	// 3. Redis Slave Deployments 생성 (마스터 개수만큼 슬레이브 그룹 생성)
+	for i := int32(0); i < reqKRedis.Spec.Masters; i++ {
+		slaveDep := r.deploymentForSlave(reqKRedis, int(i))
+		slaveDeployment := &appsv1.Deployment{}
+		err = r.Client.Get(ctx, client.ObjectKey{Name: slaveDep.Name, Namespace: slaveDep.Namespace}, slaveDeployment)
+		if err != nil && kerrors.IsNotFound(err) {
+			log.Info("Creating Slave Deployment.", "Namespace", reqKRedis.Namespace, "Name", slaveDep.Name)
+			err = r.Client.Create(ctx, slaveDep)
+			if err != nil {
+				log.Error(err, "Failed to create Slave Deployment.")
+				return ctrl.Result{}, err
+			}
+		} else if err != nil {
+			log.Error(err, "Failed to get Slave Deployment.")
+			return ctrl.Result{}, err
+		}
+	}
 
-    // 4. Redis Service 생성
-    svc := r.serviceForKRedis(reqKRedis)
-    service := &corev1.Service{}
-    err = r.Client.Get(ctx, client.ObjectKey{Name: svc.Name, Namespace: svc.Namespace}, service)
-    if err != nil && kerrors.IsNotFound(err) {
-        log.Info("Creating Redis Service.", "Namespace", svc.Namespace, "Name", svc.Name)
-        err = r.Client.Create(ctx, svc)
-        if err != nil {
-            log.Error(err, "Failed to create Redis Service.")
-            return ctrl.Result{}, err
-        }
-    } else if err != nil {
-        log.Error(err, "Failed to get Redis Service.")
-        return ctrl.Result{}, err
-    }
+	// 4. Redis Service 생성
+	svc := r.serviceForKRedis(reqKRedis)
+	service := &corev1.Service{}
+	err = r.Client.Get(ctx, client.ObjectKey{Name: svc.Name, Namespace: svc.Namespace}, service)
+	if err != nil && kerrors.IsNotFound(err) {
+		log.Info("Creating Redis Service.", "Namespace", svc.Namespace, "Name", svc.Name)
+		err = r.Client.Create(ctx, svc)
+		if err != nil {
+			log.Error(err, "Failed to create Redis Service.")
+			return ctrl.Result{}, err
+		}
+	} else if err != nil {
+		log.Error(err, "Failed to get Redis Service.")
+		return ctrl.Result{}, err
+	}
 
-    log.Info("KRedis Reconcile loop completed successfully.")
-    return ctrl.Result{}, nil
+	log.Info("KRedis Reconcile loop completed successfully.")
+	return ctrl.Result{}, nil
 }
 
 // deploymentForMaster: 마스터 노드를 위한 Deployment 생성
 func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv1.Deployment {
-    labels := labelsForKRedis(cr.Name + "-master")
-    replicas := int32(cr.Spec.Masters)
-    return &appsv1.Deployment{
-        ObjectMeta: metav1.ObjectMeta{
-            Name:      cr.Name + "-master",
-            Namespace: cr.Namespace,
-        },
-        Spec: appsv1.DeploymentSpec{
-            Replicas: &replicas,
-            Selector: &metav1.LabelSelector{
-                MatchLabels: labels,
-            },
-            Template: corev1.PodTemplateSpec{
-                ObjectMeta: metav1.ObjectMeta{
-                    Labels: labels,
-                },
-                Spec: corev1.PodSpec{
-                    Containers: []corev1.Container{{
-                        Image: cr.Spec.Image,
-                        Name:  "redis-master",
-                        Resources: corev1.ResourceRequirements{
+	labels := labelsForKRedis(cr.Name + "-master")
+	replicas := int32(cr.Spec.Masters)
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cr.Name + "-master",
+			Namespace: cr.Namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Image: cr.Spec.Image,
+						Name:  "redis-master",
+						Resources: corev1.ResourceRequirements{
 							Limits: corev1.ResourceList{
 								"cpu":    parseResource(cr.Spec.Resource["limits"], "cpu", "1"),
 								"memory": parseResource(cr.Spec.Resource["limits"], "memory", "1Gi"),
@@ -169,20 +170,20 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
 								"memory": parseResource(cr.Spec.Resource["requests"], "memory", "512Mi"),
 							},
 						},
-                        Env: []corev1.EnvVar{
-                            {
-                                Name:  "MASTER",
-                                Value: "true",
-                            },
+						Env: []corev1.EnvVar{
+							{
+								Name:  "MASTER",
+								Value: "true",
+							},
 							{
 								Name:  "REDIS_MAXMEMORY", // maxmemory 설정
 								Value: cr.Spec.Resource["limits"]["memory"],
 							},
-                        },
-                        Ports: []corev1.ContainerPort{{
-                            ContainerPort: cr.Spec.BasePort,
-                        }},
-                    }},
+						},
+						Ports: []corev1.ContainerPort{{
+							ContainerPort: cr.Spec.BasePort,
+						}},
+					}},
 					Affinity: &corev1.Affinity{
 						PodAntiAffinity: &corev1.PodAntiAffinity{
 							PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
@@ -201,38 +202,38 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
 							},
 						},
 					},
-                },
-            },
-        },
-    }
+				},
+			},
+		},
+	}
 }
 
 // deploymentForSlave: 슬레이브 노드를 위한 Deployment 생성
 func (r *KRedisReconciler) deploymentForSlave(cr *stablev1alpha1.KRedis, index int) *appsv1.Deployment {
-    labels := labelsForKRedis(fmt.Sprintf("%s-slave-%d", cr.Name, index))
-    replicas := cr.Spec.Replicas
-    return &appsv1.Deployment{
-        ObjectMeta: metav1.ObjectMeta{
-            Name:      fmt.Sprintf("%s-slave-%d", cr.Name, index),
-            Namespace: cr.Namespace,
-        },
-        Spec: appsv1.DeploymentSpec{
-            Replicas: &replicas,
-            Selector: &metav1.LabelSelector{
-                MatchLabels: labels,
-            },
-            Template: corev1.PodTemplateSpec{
-                ObjectMeta: metav1.ObjectMeta{
-                    Labels: labels,
-                },
-                Spec: corev1.PodSpec{
-                    Containers: []corev1.Container{{
-                        Image: cr.Spec.Image,
-                        Name:  "redis-slave",
-                        Ports: []corev1.ContainerPort{{
-                            ContainerPort: cr.Spec.BasePort,
-                        }},
-                    }},
+	labels := labelsForKRedis(fmt.Sprintf("%s-slave-%d", cr.Name, index))
+	replicas := cr.Spec.Replicas
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-slave-%d", cr.Name, index),
+			Namespace: cr.Namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Image: cr.Spec.Image,
+						Name:  "redis-slave",
+						Ports: []corev1.ContainerPort{{
+							ContainerPort: cr.Spec.BasePort,
+						}},
+					}},
 					Affinity: &corev1.Affinity{
 						PodAntiAffinity: &corev1.PodAntiAffinity{
 							PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
@@ -251,29 +252,29 @@ func (r *KRedisReconciler) deploymentForSlave(cr *stablev1alpha1.KRedis, index i
 							},
 						},
 					},
-                },
-            },
-        },
-    }
+				},
+			},
+		},
+	}
 }
 
 // serviceForKRedis: Redis Cluster를 위한 Service 생성
 func (r *KRedisReconciler) serviceForKRedis(cr *stablev1alpha1.KRedis) *corev1.Service {
-    labels := labelsForKRedis(cr.Name)
-    return &corev1.Service{
-        ObjectMeta: metav1.ObjectMeta{
-            Name:      cr.Name,
-            Namespace: cr.Namespace,
-        },
-        Spec: corev1.ServiceSpec{
-            Selector: labels,
-            Ports: []corev1.ServicePort{{
-                Protocol:   corev1.ProtocolTCP,
-                Port:       cr.Spec.BasePort,
-                TargetPort: intstr.FromInt(int(cr.Spec.BasePort)),
-            }},
-        },
-    }
+	labels := labelsForKRedis(cr.Name)
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cr.Name,
+			Namespace: cr.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: labels,
+			Ports: []corev1.ServicePort{{
+				Protocol:   corev1.ProtocolTCP,
+				Port:       cr.Spec.BasePort,
+				TargetPort: intstr.FromInt(int(cr.Spec.BasePort)),
+			}},
+		},
+	}
 }
 
 func parseResource(resourceMap map[string]string, key string, defaultValue string) resource.Quantity {
@@ -287,16 +288,16 @@ func parseResource(resourceMap map[string]string, key string, defaultValue strin
 // labelsForKRedis returns the labels for selecting the resources
 // belonging to the given kredis CR name.
 func labelsForKRedis(name string) map[string]string {
-    labels := map[string]string{
-        "app":       "kredis",
-        "kredis_cr": name,
-    }
-    if strings.Contains(name, "master") {
-        labels["role"] = "master" // Master 라벨 추가
-    } else {
-        labels["role"] = "slave"  // Slave 라벨 추가
-    }
-    return labels
+	labels := map[string]string{
+		"app":       "kredis",
+		"kredis_cr": name,
+	}
+	if strings.Contains(name, "master") {
+		labels["role"] = "master" // Master 라벨 추가
+	} else {
+		labels["role"] = "slave"  // Slave 라벨 추가
+	}
+	return labels
 }
 
 // getPodNames returns the pod names of the array of pods passed in
