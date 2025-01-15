@@ -157,6 +157,11 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets: []corev1.LocalObjectReference{
+                        {
+                            Name: "docker-secret", // Secret 이름
+                        },
+                    },
 					Containers: []corev1.Container{{
 						Image: cr.Spec.Image,
 						Name:  "redis-master",
@@ -227,6 +232,11 @@ func (r *KRedisReconciler) deploymentForSlave(cr *stablev1alpha1.KRedis, index i
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets: []corev1.LocalObjectReference{
+                        {
+                            Name: "docker-secret", // Secret 이름
+                        },
+                    },
 					Containers: []corev1.Container{{
 						Image: cr.Spec.Image,
 						Name:  "redis-slave",
@@ -278,11 +288,11 @@ func (r *KRedisReconciler) serviceForKRedis(cr *stablev1alpha1.KRedis) *corev1.S
 }
 
 func parseResource(resourceMap map[string]string, key string, defaultValue string) resource.Quantity {
-    value, ok := resourceMap[key]
-    if !ok || value == "" {
-        value = defaultValue
-    }
-    return resource.MustParse(value)
+	value, ok := resourceMap[key]
+	if !ok || value == "" {
+		value = defaultValue
+	}
+	return resource.MustParse(value)
 }
 
 // labelsForKRedis returns the labels for selecting the resources
@@ -295,7 +305,7 @@ func labelsForKRedis(name string) map[string]string {
 	if strings.Contains(name, "master") {
 		labels["role"] = "master" // Master 라벨 추가
 	} else {
-		labels["role"] = "slave"  // Slave 라벨 추가
+		labels["role"] = "slave" // Slave 라벨 추가
 	}
 	return labels
 }
@@ -313,7 +323,7 @@ func getPodNames(pods []corev1.Pod) []string {
 func (r *KRedisReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&stablev1alpha1.KRedis{}).
-		Owns(&appsv1.Deployment{}).
+		// Owns(&appsv1.Deployment{}).
 		// WithOptions(controller.Options{MaxConcurrentReconciles: 2}).
 		Complete(r)
 }
