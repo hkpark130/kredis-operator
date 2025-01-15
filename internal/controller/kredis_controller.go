@@ -176,7 +176,7 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
                             },
 							{
 								Name:  "REDIS_MAXMEMORY", // maxmemory 설정
-								Value: cr.Spec.MaxMemory,
+								Value: cr.Spec.Resource["limits"]["memory"],
 							},
                         },
                         Ports: []corev1.ContainerPort{{
@@ -233,27 +233,27 @@ func (r *KRedisReconciler) deploymentForSlave(cr *stablev1alpha1.KRedis, index i
                             ContainerPort: cr.Spec.BasePort,
                         }},
                     }},
+					Affinity: &corev1.Affinity{
+						PodAntiAffinity: &corev1.PodAntiAffinity{
+							PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
+								{
+									Weight: 1,
+									PodAffinityTerm: corev1.PodAffinityTerm{
+										LabelSelector: &metav1.LabelSelector{
+											MatchLabels: map[string]string{ // Master와 Slave 구분
+												"app":  "kredis",
+												"role": "master", // Master와의 배치를 회피
+											},
+										},
+										TopologyKey: "kubernetes.io/hostname", // 같은 노드에서 배치되지 않도록 지시
+									},
+								},
+							},
+						},
+					},
                 },
             },
         },
-		Affinity: &corev1.Affinity{
-			PodAntiAffinity: &corev1.PodAntiAffinity{
-				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
-					{
-						Weight: 1,
-						PodAffinityTerm: corev1.PodAffinityTerm{
-							LabelSelector: &metav1.LabelSelector{
-								MatchLabels: map[string]string{ // Master와 Slave 구분
-									"app":  "kredis",
-									"role": "master", // Master와의 배치를 회피
-								},
-							},
-							TopologyKey: "kubernetes.io/hostname", // 같은 노드에서 배치되지 않도록 지시
-						},
-					},
-				},
-			},
-		},
     }
 }
 
