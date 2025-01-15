@@ -76,6 +76,13 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
         return ctrl.Result{}, err
     }
 
+	// 1-1. Masters, Replicas 는 최소 1개 이상!
+	if reqKRedis.Spec.Masters <= 0 || reqKRedis.Spec.Replicas <= 0 {
+		err := fmt.Errorf("invalid spec: Masters and Replicas must be greater than zero")
+		log.Error(err, "Invalid KRedis spec.")
+		return ctrl.Result{}, err
+	}
+
     // 2. Redis Master Deployment 생성
     masterDep := r.deploymentForMaster(reqKRedis)
     masterDeployment := &appsv1.Deployment{}
@@ -133,7 +140,7 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 // deploymentForMaster: 마스터 노드를 위한 Deployment 생성
 func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv1.Deployment {
     labels := labelsForKRedis(cr.Name + "-master")
-    replicas := int32(1)
+    replicas := int32(cr.Spec.Masters)
     return &appsv1.Deployment{
         ObjectMeta: metav1.ObjectMeta{
             Name:      cr.Name + "-master",
@@ -167,11 +174,33 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
                                 Name:  "MASTER",
                                 Value: "true",
                             },
+							{
+								Name:  "REDIS_MAXMEMORY", // maxmemory 설정
+								Value: cr.Spec.MaxMemory,
+							},
                         },
                         Ports: []corev1.ContainerPort{{
                             ContainerPort: cr.Spec.BasePort,
                         }},
                     }},
+					Affinity: &corev1.Affinity{
+						PodAntiAffinity: &corev1.PodAntiAffinity{
+							PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
+								{
+									Weight: 1,
+									PodAffinityTerm: corev1.PodAffinityTerm{
+										LabelSelector: &metav1.LabelSelector{
+											MatchLabels: map[string]string{ // Master와 Slave 구분
+												"app":  "kredis",
+												"role": "slave", // Slave와의 배치를 회피
+											},
+										},
+										TopologyKey: "kubernetes.io/hostname", // 같은 노드에서 배치되지 않도록 지시
+									},
+								},
+							},
+						},
+					},
                 },
             },
         },
@@ -207,6 +236,24 @@ func (r *KRedisReconciler) deploymentForSlave(cr *stablev1alpha1.KRedis, index i
                 },
             },
         },
+		Affinity: &corev1.Affinity{
+			PodAntiAffinity: &corev1.PodAntiAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
+					{
+						Weight: 1,
+						PodAffinityTerm: corev1.PodAffinityTerm{
+							LabelSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{ // Master와 Slave 구분
+									"app":  "kredis",
+									"role": "master", // Master와의 배치를 회피
+								},
+							},
+							TopologyKey: "kubernetes.io/hostname", // 같은 노드에서 배치되지 않도록 지시
+						},
+					},
+				},
+			},
+		},
     }
 }
 
@@ -240,10 +287,16 @@ func parseResource(resourceMap map[string]string, key string, defaultValue strin
 // labelsForKRedis returns the labels for selecting the resources
 // belonging to the given kredis CR name.
 func labelsForKRedis(name string) map[string]string {
-	return map[string]string{
-		"app": "kredis", 
-		"kredis_cr": name,
-	}
+    labels := map[string]string{
+        "app":       "kredis",
+        "kredis_cr": name,
+    }
+    if strings.Contains(name, "master") {
+        labels["role"] = "master" // Master 라벨 추가
+    } else {
+        labels["role"] = "slave"  // Slave 라벨 추가
+    }
+    return labels
 }
 
 // getPodNames returns the pod names of the array of pods passed in
