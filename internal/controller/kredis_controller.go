@@ -98,6 +98,18 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	} else if err != nil {
 		log.Error(err, "Failed to get Master Deployment.")
 		return ctrl.Result{}, err
+	} else {
+		// Deployment가 이미 존재하면 스펙 업데이트
+		log.Info("Updating Master Deployment if necessary.", "Namespace", reqKRedis.Namespace, "Name", masterDep.Name)
+		if !equalDeployments(masterDeployment, masterDep) {
+			// 기존 Deployment와 CRD에서 정의한 Deployment를 비교하여 다를 경우 업데이트
+			masterDeployment.Spec = masterDep.Spec
+			err = r.Client.Update(ctx, masterDeployment)
+			if err != nil {
+				log.Error(err, "Failed to update Master Deployment.")
+				return ctrl.Result{}, err
+			}
+		}
 	}
 
 	// 3. Redis Slave Deployments 생성 (마스터 개수만큼 슬레이브 그룹 생성)
@@ -285,6 +297,14 @@ func (r *KRedisReconciler) serviceForKRedis(cr *stablev1alpha1.KRedis) *corev1.S
 			}},
 		},
 	}
+}
+
+func equalDeployments(current, desired *appsv1.Deployment) bool {
+    // Spec만 비교하고 metadata는 제외 (Replicas 만 비교중임)
+    return current.Spec.Replicas != nil && 
+           desired.Spec.Replicas != nil && 
+           *current.Spec.Replicas == *desired.Spec.Replicas
+           // 추가적인 필드 비교가 필요할 경우 여기서 추가적으로 구현
 }
 
 func parseResource(resourceMap map[string]string, key string, defaultValue string) resource.Quantity {
