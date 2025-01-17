@@ -31,10 +31,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	// "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"k8s.io/client-go/util/retry" // 내용: https://alenkacz.medium.com/kubernetes-operators-best-practices-understanding-conflict-errors-d05353dff421
 
 	stablev1alpha1 "github.com/hkpark130/kredis-operator/api/v1alpha1"
 )
@@ -103,11 +104,26 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		log.Info("Updating Master Deployment if necessary.", "Namespace", reqKRedis.Namespace, "Name", masterDep.Name)
 		if !equalDeployments(masterDeployment, masterDep) {
 			// 기존 Deployment와 CRD에서 정의한 Deployment를 비교하여 다를 경우 업데이트
-			masterDeployment.Spec = masterDep.Spec
-			err = r.Client.Update(ctx, masterDeployment)
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				var currentMasterDeployment appsv1.Deployment // 현재 배포를 가져오기 위한 변수
+				err := r.Get(ctx, types.NamespacedName{
+					Name:      masterDeployment.Name,
+					Namespace: masterDeployment.Namespace,
+				}, currentMasterDeployment)
+				if err != nil {
+					return err
+				}
+	
+				// 가져온 최신 Deployment를 업데이트하기 위해 복사
+				currentMasterDeployment.Spec = masterDep.Spec
+	
+				err = r.Client.Update(ctx, currentMasterDeployment)
+				return err
+			})
+	
 			if err != nil {
 				log.Error(err, "Failed to update Master Deployment.")
-				return ctrl.Result{}, err
+				return ctrl.Result{}, fmt.Errorf("failed to update Master Deployment: %w", err)
 			}
 		}
 	}
