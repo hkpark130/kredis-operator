@@ -32,10 +32,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry" // 내용: https://alenkacz.medium.com/kubernetes-operators-best-practices-understanding-conflict-errors-d05353dff421
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"k8s.io/client-go/util/retry" // 내용: https://alenkacz.medium.com/kubernetes-operators-best-practices-understanding-conflict-errors-d05353dff421
 
 	stablev1alpha1 "github.com/hkpark130/kredis-operator/api/v1alpha1"
 )
@@ -107,7 +107,7 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 				// 현재 Deployment를 가져오기 위한 포인터 타입 객체 생성
 				currentMasterDeployment := &appsv1.Deployment{}
-	
+
 				// 리소스 가져오기
 				err := r.Client.Get(ctx, types.NamespacedName{
 					Name:      masterDeployment.Name,
@@ -117,11 +117,11 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 					return err
 				}
 				currentMasterDeployment.Spec = masterDep.Spec
-	
+
 				err = r.Client.Update(ctx, currentMasterDeployment)
 				return err
 			})
-	
+
 			if err != nil {
 				log.Error(err, "Failed to update Master Deployment.")
 				return ctrl.Result{}, fmt.Errorf("failed to update Master Deployment: %w", err)
@@ -130,20 +130,52 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// 3. Redis Slave Deployments 생성 (마스터 개수만큼 슬레이브 그룹 생성)
-	for i := int32(0); i < reqKRedis.Spec.Masters; i++ {
-		slaveDep := r.deploymentForSlave(reqKRedis, int(i))
-		slaveDeployment := &appsv1.Deployment{}
-		err = r.Client.Get(ctx, client.ObjectKey{Name: slaveDep.Name, Namespace: slaveDep.Namespace}, slaveDeployment)
-		if err != nil && kerrors.IsNotFound(err) {
-			log.Info("Creating Slave Deployment.", "Namespace", reqKRedis.Namespace, "Name", slaveDep.Name)
-			err = r.Client.Create(ctx, slaveDep)
-			if err != nil {
-				log.Error(err, "Failed to create Slave Deployment.")
-				return ctrl.Result{}, err
+	slaveDeployments := &appsv1.DeploymentList{}
+	opts := []client.ListOption{
+		client.InNamespace(reqKRedis.Namespace),
+		client.MatchingLabels(map[string]string{"app": "kredis", "role": "slave"}),
+	}
+	
+	err = r.Client.List(ctx, slaveDeployments, opts...)
+	if err != nil {
+		log.Error(err, "Failed to list slave deployments")
+		return err
+	}
+
+	currentSlaveCount := len(slaveDeployments.Items)
+	desiredSlaveCount := int(reqKRedis.Spec.Masters)
+	log.Info("Slave counts: ", "currentSlaveCount", currentSlaveCount, "desiredSlaveCount", desiredSlaveCount)
+
+	for i := 0; i < max(currentSlaveCount, desiredSlaveCount); i++ {
+		slaveDepName := fmt.Sprintf("%s-slave-%d", reqKRedis.Name, i)
+
+		if i >= desiredSlaveCount {
+			// 삭제해야 할 슬레이브 처리
+			for _, slaveDep := range slaveDeployments.Items {
+				if slaveDep.Name == slaveDepName {
+					log.Info("Deleting unnecessary Slave Deployment", "Namespace", slaveDep.Namespace, "Name", slaveDep.Name)
+					if err := r.Client.Delete(ctx, &slaveDep); err != nil {
+						log.Error(err, "Failed to delete Slave Deployment", "Namespace", slaveDep.Namespace, "Name", slaveDep.Name)
+					}
+				}
 			}
-		} else if err != nil {
-			log.Error(err, "Failed to get Slave Deployment.")
-			return ctrl.Result{}, err
+		} else if i >= currentSlaveCount {
+			// 생성해야 할 슬레이브 처리: 존재 확인 후 생성
+			slaveDep := r.deploymentForSlave(reqKRedis, i)
+			existingDep := &appsv1.Deployment{}
+			err := r.Client.Get(ctx, client.ObjectKey{Name: slaveDepName, Namespace: reqKRedis.Namespace}, existingDep)
+			if err != nil {
+				if kerrors.IsNotFound(err) {
+					log.Info("Creating missing Slave Deployment", "Namespace", reqKRedis.Namespace, "Name", slaveDepName)
+					if createErr := r.Client.Create(ctx, slaveDep); createErr != nil {
+						log.Error(createErr, "Failed to create Slave Deployment", "Namespace", reqKRedis.Namespace, "Name", slaveDepName)
+						return ctrl.Result{}, createErr
+					}
+				} else {
+					log.Error(err, "Failed to check Slave Deployment existence", "Namespace", reqKRedis.Namespace, "Name", slaveDepName)
+					return ctrl.Result{}, err
+				}
+			}
 		}
 	}
 
@@ -175,6 +207,7 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cr.Name + "-master",
 			Namespace: cr.Namespace,
+			Labels:    labels,
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
@@ -250,6 +283,7 @@ func (r *KRedisReconciler) deploymentForSlave(cr *stablev1alpha1.KRedis, index i
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-slave-%d", cr.Name, index),
 			Namespace: cr.Namespace,
+			Labels:    labels,
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
@@ -318,10 +352,10 @@ func (r *KRedisReconciler) serviceForKRedis(cr *stablev1alpha1.KRedis) *corev1.S
 
 func equalDeployments(current, desired *appsv1.Deployment) bool {
 	// Spec만 비교하고 metadata는 제외 (Replicas 만 비교중임)
-	return current.Spec.Replicas != nil && 
-			desired.Spec.Replicas != nil && 
-			*current.Spec.Replicas == *desired.Spec.Replicas
-			// 추가적인 필드 비교가 필요할 경우 여기서 추가적으로 구현
+	return current.Spec.Replicas != nil &&
+		desired.Spec.Replicas != nil &&
+		*current.Spec.Replicas == *desired.Spec.Replicas
+	// 추가적인 필드 비교가 필요할 경우 여기서 추가적으로 구현
 }
 
 func parseResource(resourceMap map[string]string, key string, defaultValue string) resource.Quantity {
@@ -347,6 +381,13 @@ func labelsForKRedis(name string) map[string]string {
 	return labels
 }
 
+func max(a, b int) int {
+    if a > b {
+        return a
+    }
+    return b
+}
+
 // getPodNames returns the pod names of the array of pods passed in
 func getPodNames(pods []corev1.Pod) []string {
 	var podNames []string
@@ -360,7 +401,7 @@ func getPodNames(pods []corev1.Pod) []string {
 func (r *KRedisReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&stablev1alpha1.KRedis{}).
-		// Owns(&appsv1.Deployment{}).
+		Owns(&appsv1.Deployment{}).
 		// WithOptions(controller.Options{MaxConcurrentReconciles: 2}).
 		Complete(r)
 }
