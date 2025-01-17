@@ -170,10 +170,10 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
 				},
 				Spec: corev1.PodSpec{
 					ImagePullSecrets: []corev1.LocalObjectReference{
-                        {
-                            Name: "docker-secret", // Secret 이름
-                        },
-                    },
+						{
+							Name: "docker-secret", // Secret 이름
+						},
+					},
 					Containers: []corev1.Container{{
 						Image: cr.Spec.Image,
 						Name:  "redis-master",
@@ -245,10 +245,10 @@ func (r *KRedisReconciler) deploymentForSlave(cr *stablev1alpha1.KRedis, index i
 				},
 				Spec: corev1.PodSpec{
 					ImagePullSecrets: []corev1.LocalObjectReference{
-                        {
-                            Name: "docker-secret", // Secret 이름
-                        },
-                    },
+						{
+							Name: "docker-secret", // Secret 이름
+						},
+					},
 					Containers: []corev1.Container{{
 						Image: cr.Spec.Image,
 						Name:  "redis-slave",

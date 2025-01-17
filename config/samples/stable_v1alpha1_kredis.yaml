@@ -7,7 +7,7 @@ metadata:
   name: kredis-sample
 spec:
   replicas: 1 # 슬레이브 노드
-  masters: 2 # 마스터 노드
+  masters: 3 # 마스터 노드
   image: docker.direa.synology.me/redis-cluster:latest
   memory: 1gb
   basePort: 10000
