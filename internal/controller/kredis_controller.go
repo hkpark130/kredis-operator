@@ -105,16 +105,17 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if !equalDeployments(masterDeployment, masterDep) {
 			// 기존 Deployment와 CRD에서 정의한 Deployment를 비교하여 다를 경우 업데이트
 			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				var currentMasterDeployment appsv1.Deployment // 현재 배포를 가져오기 위한 변수
-				err := r.Get(ctx, types.NamespacedName{
+				// 현재 Deployment를 가져오기 위한 포인터 타입 객체 생성
+				currentMasterDeployment := &appsv1.Deployment{}
+	
+				// 리소스 가져오기
+				err := r.Client.Get(ctx, types.NamespacedName{
 					Name:      masterDeployment.Name,
 					Namespace: masterDeployment.Namespace,
 				}, currentMasterDeployment)
 				if err != nil {
 					return err
 				}
-	
-				// 가져온 최신 Deployment를 업데이트하기 위해 복사
 				currentMasterDeployment.Spec = masterDep.Spec
 	
 				err = r.Client.Update(ctx, currentMasterDeployment)
@@ -316,11 +317,11 @@ func (r *KRedisReconciler) serviceForKRedis(cr *stablev1alpha1.KRedis) *corev1.S
 }
 
 func equalDeployments(current, desired *appsv1.Deployment) bool {
-    // Spec만 비교하고 metadata는 제외 (Replicas 만 비교중임)
-    return current.Spec.Replicas != nil && 
-           desired.Spec.Replicas != nil && 
-           *current.Spec.Replicas == *desired.Spec.Replicas
-           // 추가적인 필드 비교가 필요할 경우 여기서 추가적으로 구현
+	// Spec만 비교하고 metadata는 제외 (Replicas 만 비교중임)
+	return current.Spec.Replicas != nil && 
+			desired.Spec.Replicas != nil && 
+			*current.Spec.Replicas == *desired.Spec.Replicas
+			// 추가적인 필드 비교가 필요할 경우 여기서 추가적으로 구현
 }
 
 func parseResource(resourceMap map[string]string, key string, defaultValue string) resource.Quantity {
