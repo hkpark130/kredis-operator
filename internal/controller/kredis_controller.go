@@ -1,38 +1,20 @@
-/*
-Copyright 2025.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
 	"context"
 	"fmt"
 	"strings"
-	// "time"
-
-	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/util/intstr"
+	"os/exec"
 
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
-
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry" // 내용: https://alenkacz.medium.com/kubernetes-operators-best-practices-understanding-conflict-errors-d05353dff421
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -40,7 +22,6 @@ import (
 	stablev1alpha1 "github.com/hkpark130/kredis-operator/api/v1alpha1"
 )
 
-// KRedisReconciler reconciles a KRedis object
 type KRedisReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -49,168 +30,143 @@ type KRedisReconciler struct {
 // +kubebuilder:rbac:groups=stable.docker.direa.synology.me,resources=kredis,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=stable.docker.direa.synology.me,resources=kredis/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=stable.docker.direa.synology.me,resources=kredis/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=*
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=*
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=*
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the KRedis object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.18.4/pkg/reconcile
 func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	// 1. KRedis 객체를 가져옴
+	// KRedis 객체 조회
 	reqKRedis := &stablev1alpha1.KRedis{}
-	err := r.Client.Get(ctx, req.NamespacedName, reqKRedis)
-	if err != nil {
+	if err := r.Client.Get(ctx, req.NamespacedName, reqKRedis); err != nil {
 		if kerrors.IsNotFound(err) {
-			log.Info("KRedis resource not found.")
 			return ctrl.Result{}, nil
 		}
-		log.Error(err, "Failed to get KRedis resource.")
 		return ctrl.Result{}, err
 	}
 
-	// 1-1. Masters, Replicas 는 최소 1개 이상!
+	// 최소 요구사항 검증
 	if reqKRedis.Spec.Masters <= 0 || reqKRedis.Spec.Replicas <= 0 {
-		err := fmt.Errorf("invalid spec: Masters and Replicas must be greater than zero")
-		log.Error(err, "Invalid KRedis spec.")
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("invalid spec: Masters and Replicas must be greater than zero")
 	}
 
-	// 2. Redis Master Deployment 생성
-	masterDep := r.deploymentForMaster(reqKRedis)
-	masterDeployment := &appsv1.Deployment{}
-	err = r.Client.Get(ctx, client.ObjectKey{Name: masterDep.Name, Namespace: masterDep.Namespace}, masterDeployment)
+	// Master StatefulSet 관리
+	masterSts := r.statefulSetForMaster(reqKRedis)
+	currentSts := &appsv1.StatefulSet{}
+	err := r.Client.Get(ctx, client.ObjectKey{Name: masterSts.Name, Namespace: masterSts.Namespace}, currentSts)
+
 	if err != nil && kerrors.IsNotFound(err) {
-		log.Info("Creating Master Deployment.", "Namespace", reqKRedis.Namespace, "Name", masterDep.Name)
-		err = r.Client.Create(ctx, masterDep)
-		if err != nil {
-			log.Error(err, "Failed to create Master Deployment.")
+		// StatefulSet이 없으면 생성
+		log.Info("Creating Master StatefulSet", "Namespace", reqKRedis.Namespace, "Name", masterSts.Name)
+		if err = r.Client.Create(ctx, masterSts); err != nil {
 			return ctrl.Result{}, err
 		}
 	} else if err != nil {
-		log.Error(err, "Failed to get Master Deployment.")
 		return ctrl.Result{}, err
 	} else {
-		// Deployment가 이미 존재하면 스펙 업데이트
-		log.Info("Updating Master Deployment if necessary.", "Namespace", reqKRedis.Namespace, "Name", masterDep.Name)
-		if !equalDeployments(masterDeployment, masterDep) {
-			// 기존 Deployment와 CRD에서 정의한 Deployment를 비교하여 다를 경우 업데이트
-			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				// 현재 Deployment를 가져오기 위한 포인터 타입 객체 생성
-				currentMasterDeployment := &appsv1.Deployment{}
-
-				// 리소스 가져오기
-				err := r.Client.Get(ctx, types.NamespacedName{
-					Name:      masterDeployment.Name,
-					Namespace: masterDeployment.Namespace,
-				}, currentMasterDeployment)
-				if err != nil {
-					return err
+		// StatefulSet이 존재하면 업데이트 검토
+		if !equalStatefulSets(currentSts, masterSts) {
+			// 스케일 다운 시나리오 체크
+			if currentSts.Spec.Replicas != nil && masterSts.Spec.Replicas != nil &&
+				*currentSts.Spec.Replicas > *masterSts.Spec.Replicas {
+				
+				// 데이터 마이그레이션 수행
+				if err := r.handleDataMigration(ctx, reqKRedis, currentSts); err != nil {
+					log.Error(err, "Failed to migrate data")
+					return ctrl.Result{}, err
 				}
-				currentMasterDeployment.Spec = masterDep.Spec
 
-				err = r.Client.Update(ctx, currentMasterDeployment)
-				return err
-			})
-
-			if err != nil {
-				log.Error(err, "Failed to update Master Deployment.")
-				return ctrl.Result{}, fmt.Errorf("failed to update Master Deployment: %w", err)
-			}
-		}
-	}
-
-	// 3. Redis Slave Deployments 생성 (마스터 개수만큼 슬레이브 그룹 생성)
-	slaveDeployments := &appsv1.DeploymentList{}
-	opts := []client.ListOption{
-		client.InNamespace(reqKRedis.Namespace),
-		client.MatchingLabels(map[string]string{"app": "kredis", "role": "slave"}),
-	}
-	
-	err = r.Client.List(ctx, slaveDeployments, opts...)
-	if err != nil {
-		log.Error(err, "Failed to list slave deployments")
-		return err
-	}
-
-	currentSlaveCount := len(slaveDeployments.Items)
-	desiredSlaveCount := int(reqKRedis.Spec.Masters)
-	log.Info("Slave counts: ", "currentSlaveCount", currentSlaveCount, "desiredSlaveCount", desiredSlaveCount)
-
-	for i := 0; i < max(currentSlaveCount, desiredSlaveCount); i++ {
-		slaveDepName := fmt.Sprintf("%s-slave-%d", reqKRedis.Name, i)
-
-		if i >= desiredSlaveCount {
-			// 삭제해야 할 슬레이브 처리
-			for _, slaveDep := range slaveDeployments.Items {
-				if slaveDep.Name == slaveDepName {
-					log.Info("Deleting unnecessary Slave Deployment", "Namespace", slaveDep.Namespace, "Name", slaveDep.Name)
-					if err := r.Client.Delete(ctx, &slaveDep); err != nil {
-						log.Error(err, "Failed to delete Slave Deployment", "Namespace", slaveDep.Namespace, "Name", slaveDep.Name)
-					}
-				}
-			}
-		} else if i >= currentSlaveCount {
-			// 생성해야 할 슬레이브 처리: 존재 확인 후 생성
-			slaveDep := r.deploymentForSlave(reqKRedis, i)
-			existingDep := &appsv1.Deployment{}
-			err := r.Client.Get(ctx, client.ObjectKey{Name: slaveDepName, Namespace: reqKRedis.Namespace}, existingDep)
-			if err != nil {
-				if kerrors.IsNotFound(err) {
-					log.Info("Creating missing Slave Deployment", "Namespace", reqKRedis.Namespace, "Name", slaveDepName)
-					if createErr := r.Client.Create(ctx, slaveDep); createErr != nil {
-						log.Error(createErr, "Failed to create Slave Deployment", "Namespace", reqKRedis.Namespace, "Name", slaveDepName)
-						return ctrl.Result{}, createErr
-					}
-				} else {
-					log.Error(err, "Failed to check Slave Deployment existence", "Namespace", reqKRedis.Namespace, "Name", slaveDepName)
+				// 관련된 슬레이브 Deployment 삭제
+				if err := r.deleteRelatedSlaves(ctx, reqKRedis, int(*masterSts.Spec.Replicas)); err != nil {
+					log.Error(err, "Failed to delete related slaves")
 					return ctrl.Result{}, err
 				}
 			}
+
+			// StatefulSet 업데이트
+			if err := r.updateStatefulSet(ctx, currentSts, masterSts); err != nil {
+				log.Error(err, "Failed to update StatefulSet")
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
-	// 4. Redis Service 생성
-	svc := r.serviceForKRedis(reqKRedis)
-	service := &corev1.Service{}
-	err = r.Client.Get(ctx, client.ObjectKey{Name: svc.Name, Namespace: svc.Namespace}, service)
-	if err != nil && kerrors.IsNotFound(err) {
-		log.Info("Creating Redis Service.", "Namespace", svc.Namespace, "Name", svc.Name)
-		err = r.Client.Create(ctx, svc)
-		if err != nil {
-			log.Error(err, "Failed to create Redis Service.")
-			return ctrl.Result{}, err
-		}
-	} else if err != nil {
-		log.Error(err, "Failed to get Redis Service.")
+	// Slave Deployments 관리
+	if err := r.reconcileSlaveDeployments(ctx, reqKRedis); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	log.Info("KRedis Reconcile loop completed successfully.")
+	// Headless Service 생성/관리
+	if err := r.reconcileHeadlessService(ctx, reqKRedis); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Client Service 생성/관리
+	if err := r.reconcileClientService(ctx, reqKRedis); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	return ctrl.Result{}, nil
 }
 
-// deploymentForMaster: 마스터 노드를 위한 Deployment 생성
-func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv1.Deployment {
+func (r *KRedisReconciler) handleDataMigration(ctx context.Context, cr *stablev1alpha1.KRedis, sts *appsv1.StatefulSet) error {
+	log := log.FromContext(ctx)
+	
+	// 마지막 마스터 노드의 데이터 마이그레이션
+	podName := fmt.Sprintf("%s-%d", sts.Name, *sts.Spec.Replicas-1)
+	
+	// redis-cli를 통한 리샤딩 명령 실행
+	cmd := exec.Command("kubectl", "exec", podName, "-n", cr.Namespace, "--", 
+		"redis-cli", "--cluster", "reshard", 
+		fmt.Sprintf("%s:6379", podName),
+		"--cluster-yes")
+	
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Error(err, "Redis reshard failed", "output", string(output))
+		return fmt.Errorf("redis reshard failed: %v, output: %s", err, output)
+	}
+	
+	return nil
+}
+
+func (r *KRedisReconciler) deleteRelatedSlaves(ctx context.Context, cr *stablev1alpha1.KRedis, masterCount int) error {
+	log := log.FromContext(ctx)
+
+	// masterCount 이후의 슬레이브 Deployment 삭제
+	for i := masterCount; i < int(cr.Spec.Masters); i++ {
+		slaveName := fmt.Sprintf("%s-slave-%d", cr.Name, i)
+		slave := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      slaveName,
+				Namespace: cr.Namespace,
+			},
+		}
+		
+		if err := r.Client.Delete(ctx, slave); err != nil && !kerrors.IsNotFound(err) {
+			log.Error(err, "Failed to delete slave deployment", "name", slaveName)
+			return err
+		}
+		log.Info("Successfully deleted slave deployment", "name", slaveName)
+	}
+	return nil
+}
+
+func (r *KRedisReconciler) statefulSetForMaster(cr *stablev1alpha1.KRedis) *appsv1.StatefulSet {
 	labels := labelsForKRedis(cr.Name + "-master")
-	replicas := int32(cr.Spec.Masters)
-	return &appsv1.Deployment{
+	replicas := cr.Spec.Masters
+
+	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cr.Name + "-master",
 			Namespace: cr.Namespace,
 			Labels:    labels,
 		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName: cr.Name + "-master-headless",
+			Replicas:    &replicas,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: labels,
 			},
@@ -219,14 +175,10 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					ImagePullSecrets: []corev1.LocalObjectReference{
-						{
-							Name: "docker-secret", // Secret 이름
-						},
-					},
+					ImagePullSecrets: []corev1.LocalObjectReference{{Name: "docker-secret"}},
 					Containers: []corev1.Container{{
-						Image: cr.Spec.Image,
 						Name:  "redis-master",
+						Image: cr.Spec.Image,
 						Resources: corev1.ResourceRequirements{
 							Limits: corev1.ResourceList{
 								"cpu":    parseResource(cr.Spec.Resource["limits"], "cpu", "1"),
@@ -238,16 +190,14 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
 							},
 						},
 						Env: []corev1.EnvVar{
-							{
-								Name:  "MASTER",
-								Value: "true",
-							},
-							{
-								Name:  "REDIS_MAXMEMORY", // maxmemory 설정
-								Value: cr.Spec.Resource["limits"]["memory"],
-							},
+							{Name: "MASTER", Value: "true"},
+							{Name: "REDIS_MAXMEMORY", Value: cr.Spec.Resource["limits"]["memory"]},
+							{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{
+								FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+							}},
 						},
 						Ports: []corev1.ContainerPort{{
+							Name:          "redis",
 							ContainerPort: cr.Spec.BasePort,
 						}},
 					}},
@@ -258,12 +208,12 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
 									Weight: 1,
 									PodAffinityTerm: corev1.PodAffinityTerm{
 										LabelSelector: &metav1.LabelSelector{
-											MatchLabels: map[string]string{ // Master와 Slave 구분
+											MatchLabels: map[string]string{
 												"app":  "kredis",
-												"role": "slave", // Slave와의 배치를 회피
+												"role": "slave",
 											},
 										},
-										TopologyKey: "kubernetes.io/hostname", // 같은 노드에서 배치되지 않도록 지시
+										TopologyKey: "kubernetes.io/hostname",
 									},
 								},
 							},
@@ -273,6 +223,77 @@ func (r *KRedisReconciler) deploymentForMaster(cr *stablev1alpha1.KRedis) *appsv
 			},
 		},
 	}
+}
+
+func (r *KRedisReconciler) reconcileHeadlessService(ctx context.Context, cr *stablev1alpha1.KRedis) error {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cr.Name + "-master-headless",
+			Namespace: cr.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "None",
+			Selector:  labelsForKRedis(cr.Name + "-master"),
+			Ports: []corev1.ServicePort{{
+				Name:       "redis",
+				Port:      cr.Spec.BasePort,
+				TargetPort: intstr.FromInt(int(cr.Spec.BasePort)),
+			}},
+		},
+	}
+
+	// 서비스 생성 또는 업데이트
+	if err := r.Client.Get(ctx, client.ObjectKey{Name: svc.Name, Namespace: svc.Namespace}, &corev1.Service{}); err != nil {
+		if kerrors.IsNotFound(err) {
+			return r.Client.Create(ctx, svc)
+		}
+		return err
+	}
+	return r.Client.Update(ctx, svc)
+}
+
+func (r *KRedisReconciler) reconcileSlaveDeployments(ctx context.Context, cr *stablev1alpha1.KRedis) error {
+	log := log.FromContext(ctx)
+
+	// 현재 슬레이브 Deployment 목록 조회
+	slaveDeployments := &appsv1.DeploymentList{}
+	if err := r.Client.List(ctx, slaveDeployments, 
+		client.InNamespace(cr.Namespace),
+		client.MatchingLabels(map[string]string{"app": "kredis", "role": "slave"})); err != nil {
+		return err
+	}
+
+	// 필요한 슬레이브 수 계산
+	currentCount := len(slaveDeployments.Items)
+	desiredCount := int(cr.Spec.Masters)
+
+	// 슬레이브 Deployment 조정
+	for i := 0; i < max(currentCount, desiredCount); i++ {
+		if i >= desiredCount {
+			// 불필요한 슬레이브 삭제
+			if err := r.deleteRelatedSlaves(ctx, cr, desiredCount); err != nil {
+				return err
+			}
+		} else {
+			// 슬레이브 생성 또는 업데이트
+			slaveDep := r.deploymentForSlave(cr, i)
+			if err := r.Client.Get(ctx, client.ObjectKey{Name: slaveDep.Name, Namespace: slaveDep.Namespace}, &appsv1.Deployment{}); err != nil {
+				if kerrors.IsNotFound(err) {
+					if err := r.Client.Create(ctx, slaveDep); err != nil {
+						return err
+					}
+				} else {
+					return err
+				}
+			} else {
+				if err := r.Client.Update(ctx, slaveDep); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // deploymentForSlave: 슬레이브 노드를 위한 Deployment 생성
@@ -331,31 +352,10 @@ func (r *KRedisReconciler) deploymentForSlave(cr *stablev1alpha1.KRedis, index i
 	}
 }
 
-// serviceForKRedis: Redis Cluster를 위한 Service 생성
-func (r *KRedisReconciler) serviceForKRedis(cr *stablev1alpha1.KRedis) *corev1.Service {
-	labels := labelsForKRedis(cr.Name)
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name,
-			Namespace: cr.Namespace,
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: labels,
-			Ports: []corev1.ServicePort{{
-				Protocol:   corev1.ProtocolTCP,
-				Port:       cr.Spec.BasePort,
-				TargetPort: intstr.FromInt(int(cr.Spec.BasePort)),
-			}},
-		},
-	}
-}
-
-func equalDeployments(current, desired *appsv1.Deployment) bool {
-	// Spec만 비교하고 metadata는 제외 (Replicas 만 비교중임)
+func equalStatefulSets(current, desired *appsv1.StatefulSet) bool {
 	return current.Spec.Replicas != nil &&
 		desired.Spec.Replicas != nil &&
 		*current.Spec.Replicas == *desired.Spec.Replicas
-	// 추가적인 필드 비교가 필요할 경우 여기서 추가적으로 구현
 }
 
 func parseResource(resourceMap map[string]string, key string, defaultValue string) resource.Quantity {
@@ -397,11 +397,11 @@ func getPodNames(pods []corev1.Pod) []string {
 	return podNames
 }
 
-// SetupWithManager sets up the controller with the Manager.
 func (r *KRedisReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&stablev1alpha1.KRedis{}).
+		Owns(&appsv1.StatefulSet{}).
 		Owns(&appsv1.Deployment{}).
-		// WithOptions(controller.Options{MaxConcurrentReconciles: 2}).
+		Owns(&corev1.Service{}).
 		Complete(r)
 }
