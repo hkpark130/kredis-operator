@@ -14,7 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
+	"k8s.io/client-go/util/retry" // 내용: https://alenkacz.medium.com/kubernetes-operators-best-practices-understanding-conflict-errors-d05353dff421
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -69,21 +69,30 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	} else {
 		// StatefulSet이 존재하면 업데이트 검토
 		if !equalStatefulSets(currentSts, masterSts) {
-			// 스케일 다운 시나리오 체크
-			if currentSts.Spec.Replicas != nil && masterSts.Spec.Replicas != nil &&
-				*currentSts.Spec.Replicas > *masterSts.Spec.Replicas {
-				
-				// 데이터 마이그레이션 수행
-				if err := r.handleDataMigration(ctx, reqKRedis, currentSts); err != nil {
-					log.Error(err, "Failed to migrate data")
-					return ctrl.Result{}, err
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				// 스케일 다운 시나리오 체크
+				if currentSts.Spec.Replicas != nil && masterSts.Spec.Replicas != nil &&
+					*currentSts.Spec.Replicas > *masterSts.Spec.Replicas {
+
+					// 데이터 마이그레이션 수행
+					if err := r.handleDataMigration(ctx, reqKRedis, currentSts); err != nil {
+						log.Error(err, "Failed to migrate data")
+						return err
+					}
+
+					// 관련된 슬레이브 Deployment 삭제
+					if err := r.deleteRelatedSlaves(ctx, reqKRedis, int(*masterSts.Spec.Replicas)); err != nil {
+						log.Error(err, "Failed to delete related slaves")
+						return err
+					}
 				}
 
-				// 관련된 슬레이브 Deployment 삭제
-				if err := r.deleteRelatedSlaves(ctx, reqKRedis, int(*masterSts.Spec.Replicas)); err != nil {
-					log.Error(err, "Failed to delete related slaves")
-					return ctrl.Result{}, err
-				}
+				return nil // 스케일 다운이 아님
+			})
+
+			if err != nil {
+				log.Error(err, "Failed to update Master StatefulSet.")
+				return ctrl.Result{}, fmt.Errorf("failed to update Master StatefulSet: %w", err)
 			}
 
 			// StatefulSet 업데이트
@@ -91,6 +100,9 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				log.Error(err, "Failed to update StatefulSet")
 				return ctrl.Result{}, err
 			}
+		} else {
+			// StatefulSets are equal, nothing to do
+			return ctrl.Result{}, nil
 		}
 	}
 
@@ -110,6 +122,56 @@ func (r *KRedisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (r *KRedisReconciler) reconcileClientService(ctx context.Context, kredis *stablev1alpha1.KRedis) error {
+    log := log.FromContext(ctx)
+
+    svc := &corev1.Service{}
+    err := r.Get(ctx, types.NamespacedName{Name: kredis.Name + "-client", Namespace: kredis.Namespace}, svc)
+
+    if err != nil && kerrors.IsNotFound(err) {
+        // Client Service가 존재하지 않으면 생성
+        svc = r.clientServiceForKRedis(kredis)
+        err = r.Create(ctx, svc)
+        if err != nil {
+            log.Error(err, "Failed to create client service")
+            return err
+        }
+        log.Info("Created client service", "service", svc.Name)
+        return nil
+    } else if err != nil {
+        log.Error(err, "Failed to get client service")
+        return err
+    }
+
+    return nil
+}
+
+// Client Service 정의 함수
+func (r *KRedisReconciler) clientServiceForKRedis(kredis *stablev1alpha1.KRedis) *corev1.Service {
+    return &corev1.Service{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      kredis.Name + "-client",
+            Namespace: kredis.Namespace,
+            Labels: map[string]string{
+                "app": kredis.Name,
+            },
+        },
+        Spec: corev1.ServiceSpec{
+            Type: corev1.ServiceTypeClusterIP,
+            Ports: []corev1.ServicePort{
+                {
+                    Name:       "redis",
+                    Port:       6379,
+                    TargetPort: intstr.FromInt(6379),
+                },
+            },
+            Selector: map[string]string{
+                "app": kredis.Name,
+            },
+        },
+    }
 }
 
 func (r *KRedisReconciler) handleDataMigration(ctx context.Context, cr *stablev1alpha1.KRedis, sts *appsv1.StatefulSet) error {
@@ -266,6 +328,7 @@ func (r *KRedisReconciler) reconcileSlaveDeployments(ctx context.Context, cr *st
 	// 필요한 슬레이브 수 계산
 	currentCount := len(slaveDeployments.Items)
 	desiredCount := int(cr.Spec.Masters)
+	log.Info("Reconciling slave deployments", "currentCount: ", currentCount, "desiredCount: ", desiredCount)
 
 	// 슬레이브 Deployment 조정
 	for i := 0; i < max(currentCount, desiredCount); i++ {
@@ -350,6 +413,35 @@ func (r *KRedisReconciler) deploymentForSlave(cr *stablev1alpha1.KRedis, index i
 			},
 		},
 	}
+}
+
+func (r *KRedisReconciler) updateStatefulSet(ctx context.Context, currentSts, desiredSts *appsv1.StatefulSet) error {
+	log := log.FromContext(ctx)
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// 최신 버전의 StatefulSet 가져오기
+		latestSts := &appsv1.StatefulSet{}
+		err := r.Client.Get(ctx, types.NamespacedName{
+			Name:      currentSts.Name,
+			Namespace: currentSts.Namespace,
+		}, latestSts)
+		if err != nil {
+			return err
+		}
+
+		latestSts.Spec = desiredSts.Spec
+
+		err = r.Client.Update(ctx, latestSts)
+		return err
+	})
+
+	if err != nil {
+		log.Error(err, "Failed to update StatefulSet", "name", currentSts.Name)
+		return err
+	}
+
+	log.Info("Successfully updated StatefulSet", "name", currentSts.Name)
+	return nil
 }
 
 func equalStatefulSets(current, desired *appsv1.StatefulSet) bool {
