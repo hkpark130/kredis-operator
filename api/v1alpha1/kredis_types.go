@@ -30,14 +30,27 @@ type KRedisSpec struct {
 	Replicas   int32                        `json:"replicas"`
 	Memory     string                       `json:"memory"`
 	BasePort   int32                        `json:"basePort"`
+	ClusterInitialized	bool				`json:"clusterInitialized"`
 	Resource   map[string]map[string]string `json:"resource"`
 	SecretName string                       `json:"secretName"`
 }
 
 // KRedisStatus defines the observed state of KRedis
 type KRedisStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// 클러스터 상태 (Healthy, Unhealthy)
+	ClusterStatus string `json:"clusterStatus,omitempty"`
+	
+	// 활성화된 총 노드 수
+	ActiveNodes int32 `json:"activeNodes,omitempty"`
+	
+	// 마스터 노드 수
+	MasterNodes int32 `json:"masterNodes,omitempty"`
+	
+	// 슬레이브 노드 수
+	SlaveNodes int32 `json:"slaveNodes,omitempty"`
+	
+	// 마지막 클러스터 상태 체크 시간
+	LastChecked string `json:"lastChecked,omitempty"`
 }
 
 // +kubebuilder:object:root=true

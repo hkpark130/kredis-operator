@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-scripts
+  namespace: kredis-operator-system
+data:
+  create-cluster.sh: |
+    #!/bin/bash
+    # Redis 클러스터 생성 스크립트
+    # Master 및 Slave 호스트 이름을 인자로 받음
+
+    # Master 노드 수
+    num_masters=$1
+    shift
+
+    # Master 노드 정보
+    master_nodes=()
+    for i in $(seq 1 $num_masters); do
+      master_nodes+=("$1")
+      shift
+    done
+
+    # 슬레이브 노드 정보
+    slave_nodes=()
+    for i in $(seq 1 $num_masters); do
+      slave_nodes+=("$1")
+      shift
+    done
+
+    # Redis 클러스터 생성 (각 마스터당 슬레이브 1대)
+    redis-cli --cluster create "${master_nodes[@]}" --cluster-replicas 1 --cluster-yes
+  get_redis_ips.sh: |
+    #!/bin/bash
+    # 마스터 및 슬레이브 호스트 이름을 가져오는 스크립트
+    # 환경 변수를 통해 필요한 정보를 전달받음
+
+    # Redis 클러스터 정보 (환경 변수)
+    MASTERS=${MASTERS}
+    NAME=${NAME}
+    NAMESPACE=${NAMESPACE}
+    BASE_PORT=${BASE_PORT}
+
+    # 마스터 노드 수 출력 (첫 번째 인자로 전달)
+    echo $MASTERS
+
+    # 마스터 노드 호스트 이름
+    for i in $(seq 0 $((${MASTERS} - 1))); do
+        # 마스터 호스트 이름
+        master_host=${NAME}-master-$i.${NAME}-master-headless.${NAMESPACE}.svc.cluster.local:${BASE_PORT}
+        echo "$master_host"
+    done
+
+    # 슬레이브 노드 호스트 이름
+    for i in $(seq 0 $((${MASTERS} - 1))); do
+        # 슬레이브 호스트 이름
+        slave_host=${NAME}-slave-$i.${NAMESPACE}.svc.cluster.local:${BASE_PORT}
+        echo "$slave_host"
+    done

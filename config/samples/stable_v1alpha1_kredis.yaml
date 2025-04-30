@@ -11,6 +11,7 @@ spec:
   image: docker.direa.synology.me/redis-cluster:latest
   memory: 1gb
   basePort: 10000
+  clusterInitialized: false
   resource:
     limits:
       cpu: "4"       # CPU 제한량 e.g., 1, 500m, etc.

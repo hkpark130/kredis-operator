@@ -42,6 +42,8 @@ spec:
               basePort:
                 format: int32
                 type: integer
+              clusterInitialized:
+                type: boolean
               image:
                 type: string
               masters:
@@ -62,6 +64,7 @@ spec:
                 type: string
             required:
             - basePort
+            - clusterInitialized
             - image
             - masters
             - memory
