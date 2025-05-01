@@ -1,4 +1,16 @@
 ## Append samples of your project ##
 resources:
 - stable_v1alpha1_kredis.yaml
+
+# 이미지 레지스트리 주소를 변수로 처리
+patchesJson6902:
+- target:
+    group: stable.docker.direa.synology.me
+    version: v1alpha1
+    kind: Kredis
+    name: kredis-sample
+  patch: |-
+    - op: replace
+      path: /spec/image
+      value: ${REGISTRY_URL}/redis-cluster:latest
 # +kubebuilder:scaffold:manifestskustomizesamples
