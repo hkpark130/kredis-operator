@@ -5,7 +5,7 @@ import (
 
 	"github.com/hkpark130/kredis-operator/api/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
+	// "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // SetupRedisExporter는 Redis 모니터링을 위한 Prometheus Exporter를 설정합니다.
@@ -17,7 +17,7 @@ import (
 // - 명령 처리: commands_processed, commands_duration
 // - 키 통계: keyspace_hits, keyspace_misses, expired_keys
 // - 네트워크 I/O: input_bytes, output_bytes
-// - 클러스터 상태: cluster_state, cluster_slots_* 
+// - 클러스터 상태: cluster_state, cluster_slots_*
 //
 // ctx: 컨텍스트
 // c: 쿠버네티스 API 클라이언트

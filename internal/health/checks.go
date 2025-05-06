@@ -5,12 +5,12 @@ import (
 
 	"github.com/hkpark130/kredis-operator/api/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
+	// "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // ConfigureStatefulSetProbes는 StatefulSet에 liveness 및 readiness 프로브를 구성합니다.
 // Redis 클러스터의 안정적인 운영을 위해 각 노드의 상태를 모니터링합니다.
-// 
+//
 // 주요 기능:
 // - liveness probe: Redis 서버가 응답하는지 확인 (TCP 소켓 체크)
 // - readiness probe: Redis가 명령을 처리할 준비가 되었는지 확인 (PING 명령 실행)

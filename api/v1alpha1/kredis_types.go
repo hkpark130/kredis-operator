@@ -26,10 +26,10 @@ import (
 // KRedisSpec defines the desired state of KRedis
 type KRedisSpec struct {
 	Image      string                       `json:"image"`
-	Masters    int32                        `json:"masters"`
-	Replicas   int32                        `json:"replicas"`
+	Masters    int                          `json:"masters"`
+	Replicas   int                          `json:"replicas"`
 	Memory     string                       `json:"memory"`
-	BasePort   int32                        `json:"basePort"`
+	BasePort   int                          `json:"basePort"`
 	Resource   map[string]map[string]string `json:"resource"`
 	SecretName string                       `json:"secretName"`
 }

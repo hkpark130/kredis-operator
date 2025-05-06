@@ -28,6 +28,7 @@ resources:
 # [METRICS] Expose the controller manager metrics service.
 - metrics_service.yaml
 - docker-secret.yaml
+- redis-config.yaml  # Redis 설정을 위한 ConfigMap 추가
 
 # Uncomment the patches line if you enable Metrics, and/or are using webhooks and cert-manager
 patches:

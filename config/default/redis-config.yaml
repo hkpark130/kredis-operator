@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+data:
+  master.conf: |
+    cluster-enabled yes
+    cluster-config-file nodes.conf
+    # 실제 포트는 KRedis CR에 정의된 값으로 대체됩니다
+    port ${REDIS_PORT}
+    cluster-announce-ip ${POD_IP}
+    cluster-announce-port ${REDIS_PORT}
+    cluster-announce-bus-port ${CLUSTER_BUS_PORT}
+    # 실제 메모리는 KRedis CR에 정의된 값으로 대체됩니다
+    maxmemory ${REDIS_MAXMEMORY}
+    maxmemory-policy allkeys-lru
+    appendonly yes
+    save 900 1
+    save 300 10
+    save 60 10000
+    
+  slave.conf: |
+    cluster-enabled yes
+    cluster-config-file nodes.conf
+    port ${REDIS_PORT}
+    cluster-announce-ip ${POD_IP}
+    cluster-announce-port ${REDIS_PORT}
+    cluster-announce-bus-port ${CLUSTER_BUS_PORT}
+    maxmemory ${REDIS_MAXMEMORY}
+    maxmemory-policy allkeys-lru
+    appendonly yes
+    save 900 1
+    save 300 10
+    save 60 10000
+    # 슬레이브 특정 설정 (클러스터 오케스트레이션 시 사용)
+  
+  master.conf.template: |
+    cluster-enabled yes
+    cluster-config-file nodes.conf
+    # 실제 포트는 KRedis CR에 정의된 값으로 대체됩니다
+    port ${REDIS_PORT}
+    cluster-announce-ip ${POD_IP}
+    cluster-announce-port ${REDIS_PORT}
+    cluster-announce-bus-port ${CLUSTER_BUS_PORT}
+    # 실제 메모리는 KRedis CR에 정의된 값으로 대체됩니다
+    maxmemory ${REDIS_MAXMEMORY}
+    maxmemory-policy allkeys-lru
+    appendonly yes
+    save 900 1
+    save 300 10
+    save 60 10000
+    
+  slave.conf.template: |
+    cluster-enabled yes
+    cluster-config-file nodes.conf
+    port ${REDIS_PORT}
+    cluster-announce-ip ${POD_IP}
+    cluster-announce-port ${REDIS_PORT}
+    cluster-announce-bus-port ${CLUSTER_BUS_PORT}
+    maxmemory ${REDIS_MAXMEMORY}
+    maxmemory-policy allkeys-lru
+    appendonly yes
+    save 900 1
+    save 300 10
+    save 60 10000
+    # 슬레이브 특정 설정 (클러스터 오케스트레이션 시 사용)
+  
+  start-master.sh: |
+    #!/bin/sh
+    set -e
+    
+    # 환경 변수를 설정 파일에 주입
+    cat /redis-writable/master.conf.template | \
+      sed "s/\${REDIS_PORT}/$REDIS_PORT/g" | \
+      sed "s/\${POD_IP}/$POD_IP/g" | \
+      sed "s/\${CLUSTER_BUS_PORT}/$CLUSTER_BUS_PORT/g" | \
+      sed "s/\${REDIS_MAXMEMORY}/$REDIS_MAXMEMORY/g" > /redis-writable/master.conf
+    
+    # Redis 서버 실행
+    exec redis-server /redis-writable/master.conf
+  
+  start-slave.sh: |
+    #!/bin/sh
+    set -e
+    
+    # 환경 변수를 설정 파일에 주입
+    cat /redis-writable/slave.conf.template | \
+      sed "s/\${REDIS_PORT}/$REDIS_PORT/g" | \
+      sed "s/\${POD_IP}/$POD_IP/g" | \
+      sed "s/\${CLUSTER_BUS_PORT}/$CLUSTER_BUS_PORT/g" | \
+      sed "s/\${REDIS_MAXMEMORY}/$REDIS_MAXMEMORY/g" > /redis-writable/slave.conf
+    
+    # Redis 서버 실행
+    exec redis-server /redis-writable/slave.conf

@@ -40,17 +40,14 @@ spec:
             description: KRedisSpec defines the desired state of KRedis
             properties:
               basePort:
-                format: int32
                 type: integer
               image:
                 type: string
               masters:
-                format: int32
                 type: integer
               memory:
                 type: string
               replicas:
-                format: int32
                 type: integer
               resource:
                 additionalProperties:

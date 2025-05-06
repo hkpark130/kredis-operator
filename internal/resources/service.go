@@ -25,13 +25,57 @@ import (
 // cr: KRedis 커스텀 리소스
 // return: 구성된 헤드리스 Service 객체
 func CreateHeadlessService(cr *v1alpha1.KRedis) *corev1.Service {
-    // TODO: 헤드리스 서비스 구현
-    // - 서비스 이름 설정 (일반적으로 [name]-headless)
-    // - ClusterIP: "None" 설정
-    // - Redis 통신 포트 및 클러스터 버스 포트 노출
-    // - 적절한 라벨 셀렉터 설정 (역할 구분)
+	// 서비스 이름 생성 - 헤드리스 서비스임을 나타내는 접미사 추가
+	name := fmt.Sprintf("%s-headless", cr.Name)
 
-    return &corev1.Service{}
+	// Redis 포트와 클러스터 버스 포트 계산
+	// Redis 클러스터는 데이터 포트와 클러스터 버스 포트 두 개가 필요함
+	redisPort := cr.Spec.BasePort
+	clusterBusPort := redisPort + 10000 // 클러스터 버스 포트는 일반적으로 basePort + 10000
+
+	// 서비스에 적용할 라벨 생성
+	labels := utils.LabelsForKRedis(cr.Name, "service")
+	labels["headless"] = "true"
+
+	// 서비스 셀렉터 - 마스터와 슬레이브 노드 모두 대상으로 함
+	selector := map[string]string{
+		"app":       "kredis",
+		"kredis_cr": cr.Name,
+	}
+
+	// 헤드리스 서비스 객체 생성
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: cr.Namespace,
+			Labels:    labels,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(cr, v1alpha1.GroupVersion.WithKind("KRedis")),
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "None", // 헤드리스 서비스의 핵심 설정
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "redis",
+					Port:       int32(redisPort),
+					TargetPort: intstr.FromInt(int(redisPort)),
+					Protocol:   "TCP",
+				},
+				{
+					Name:       "cluster-bus",
+					Port:       int32(clusterBusPort),
+					TargetPort: intstr.FromInt(int(clusterBusPort)),
+					Protocol:   "TCP",
+				},
+			},
+			Selector: selector,
+			// StatefulSet에서 Pod와 연결할 때 사용됨
+			PublishNotReadyAddresses: true, // 초기화 중인 Pod의 주소도 DNS에 등록
+		},
+	}
+
+	return service
 }
 
 // CreateClientService는 Redis 클러스터에 접근하기 위한 클라이언트 서비스를 생성합니다.
@@ -50,11 +94,11 @@ func CreateHeadlessService(cr *v1alpha1.KRedis) *corev1.Service {
 // cr: KRedis 커스텀 리소스
 // return: 구성된 Client Service 객체
 func CreateClientService(cr *v1alpha1.KRedis) *corev1.Service {
-    // TODO: 클라이언트 서비스 구현
-    // - 서비스 이름 설정 (일반적으로 [name]-client)
-    // - 표준 ClusterIP 서비스 타입 설정
-    // - 클라이언트 접속용 Redis 포트만 노출
-    // - 마스터 노드를 대상으로 하는 셀렉터 설정
+	// TODO: 클라이언트 서비스 구현
+	// - 서비스 이름 설정 (일반적으로 [name]-client)
+	// - 표준 ClusterIP 서비스 타입 설정
+	// - 클라이언트 접속용 Redis 포트만 노출
+	// - 마스터 노드를 대상으로 하는 셀렉터 설정
 
-    return &corev1.Service{}
+	return &corev1.Service{}
 }
