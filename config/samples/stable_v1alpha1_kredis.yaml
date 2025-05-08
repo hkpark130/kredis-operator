@@ -8,8 +8,7 @@ metadata:
 spec:
   replicas: 1 # 슬레이브 노드
   masters: 3 # 마스터 노드
-  # image: docker.direa.synology.me/redis-cluster:latest
-  image: 192.168.0.33:9083/redis-cluster:latest
+  image: docker.direa.synology.me/redis-cluster:latest
   memory: 1gb
   basePort: 10000
   resource:

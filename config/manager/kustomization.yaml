@@ -4,5 +4,5 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 images:
 - name: controller
-  newName: 192.168.0.33:9083/kredis-operator
+  newName: docker.direa.synology.me/kredis-operator
   newTag: latest

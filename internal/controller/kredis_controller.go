@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"reflect"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -157,7 +156,7 @@ func (r *KRedisReconciler) ensureHeadlessService(ctx context.Context, cr *stabil
 		needsUpdate = true
 	}
 
-	// PublishNotReadyAddresses 설정이 다른지 확인
+	// PublishNotReadyAddresses 설정이 다른지 확인 (아직 준비되지 않은 Pod도 DNS에 등록해줌)
 	if found.Spec.PublishNotReadyAddresses != headlessService.Spec.PublishNotReadyAddresses {
 		needsUpdate = true
 	}
@@ -339,6 +338,7 @@ func (r *KRedisReconciler) reconcileMasters(ctx context.Context, cr *stabilev1al
 // StatefulSet을 사용하여 슬레이브 노드를 생성, 업데이트 또는 삭제합니다.
 func (r *KRedisReconciler) reconcileSlaves(ctx context.Context, cr *stabilev1alpha1.KRedis) error {
 	log := log.FromContext(ctx)
+	clusterManager := redis.NewClusterManager(r.Client)
 
 	// 마스터 수만큼 순회하며 각 마스터에 대한 슬레이브 StatefulSet을 처리
 	for masterIdx := int(0); masterIdx < cr.Spec.Masters; masterIdx++ {
@@ -365,14 +365,62 @@ func (r *KRedisReconciler) reconcileSlaves(ctx context.Context, cr *stabilev1alp
 		// StatefulSet이 존재하면 필요에 따라 업데이트
 		needsUpdate := false
 
-		// 레플리카 수가 다른지 확인
+		// 레플리카 수 변경 감지 및 처리 (스케일 업/다운)
 		if *found.Spec.Replicas != int32(cr.Spec.Replicas) {
-			log.Info("Updating slave StatefulSet replicas",
-				"name", found.Name,
-				"current", *found.Spec.Replicas,
-				"desired", cr.Spec.Replicas)
-			*found.Spec.Replicas = int32(cr.Spec.Replicas)
-			needsUpdate = true
+			// 스케일 다운(슬레이브 수 감소) 케이스 처리
+			if *found.Spec.Replicas > int32(cr.Spec.Replicas) {
+				log.Info("Slave scale down detected",
+					"name", found.Name,
+					"current", *found.Spec.Replicas,
+					"desired", cr.Spec.Replicas)
+
+				// 슬레이브 스케일 다운 상태 확인
+				scaleStatus, err := clusterManager.GetSlaveScaleStatus(ctx, cr, masterIdx)
+				if err != nil {
+					log.Error(err, "Failed to get slave scale status", "masterIndex", masterIdx)
+					return err
+				}
+
+				// 진행 중이면 완료 여부 확인
+				if scaleStatus.InProgress {
+					if scaleStatus.Completed {
+						log.Info("Slave scale down completed, updating StatefulSet", "name", found.Name)
+						*found.Spec.Replicas = int32(cr.Spec.Replicas)
+						needsUpdate = true
+						
+						// 상태 초기화
+						scaleStatus.InProgress = false
+						scaleStatus.Completed = false
+						if err := clusterManager.SetSlaveScaleStatus(ctx, cr, masterIdx, scaleStatus); err != nil {
+							log.Error(err, "Failed to reset slave scale status", "masterIndex", masterIdx)
+							return err
+						}
+					} else {
+						log.Info("Slave scale down in progress", "name", found.Name, "message", scaleStatus.Message)
+					}
+				} else {
+					// 아직 시작하지 않았으면 스케일 다운 시작
+					log.Info("Starting slave scale down process", "name", found.Name)
+					
+					// 스케일 다운 상태 설정
+					scaleStatus.InProgress = true
+					scaleStatus.Message = "Scale down initiated"
+					if err := clusterManager.SetSlaveScaleStatus(ctx, cr, masterIdx, scaleStatus); err != nil {
+						log.Error(err, "Failed to set slave scale status", "masterIndex", masterIdx)
+						return err
+					}
+					
+					// 이 시점에서는 StatefulSet을 업데이트하지 않고 다음 조정에서 처리
+				}
+			} else {
+				// 스케일 업(슬레이브 수 증가)인 경우 바로 업데이트
+				log.Info("Updating slave StatefulSet replicas (scale up)",
+					"name", found.Name,
+					"current", *found.Spec.Replicas,
+					"desired", cr.Spec.Replicas)
+				*found.Spec.Replicas = int32(cr.Spec.Replicas)
+				needsUpdate = true
+			}
 		}
 
 		// 이미지가 변경되었는지 확인
@@ -476,145 +524,12 @@ func (r *KRedisReconciler) orchestrateCluster(ctx context.Context, cr *stabilev1
 	// Redis 클러스터 매니저 인스턴스 생성
 	clusterManager := redis.NewClusterManager(r.Client)
 
-	// 1. 클러스터 상태 확인 (초기화 필요 여부)
-	clusterExists, err := clusterManager.CheckClusterExists(ctx, cr)
-	if err != nil {
-		log.Error(err, "Failed to check if cluster exists")
+	// 클러스터 오케스트레이션을 ClusterManager에게 위임
+	if err := clusterManager.OrchestrateCluster(ctx, cr); err != nil {
+		log.Error(err, "Failed to orchestrate Redis cluster")
 		return err
 	}
 
-	// 2. 필요시 클러스터 초기화
-	if !clusterExists {
-		log.Info("Initializing new Redis cluster")
-		if err := clusterManager.InitializeCluster(ctx, cr); err != nil {
-			log.Error(err, "Failed to initialize cluster")
-			return err
-		}
-		log.Info("Successfully initialized Redis cluster")
-		return nil // 초기화 후 다음 조정에서 나머지 작업 진행
-	}
-
-	// 3. 클러스터 설정과 실제 구성 비교
-	// 마스터 노드 변경 확인
-	currentMasters, err := clusterManager.GetCurrentMasters(ctx, cr)
-	if err != nil {
-		log.Error(err, "Failed to get current master nodes")
-		return err
-	}
-
-	// 마스터 노드 수 변경 감지 (스케일 업/다운)
-	desiredMasters := cr.Spec.Masters
-	if len(currentMasters) > desiredMasters {
-		// 스케일 다운 필요
-		log.Info("Scale down detected", "current", len(currentMasters), "desired", desiredMasters)
-
-		// 제거할 마스터 노드 수
-		toRemove := len(currentMasters) - desiredMasters
-
-		for i := 0; i < toRemove; i++ {
-			// 현재 마스터 노드 목록에서 마지막 인덱스를 제거 대상으로 선택
-			nodeIndex := len(currentMasters) - 1 - i
-
-			log.Info("Removing master node and its slaves", "masterIndex", nodeIndex)
-
-			// 1. 마스터 노드의 데이터 리샤딩 (중요: 데이터 이동 먼저 수행)
-			// RemoveMasterNode 메서드에서 슬롯 리샤딩(데이터 이동)을 수행합니다
-			// 노드가 가진 모든 슬롯을 다른 노드로 이동시킨 후에 노드 제거를 진행합니다
-			if err := clusterManager.RemoveMasterNode(ctx, cr, nodeIndex); err != nil {
-				log.Error(err, "Failed to remove master node (resharding failed)", "index", nodeIndex)
-				return err
-			}
-
-			// 2. 마스터에 연결된 슬레이브 노드들 제거 (CLUSTER FORGET)
-			slaveCount, err := clusterManager.GetSlaveCountForMaster(ctx, cr, nodeIndex)
-			if err != nil {
-				log.Error(err, "Failed to get slave count for master", "masterIndex", nodeIndex)
-				return err
-			}
-
-			for slaveIdx := 0; slaveIdx < slaveCount; slaveIdx++ {
-				if err := clusterManager.RemoveSlaveNode(ctx, cr, nodeIndex, slaveIdx); err != nil {
-					log.Error(err, "Failed to remove slave node", "masterIndex", nodeIndex, "slaveIndex", slaveIdx)
-					return err
-				}
-			}
-
-			// 3. 클러스터에서 마스터 노드도 완전히 제거 (CLUSTER FORGET)
-			if err := clusterManager.ForgetNode(ctx, cr, nodeIndex, "master"); err != nil {
-				log.Error(err, "Failed to forget master node from cluster", "index", nodeIndex)
-				return err
-			}
-
-			log.Info("Successfully removed master node and its slaves from Redis cluster", "masterIndex", nodeIndex)
-
-			// 4. StatefulSet 레플리카 수 조정은 reconcileMasters에서 처리됩니다
-			// 클러스터에서 안전하게 노드 제거가 완료되었음을 표시
-			// 마스터 StatefulSet이 이 어노테이션을 보고 레플리카 수를 조정합니다
-			masterSts := &appsv1.StatefulSet{}
-			err = r.Get(ctx, types.NamespacedName{
-				Name:      fmt.Sprintf("%s-master", cr.Name),
-				Namespace: cr.Namespace,
-			}, masterSts)
-			if err != nil {
-				log.Error(err, "Failed to get master StatefulSet")
-				return err
-			}
-
-			if masterSts.Annotations == nil {
-				masterSts.Annotations = make(map[string]string)
-			}
-			masterSts.Annotations["redis.kredis-operator/scale-down-complete"] = "true"
-			delete(masterSts.Annotations, "redis.kredis-operator/scale-down-in-progress")
-
-			if err = r.Update(ctx, masterSts); err != nil {
-				log.Error(err, "Failed to update master StatefulSet annotations")
-				return err
-			}
-		}
-	} else if len(currentMasters) < desiredMasters {
-		// 스케일 업 필요
-		log.Info("Scale up detected", "current", len(currentMasters), "desired", desiredMasters)
-
-		// 추가할 마스터 노드 수
-		toAdd := desiredMasters - len(currentMasters)
-
-		for i := 0; i < toAdd; i++ {
-			nodeIndex := len(currentMasters) + i
-
-			// 1. 마스터 노드 추가 (SlaveStatefulSet이 마스터를 자동으로 인식할 수 있도록)
-			if err := clusterManager.AddMasterNode(ctx, cr, nodeIndex); err != nil {
-				log.Error(err, "Failed to add master node", "index", nodeIndex)
-				return err
-			}
-
-			// 2. 필요한 슬레이브 노드 추가
-			for slaveIdx := 0; slaveIdx < int(cr.Spec.Replicas); slaveIdx++ {
-				if err := clusterManager.AddSlaveNode(ctx, cr, nodeIndex, slaveIdx); err != nil {
-					log.Error(err, "Failed to add slave node", "masterIndex", nodeIndex, "slaveIndex", slaveIdx)
-					return err
-				}
-			}
-
-			log.Info("Successfully added master node and its slaves", "masterIndex", nodeIndex)
-		}
-	}
-
-	// 4. 슬롯 밸런싱이 필요한지 확인하고 수행
-	needsRebalancing, err := clusterManager.CheckSlotsBalance(ctx, cr)
-	if err != nil {
-		log.Error(err, "Failed to check slots balance")
-		return err
-	}
-
-	if needsRebalancing {
-		log.Info("Rebalancing slots across cluster")
-		if err := clusterManager.RebalanceSlots(ctx, cr); err != nil {
-			log.Error(err, "Failed to rebalance slots")
-			return err
-		}
-	}
-
-	log.Info("Cluster orchestration completed successfully")
 	return nil
 }
 
