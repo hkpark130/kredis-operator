@@ -165,17 +165,73 @@ func CreateSlaveStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 
 // 슬레이브-per-master
 func CreateSlaveStatefulSetForMaster(k *cachev1alpha1.Kredis, scheme *runtime.Scheme, masterIndex int) (*appsv1.StatefulSet, error) {
+	// 특정 마스터 노드에 대한 FQDN
 	masterFQDN := fmt.Sprintf("%s-master-%d.%s-master.%s.svc.cluster.local", k.Name, masterIndex, k.Name, k.Namespace)
+
+	// StatefulSet 이름을 masterIndex를 포함하도록 설정
+	// 이렇게 하면 자동으로 생성되는 파드 이름이 kredis-sample-slave-{masterIndex}-{replicaIndex} 형태가 됨
 	slaveName := fmt.Sprintf("%s-slave-%d", k.Name, masterIndex)
+
 	env := []corev1.EnvVar{
 		{Name: "REDIS_MODE", Value: "slave"},
 		{Name: "MASTER_HOST", Value: masterFQDN},
 		{Name: "MASTER_PORT", Value: fmt.Sprintf("%d", k.Spec.BasePort)},
 		{Name: "MASTER_INDEX", Value: fmt.Sprintf("%d", masterIndex)},
 		{Name: "TOTAL_MASTERS", Value: fmt.Sprintf("%d", k.Spec.Masters)},
+		{
+			Name: "POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		},
+		// POD_INDEX 환경 변수 추가 - 파드의 인덱스를 확인할 수 있음
+		{
+			Name: "POD_INDEX",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		},
+		// 디버깅을 위한 추가 정보
+		{Name: "REDIS_ROLE", Value: "slave"},
+		{Name: "SLAVE_FOR_MASTER", Value: fmt.Sprintf("%d", masterIndex)},
 	}
+
+	// 해당 마스터에 특화된 레이블 생성
+	// 추가 레이블을 포함한 레이블 맵 생성 - 어떤 마스터에 속한 슬레이브인지 명시
 	labels := LabelsForKredis(k.Name, fmt.Sprintf("slave-%d", masterIndex))
-	return createRedisStatefulSet(k, scheme, slaveName, slaveName, "slave", k.Spec.Replicas, labels, env), nil
+	labels["master-index"] = fmt.Sprintf("%d", masterIndex) // 마스터 인덱스를 레이블에 추가
+
+	// StatefulSet 생성
+	ss := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      slaveName, // kredis-sample-slave-{masterIndex}
+			Namespace: k.Namespace,
+			Labels:    labels,
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:    &k.Spec.Replicas, // 각 마스터당 replicas 수만큼 슬레이브 생성
+			ServiceName: slaveName,        // 이 서비스 이름은 StatefulSet의 DNS 조회에 사용됨
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: corev1.PodSpec{
+					Containers:       []corev1.Container{redisContainer(k, env)},
+					ImagePullSecrets: []corev1.LocalObjectReference{{Name: "docker-secret"}},
+				},
+			},
+			VolumeClaimTemplates: volumeClaims(),
+			// 병렬로 파드 관리
+			PodManagementPolicy: appsv1.ParallelPodManagement,
+		},
+	}
+
+	// 컨트롤러 참조 설정
+	controllerutil.SetControllerReference(k, ss, scheme)
+	return ss, nil
 }
 
 // Unified 슬레이브

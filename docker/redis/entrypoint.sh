@@ -52,10 +52,13 @@ start_redis_exporter() {
 configure_slave() {
   local master_host="${MASTER_HOST:-localhost}"
   local master_port="${MASTER_PORT:-6379}"
+  # 파드 이름에서 마지막 인덱스 추출 (kredis-sample-slave-0-1에서 1을 가져옴)
   local pod_index="$(hostname | grep -o '[0-9]\+$')"
-  local master_index="${MASTER_INDEX:-$((pod_index % ${TOTAL_MASTERS:-3}))}"
-  local kredis_name="$(hostname | sed 's/-slave-[0-9]\+$//')"
-  local target_master="${kredis_name}-master-${master_index}.${master_host}"
+  # 이미 환경변수에서 마스터 인덱스를 받지만, 없으면 호스트명에서 추출
+  local master_index="${MASTER_INDEX:-$(hostname | sed -E 's/.*-slave-([0-9]+)-[0-9]+$/\1/')}"
+  # kredis 이름 추출 (kredis-sample-slave-0-0 → kredis-sample)
+  local kredis_name="$(hostname | sed -E 's/-slave-[0-9]+-[0-9]+$//')"
+  local target_master="${master_host}"
 
   log_message "슬레이브 모드: 마스터 노드 -> $target_master:$master_port"
 
