@@ -120,8 +120,7 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
-	// 각 마스터 파드에 대해 슬레이브 StatefulSet 생성
-	totalSlaveStatefulSets := 0
+	// 통합된 슬레이브 StatefulSet 생성
 	totalSlaveReadyReplicas := int32(0)
 	totalSlaveReplicas := int32(0)
 
@@ -129,59 +128,47 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	masterPodCount := int(foundMaster.Status.Replicas)
 	logger.Info(fmt.Sprintf("마스터 파드 수: %d", masterPodCount))
 
-	// 각 마스터 파드에 대해 슬레이브 StatefulSet 생성
-	for i := 0; i < masterPodCount; i++ {
-		masterPodName := fmt.Sprintf("%s-master-%d", kredis.Name, i)
-		slaveName := fmt.Sprintf("%s-slave-%d", kredis.Name, i)
+	// 통합된 슬레이브 StatefulSet 확인
+	slaveName := fmt.Sprintf("%s-slave", kredis.Name)
+	foundSlave := &appsv1.StatefulSet{}
+	err = r.Get(ctx, types.NamespacedName{Name: slaveName, Namespace: kredis.Namespace}, foundSlave)
 
-		foundSlave := &appsv1.StatefulSet{}
-		err = r.Get(ctx, types.NamespacedName{Name: slaveName, Namespace: kredis.Namespace}, foundSlave)
-
-		if err != nil && errors.IsNotFound(err) {
-			// 특정 마스터 파드에 대한 슬레이브 StatefulSet 생성
-			logger.Info(fmt.Sprintf("마스터 파드 %s에 대한 슬레이브 StatefulSet 생성", masterPodName))
-
-			// 슬레이브 StatefulSet 생성
-			slaveSts, err := resource.CreateSlaveStatefulSetForMaster(kredis, r.Scheme, i)
-			if err != nil {
-				logger.Error(err, fmt.Sprintf("마스터 %d에 대한 슬레이브 StatefulSet 생성 실패", i))
-				return ctrl.Result{}, err
-			}
-
-			logger.Info("Redis Slave StatefulSet 생성", "StatefulSet.Namespace", slaveSts.Namespace, "StatefulSet.Name", slaveSts.Name)
-			err = r.Create(ctx, slaveSts)
-			if err != nil {
-				logger.Error(err, "Slave StatefulSet 생성 실패", "StatefulSet.Namespace", slaveSts.Namespace, "StatefulSet.Name", slaveSts.Name)
-				return ctrl.Result{}, err
-			}
-
-			// 슬레이브 서비스 생성
-			slaveSvc := resource.CreateSlaveServiceForMaster(kredis, r.Scheme, i)
-			logger.Info("Redis Slave Service 생성", "Service.Namespace", slaveSvc.Namespace, "Service.Name", slaveSvc.Name)
-			err = r.Create(ctx, slaveSvc)
-			if err != nil {
-				logger.Error(err, "Slave Service 생성 실패", "Service.Namespace", slaveSvc.Namespace, "Service.Name", slaveSvc.Name)
-				return ctrl.Result{}, err
-			}
-
-			// 한 번에 하나씩 생성하기 위해 리큐
+	if err != nil && errors.IsNotFound(err) {
+		// 마스터가 준비될 때까지 대기
+		if foundMaster.Status.ReadyReplicas < 1 {
+			logger.Info("마스터 파드가 준비될 때까지 대기 중...")
 			return ctrl.Result{Requeue: true}, nil
-		} else if err != nil {
-			logger.Error(err, fmt.Sprintf("마스터 %d에 대한 Slave StatefulSet 조회 실패", i))
-			return ctrl.Result{}, err
-		} else {
-			// StatefulSet 발견, 통계 업데이트
-			totalSlaveStatefulSets++
-			totalSlaveReplicas += foundSlave.Status.Replicas
-			totalSlaveReadyReplicas += foundSlave.Status.ReadyReplicas
 		}
-	}
 
-	logger.Info(fmt.Sprintf("총 슬레이브 StatefulSet 수: %d", totalSlaveStatefulSets))
-	// 모든 슬레이브 StatefulSet이 생성되었는지 확인
-	if totalSlaveStatefulSets < masterPodCount {
-		logger.Info("일부 슬레이브 StatefulSet이 아직 생성되지 않았습니다. 리큐합니다.")
+		// 통합된 슬레이브 StatefulSet 생성
+		logger.Info("통합된 슬레이브 StatefulSet 생성")
+		slaveSts := resource.CreateUnifiedSlaveStatefulSet(kredis, r.Scheme)
+
+		logger.Info("Redis Slave StatefulSet 생성", "StatefulSet.Namespace", slaveSts.Namespace, "StatefulSet.Name", slaveSts.Name)
+		err = r.Create(ctx, slaveSts)
+		if err != nil {
+			logger.Error(err, "통합된 Slave StatefulSet 생성 실패", "StatefulSet.Namespace", slaveSts.Namespace, "StatefulSet.Name", slaveSts.Name)
+			return ctrl.Result{}, err
+		}
+
+		// 통합된 슬레이브 서비스 생성
+		slaveSvc := resource.CreateSlaveService(kredis, r.Scheme)
+		logger.Info("통합된 Redis Slave Service 생성", "Service.Namespace", slaveSvc.Namespace, "Service.Name", slaveSvc.Name)
+		err = r.Create(ctx, slaveSvc)
+		if err != nil {
+			logger.Error(err, "Slave Service 생성 실패", "Service.Namespace", slaveSvc.Namespace, "Service.Name", slaveSvc.Name)
+			return ctrl.Result{}, err
+		}
+
+		// 생성 후 리큐
 		return ctrl.Result{Requeue: true}, nil
+	} else if err != nil {
+		logger.Error(err, "통합된 Slave StatefulSet 조회 실패")
+		return ctrl.Result{}, err
+	} else {
+		// StatefulSet 발견, 통계 업데이트
+		totalSlaveReplicas = foundSlave.Status.Replicas
+		totalSlaveReadyReplicas = foundSlave.Status.ReadyReplicas
 	}
 
 	// Update metrics with master and all slave metrics
