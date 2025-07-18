@@ -14,36 +14,89 @@ import (
 	cachev1alpha1 "github.com/hkpark130/kredis-operator/api/v1alpha1"
 )
 
-// Helper: Create resource requirements from Spec
-func createResourceRequirements(resourcesMap map[string]map[string]string) corev1.ResourceRequirements {
-	reqs := corev1.ResourceRequirements{
-		Limits:   corev1.ResourceList{},
-		Requests: corev1.ResourceList{},
-	}
-	if limitMap, ok := resourcesMap["limits"]; ok {
-		for k, v := range limitMap {
-			reqs.Limits[corev1.ResourceName(k)] = resource.MustParse(v)
-		}
-	}
-	if requestMap, ok := resourcesMap["requests"]; ok {
-		for k, v := range requestMap {
-			reqs.Requests[corev1.ResourceName(k)] = resource.MustParse(v)
-		}
-	}
-	return reqs
-}
+// CreateRedisStatefulSet creates a unified StatefulSet for all Redis nodes
+func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *appsv1.StatefulSet {
+	// 총 레플리카 수 계산: 마스터 + (마스터 * 슬레이브)
+	totalReplicas := k.Spec.Masters + (k.Spec.Masters * k.Spec.Replicas)
 
-// Helper: Shared volume claims
-func volumeClaims() []corev1.PersistentVolumeClaim {
-	return []corev1.PersistentVolumeClaim{
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "redis-data",
+	labels := LabelsForKredis(k.Name, "redis")
+
+	// 환경 변수 설정 - 컨트롤러가 클러스터 관리를 담당하므로 최소한만 설정
+	env := []corev1.EnvVar{
+		{Name: "REDIS_PORT", Value: fmt.Sprintf("%d", k.Spec.BasePort)},
+		{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+		}},
+		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+		}},
+	}
+
+	// 리소스 요구사항
+	resources := corev1.ResourceRequirements{}
+	if k.Spec.Resources != nil {
+		if limitMap, ok := k.Spec.Resources["limits"]; ok {
+			resources.Limits = corev1.ResourceList{}
+			for key, value := range limitMap {
+				resources.Limits[corev1.ResourceName(key)] = resource.MustParse(value)
+			}
+		}
+		if requestMap, ok := k.Spec.Resources["requests"]; ok {
+			resources.Requests = corev1.ResourceList{}
+			for key, value := range requestMap {
+				resources.Requests[corev1.ResourceName(key)] = resource.MustParse(value)
+			}
+		}
+	}
+
+	// 프로브 설정
+	livenessProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(int(k.Spec.BasePort))},
+		},
+		InitialDelaySeconds: 30,
+		PeriodSeconds:       10,
+	}
+
+	readinessProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{"redis-cli", "-p", fmt.Sprintf("%d", k.Spec.BasePort), "ping"},
 			},
+		},
+		InitialDelaySeconds: 5,
+		PeriodSeconds:       5,
+		TimeoutSeconds:      3,
+		SuccessThreshold:    1,
+		FailureThreshold:    3,
+	}
+
+	// Redis 컨테이너
+	redisContainer := corev1.Container{
+		Name:            "redis",
+		Image:           k.Spec.Image,
+		ImagePullPolicy: corev1.PullAlways,
+		Command:         []string{"sh", "-c", "/entrypoint.sh"},
+		Env:             env,
+		Ports: []corev1.ContainerPort{
+			{ContainerPort: k.Spec.BasePort, Name: "redis"},
+			{ContainerPort: k.Spec.BasePort + 10000, Name: "cluster-bus"},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "redis-data", MountPath: "/data"},
+			{Name: "redis-logs", MountPath: "/logs"},
+		},
+		Resources:      resources,
+		LivenessProbe:  livenessProbe,
+		ReadinessProbe: readinessProbe,
+	}
+
+	// 볼륨 클레임 템플릿
+	volumeClaimTemplates := []corev1.PersistentVolumeClaim{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "redis-data"},
 			Spec: corev1.PersistentVolumeClaimSpec{
-				AccessModes: []corev1.PersistentVolumeAccessMode{
-					corev1.ReadWriteOnce,
-				},
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
 						corev1.ResourceStorage: resource.MustParse("1Gi"),
@@ -52,13 +105,9 @@ func volumeClaims() []corev1.PersistentVolumeClaim {
 			},
 		},
 		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "redis-logs",
-			},
+			ObjectMeta: metav1.ObjectMeta{Name: "redis-logs"},
 			Spec: corev1.PersistentVolumeClaimSpec{
-				AccessModes: []corev1.PersistentVolumeAccessMode{
-					corev1.ReadWriteOnce,
-				},
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
 						corev1.ResourceStorage: resource.MustParse("500Mi"),
@@ -67,150 +116,17 @@ func volumeClaims() []corev1.PersistentVolumeClaim {
 			},
 		},
 	}
-}
-
-// Helper: Probes
-func redisProbes(basePort int32) (*corev1.Probe, *corev1.Probe) {
-	liveness := &corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
-			TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(int(basePort))},
-		},
-		InitialDelaySeconds: 30,
-		PeriodSeconds:       10,
-	}
-	readiness := &corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
-			Exec: &corev1.ExecAction{
-				Command: []string{"redis-cli", "ping"},
-			},
-		},
-		InitialDelaySeconds: 5,
-		PeriodSeconds:       10,
-		TimeoutSeconds:      3,
-		SuccessThreshold:    1,
-		FailureThreshold:    3,
-	}
-	return liveness, readiness
-}
-
-// Helper: Base Redis container
-func redisContainer(k *cachev1alpha1.Kredis, env []corev1.EnvVar) corev1.Container {
-	liveness, readiness := redisProbes(k.Spec.BasePort)
-	return corev1.Container{
-		Image:           k.Spec.Image,
-		Name:            "redis",
-		ImagePullPolicy: corev1.PullAlways,
-		Command:         []string{"sh", "-c", "/entrypoint.sh"},
-		Env:             env,
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "redis-data", MountPath: "/data"},
-			{Name: "redis-logs", MountPath: "/logs"},
-		},
-		Resources:      createResourceRequirements(k.Spec.Resources),
-		Ports:          []corev1.ContainerPort{{ContainerPort: k.Spec.BasePort, Name: "redis"}},
-		LivenessProbe:  liveness,
-		ReadinessProbe: readiness,
-	}
-}
-
-// Helper: Create StatefulSet
-func createRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme, name, serviceName string, role string, replicas int32, labels map[string]string, env []corev1.EnvVar) *appsv1.StatefulSet {
-	ss := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: k.Namespace,
-		},
-		Spec: appsv1.StatefulSetSpec{
-			Replicas:    &replicas,
-			ServiceName: serviceName,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
-				},
-				Spec: corev1.PodSpec{
-					Containers:       []corev1.Container{redisContainer(k, env)},
-					ImagePullSecrets: []corev1.LocalObjectReference{{Name: "docker-secret"}},
-				},
-			},
-			VolumeClaimTemplates: volumeClaims(),
-		},
-	}
-	controllerutil.SetControllerReference(k, ss, scheme)
-	return ss
-}
-
-// 마스터용 StatefulSet
-func CreateMasterStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *appsv1.StatefulSet {
-	masterName := fmt.Sprintf("%s-master", k.Name)
-	env := []corev1.EnvVar{{Name: "REDIS_MODE", Value: "master"}}
-	labels := LabelsForKredis(k.Name, "master")
-	return createRedisStatefulSet(k, scheme, masterName, masterName, "master", k.Spec.Masters, labels, env)
-}
-
-// 일반 슬레이브
-func CreateSlaveStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *appsv1.StatefulSet {
-	slaveName := fmt.Sprintf("%s-slave", k.Name)
-	masterSvc := fmt.Sprintf("%s-master.%s.svc.cluster.local", k.Name, k.Namespace)
-	env := []corev1.EnvVar{
-		{Name: "REDIS_MODE", Value: "slave"},
-		{Name: "MASTER_HOST", Value: masterSvc},
-		{Name: "MASTER_PORT", Value: fmt.Sprintf("%d", k.Spec.BasePort)},
-	}
-	labels := LabelsForKredis(k.Name, "slave")
-	return createRedisStatefulSet(k, scheme, slaveName, slaveName, "slave", k.Spec.Replicas, labels, env)
-}
-
-// 슬레이브-per-master
-func CreateSlaveStatefulSetForMaster(k *cachev1alpha1.Kredis, scheme *runtime.Scheme, masterIndex int) (*appsv1.StatefulSet, error) {
-	// 특정 마스터 노드에 대한 FQDN
-	masterFQDN := fmt.Sprintf("%s-master-%d.%s-master.%s.svc.cluster.local", k.Name, masterIndex, k.Name, k.Namespace)
-
-	// StatefulSet 이름을 masterIndex를 포함하도록 설정
-	// 이렇게 하면 자동으로 생성되는 파드 이름이 kredis-sample-slave-{masterIndex}-{replicaIndex} 형태가 됨
-	slaveName := fmt.Sprintf("%s-slave-%d", k.Name, masterIndex)
-
-	env := []corev1.EnvVar{
-		{Name: "REDIS_MODE", Value: "slave"},
-		{Name: "MASTER_HOST", Value: masterFQDN},
-		{Name: "MASTER_PORT", Value: fmt.Sprintf("%d", k.Spec.BasePort)},
-		{Name: "MASTER_INDEX", Value: fmt.Sprintf("%d", masterIndex)},
-		{Name: "TOTAL_MASTERS", Value: fmt.Sprintf("%d", k.Spec.Masters)},
-		{
-			Name: "POD_NAME",
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
-			},
-		},
-		// POD_INDEX 환경 변수 추가 - 파드의 인덱스를 확인할 수 있음
-		{
-			Name: "POD_INDEX",
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
-			},
-		},
-		// 디버깅을 위한 추가 정보
-		{Name: "REDIS_ROLE", Value: "slave"},
-		{Name: "SLAVE_FOR_MASTER", Value: fmt.Sprintf("%d", masterIndex)},
-	}
-
-	// 해당 마스터에 특화된 레이블 생성
-	// 추가 레이블을 포함한 레이블 맵 생성 - 어떤 마스터에 속한 슬레이브인지 명시
-	labels := LabelsForKredis(k.Name, fmt.Sprintf("slave-%d", masterIndex))
-	labels["master-index"] = fmt.Sprintf("%d", masterIndex) // 마스터 인덱스를 레이블에 추가
 
 	// StatefulSet 생성
 	ss := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      slaveName, // kredis-sample-slave-{masterIndex}
+			Name:      k.Name,
 			Namespace: k.Namespace,
 			Labels:    labels,
 		},
 		Spec: appsv1.StatefulSetSpec{
-			Replicas:    &k.Spec.Replicas, // 각 마스터당 replicas 수만큼 슬레이브 생성
-			ServiceName: slaveName,        // 이 서비스 이름은 StatefulSet의 DNS 조회에 사용됨
+			Replicas:    &totalReplicas,
+			ServiceName: k.Name,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: labels,
 			},
@@ -219,59 +135,40 @@ func CreateSlaveStatefulSetForMaster(k *cachev1alpha1.Kredis, scheme *runtime.Sc
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					Containers:       []corev1.Container{redisContainer(k, env)},
+					Containers:       []corev1.Container{redisContainer},
 					ImagePullSecrets: []corev1.LocalObjectReference{{Name: "docker-secret"}},
 				},
 			},
-			VolumeClaimTemplates: volumeClaims(),
-			// 병렬로 파드 관리
-			PodManagementPolicy: appsv1.ParallelPodManagement,
+			VolumeClaimTemplates: volumeClaimTemplates,
+			PodManagementPolicy:  appsv1.OrderedReadyPodManagement,
 		},
 	}
 
-	// 컨트롤러 참조 설정
 	controllerutil.SetControllerReference(k, ss, scheme)
-	return ss, nil
+	return ss
 }
 
-// Unified 슬레이브
-func CreateUnifiedSlaveStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *appsv1.StatefulSet {
-	totalSlaves := k.Spec.Masters * k.Spec.Replicas
-	slaveName := fmt.Sprintf("%s-slave", k.Name)
-	masterSvc := fmt.Sprintf("%s-master.%s.svc.cluster.local", k.Name, k.Namespace)
-	env := []corev1.EnvVar{
-		{Name: "REDIS_MODE", Value: "slave"},
-		{Name: "MASTER_HOST", Value: masterSvc},
-		{Name: "MASTER_PORT", Value: fmt.Sprintf("%d", k.Spec.BasePort)},
-		{Name: "TOTAL_MASTERS", Value: fmt.Sprintf("%d", k.Spec.Masters)},
-		{
-			Name: "POD_NAME",
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
-			},
-		},
-	}
-	labels := LabelsForKredis(k.Name, "slave")
-	return createRedisStatefulSet(k, scheme, slaveName, slaveName, "slave", totalSlaves, labels, env)
-}
-
-// 슬레이브 서비스 정의 (per master)
-func CreateSlaveServiceForMaster(k *cachev1alpha1.Kredis, scheme *runtime.Scheme, masterIndex int) *corev1.Service {
-	slaveName := fmt.Sprintf("%s-slave-%d", k.Name, masterIndex)
-	labels := LabelsForKredis(k.Name, fmt.Sprintf("slave-%d", masterIndex))
+// CreateRedisService creates a headless service for the Redis StatefulSet
+func CreateRedisService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
+	labels := LabelsForKredis(k.Name, "redis")
 
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      slaveName,
+			Name:      k.Name,
 			Namespace: k.Namespace,
+			Labels:    labels,
 		},
 		Spec: corev1.ServiceSpec{
 			Selector:  labels,
-			Ports:     []corev1.ServicePort{{Name: "redis", Port: k.Spec.BasePort, TargetPort: intstr.FromInt(int(k.Spec.BasePort))}},
-			ClusterIP: "None",
+			ClusterIP: "None", // Headless service
 			Type:      corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{
+				{Name: "redis", Port: k.Spec.BasePort, TargetPort: intstr.FromInt(int(k.Spec.BasePort))},
+				{Name: "cluster-bus", Port: k.Spec.BasePort + 10000, TargetPort: intstr.FromInt(int(k.Spec.BasePort + 10000))},
+			},
 		},
 	}
+
 	controllerutil.SetControllerReference(k, svc, scheme)
 	return svc
 }

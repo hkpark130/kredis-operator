@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # CRD 업데이트
 # make manifests install
@@ -8,4 +9,3 @@ make docker-build docker-push IMG="docker.direa.synology.me/kredis-operator:late
 
 # 컨트롤러 배포:
 make deploy IMG="docker.direa.synology.me/kredis-operator:latest"
-

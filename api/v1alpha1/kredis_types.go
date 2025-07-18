@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -55,8 +55,50 @@ type KredisStatus struct {
 	// Total number of replicas
 	Replicas int32 `json:"replicas,omitempty"`
 
+	// ClusterState represents the Redis cluster initialization state
+	ClusterState string `json:"clusterState,omitempty"`
+
+	// ClusterNodes contains information about cluster nodes
+	ClusterNodes []ClusterNode `json:"clusterNodes,omitempty"`
+
+	// LastClusterOperation tracks the last cluster operation performed
+	LastClusterOperation string `json:"lastClusterOperation,omitempty"`
+
 	// Conditions represent the latest available observations
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// KnownClusterNodes represents the number of nodes in the cluster
+	KnownClusterNodes int `json:"knownClusterNodes,omitempty"`
+
+	// JoinedPods contains the list of pod names that have joined the cluster
+	JoinedPods []string `json:"joinedPods,omitempty"`
+}
+
+// ClusterNode represents a Redis node in the cluster
+type ClusterNode struct {
+	// NodeID is the Redis cluster node ID
+	NodeID string `json:"nodeId,omitempty"`
+
+	// PodName is the Kubernetes pod name
+	PodName string `json:"podName"`
+
+	// IP is the pod IP address
+	IP string `json:"ip"`
+
+	// Port is the Redis port
+	Port int32 `json:"port"`
+
+	// Role is either "master" or "slave"
+	Role string `json:"role"`
+
+	// MasterID is the master node ID if this is a slave
+	MasterID string `json:"masterId,omitempty"`
+
+	// Status is the node status (e.g., "ready", "failed", "pending")
+	Status string `json:"status"`
+
+	// Joined indicates if the node has joined the cluster
+	Joined bool `json:"joined"`
 }
 
 //+kubebuilder:object:root=true

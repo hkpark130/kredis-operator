@@ -3,7 +3,7 @@
 # 변수 설정
 REGISTRY="docker.direa.synology.me"
 IMAGE_NAME="redis-cluster"
-TAG="6.2"
+TAG="8.2-rc1"
 FULL_IMAGE_NAME="${REGISTRY}/${IMAGE_NAME}:${TAG}"
 
 # 로그인 (시스템에 이미 도커 로그인이 되어있다면 생략 가능)

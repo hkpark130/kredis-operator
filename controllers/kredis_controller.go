@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,6 +19,8 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -26,30 +28,37 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	cachev1alpha1 "github.com/hkpark130/kredis-operator/api/v1alpha1"
+	"github.com/hkpark130/kredis-operator/controllers/cluster"
 	"github.com/hkpark130/kredis-operator/controllers/resource"
 )
 
 // KredisReconciler reconciles a Kredis object
 type KredisReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme         *runtime.Scheme
+	RestConfig     *rest.Config
+	ClusterManager *cluster.ClusterManager
 }
 
 //+kubebuilder:rbac:groups=cache.docker.direa.synology.me,resources=kredis,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=cache.docker.direa.synology.me,resources=kredis/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=cache.docker.direa.synology.me,resources=kredis/finalizers,verbs=update
-//+kubebuilder:rbac:groups=apps,resources=statefulsets;deployments,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=core,resources=pods;services;configmaps;secrets;persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=pods/exec,verbs=create
+//+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.14.1/pkg/reconcile
+// Reconcile is part of the main kubernetes reconciliation loop
 func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -58,187 +67,176 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	err := r.Get(ctx, req.NamespacedName, kredis)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			// Request object not found, could have been deleted after reconcile request.
-			// Return and don't requeue
 			logger.Info("Kredis resource not found. Ignoring since object must be deleted")
 			return ctrl.Result{}, nil
 		}
-		// Error reading the object - requeue the request.
 		logger.Error(err, "Failed to get Kredis")
 		return ctrl.Result{}, err
 	}
 
-	// Create a general service for the Redis cluster
-	generalServiceName := kredis.Name
-	foundGeneralService := &corev1.Service{}
-	err = r.Get(ctx, types.NamespacedName{Name: generalServiceName, Namespace: kredis.Namespace}, foundGeneralService)
-	if err != nil && errors.IsNotFound(err) {
-		// Create general service for the Redis cluster
-		generalSvc := resource.CreateGeneralService(kredis, r.Scheme)
-		logger.Info("Creating Redis General Service", "Service.Namespace", generalSvc.Namespace, "Service.Name", generalSvc.Name)
-		err = r.Create(ctx, generalSvc)
-		if err != nil {
-			logger.Error(err, "Failed to create General Service", "Service.Namespace", generalSvc.Namespace, "Service.Name", generalSvc.Name)
-			return ctrl.Result{}, err
-		}
-	} else if err != nil {
-		logger.Error(err, "Failed to get General Service")
+	logger.Info("Reconciling Kredis",
+		"name", kredis.Name,
+		"masters", kredis.Spec.Masters,
+		"replicas", kredis.Spec.Replicas,
+		"totalNodes", kredis.Spec.Masters+(kredis.Spec.Masters*kredis.Spec.Replicas))
+
+	// 1. Create headless service
+	if err := r.reconcileService(ctx, kredis); err != nil {
+		logger.Error(err, "Failed to reconcile service")
 		return ctrl.Result{}, err
 	}
 
-	// Check for and create single Redis Master StatefulSet
-	totalReadyReplicas := int32(0)
-	totalReplicas := int32(0)
-	allReady := true
-
-	masterName := fmt.Sprintf("%s-master", kredis.Name)
-	foundMaster := &appsv1.StatefulSet{}
-	err = r.Get(ctx, types.NamespacedName{Name: masterName, Namespace: kredis.Namespace}, foundMaster)
-	if err != nil && errors.IsNotFound(err) {
-		// Define a new Master StatefulSet
-		masterSts := resource.CreateMasterStatefulSet(kredis, r.Scheme)
-		logger.Info("Creating Redis Master StatefulSet", "StatefulSet.Namespace", masterSts.Namespace, "StatefulSet.Name", masterSts.Name)
-		err = r.Create(ctx, masterSts)
-		if err != nil {
-			logger.Error(err, "Failed to create Master StatefulSet", "StatefulSet.Namespace", masterSts.Namespace, "StatefulSet.Name", masterSts.Name)
-			return ctrl.Result{}, err
-		}
-
-		// Create Master Service
-		masterSvc := resource.CreateMasterService(kredis, r.Scheme)
-		logger.Info("Creating Redis Master Service", "Service.Namespace", masterSvc.Namespace, "Service.Name", masterSvc.Name)
-		err = r.Create(ctx, masterSvc)
-		if err != nil {
-			logger.Error(err, "Failed to create Master Service", "Service.Namespace", masterSvc.Namespace, "Service.Name", masterSvc.Name)
-			return ctrl.Result{}, err
-		}
-
-		// Requeue to continue with the next step after creation
-		return ctrl.Result{Requeue: true}, nil
-	} else if err != nil {
-		logger.Error(err, "Failed to get Master StatefulSet")
+	// 2. Create unified StatefulSet
+	if err := r.reconcileStatefulSet(ctx, kredis); err != nil {
+		logger.Error(err, "Failed to reconcile StatefulSet")
 		return ctrl.Result{}, err
 	}
 
-	// 각 마스터 노드에 대한 슬레이브 StatefulSet 생성
-	totalSlaveReadyReplicas := int32(0)
-	totalSlaveReplicas := int32(0)
-
-	// 마스터가 준비될 때까지 대기
-	if foundMaster.Status.ReadyReplicas < 1 {
-		logger.Info("마스터 파드가 준비될 때까지 대기 중...")
-		return ctrl.Result{Requeue: true}, nil
+	// 3. Manage Redis cluster state
+	clusterReady, err := r.ClusterManager.ReconcileCluster(ctx, kredis)
+	if err != nil {
+		logger.Error(err, "Failed to reconcile Redis cluster")
+		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}
 
-	// 마스터 파드 수 확인
-	masterCount := int(kredis.Spec.Masters)
-	logger.Info(fmt.Sprintf("마스터 노드 수: %d", masterCount))
-
-	// 각 마스터 노드에 대한 슬레이브 StatefulSet 생성
-	for i := 0; i < masterCount; i++ {
-		// 해당 마스터 노드에 대한 슬레이브 StatefulSet 확인
-		slaveName := fmt.Sprintf("%s-slave-%d", kredis.Name, i)
-		foundSlave := &appsv1.StatefulSet{}
-		err = r.Get(ctx, types.NamespacedName{Name: slaveName, Namespace: kredis.Namespace}, foundSlave)
-
-		if err != nil && errors.IsNotFound(err) {
-			// 슬레이브 StatefulSet 생성
-			logger.Info(fmt.Sprintf("마스터 %d에 대한 슬레이브 StatefulSet 생성", i),
-				"MasterIndex", i,
-				"Replicas", kredis.Spec.Replicas)
-
-			slaveSts, createErr := resource.CreateSlaveStatefulSetForMaster(kredis, r.Scheme, i)
-			if createErr != nil {
-				logger.Error(createErr, "슬레이브 StatefulSet 생성 오류", "MasterIndex", i)
-				return ctrl.Result{}, createErr
-			}
-
-			logger.Info("Redis Slave StatefulSet 생성",
-				"StatefulSet.Namespace", slaveSts.Namespace,
-				"StatefulSet.Name", slaveSts.Name,
-				"ExpectedPodNameFormat", fmt.Sprintf("%s-{0..%d}", slaveSts.Name, kredis.Spec.Replicas-1))
-
-			err = r.Create(ctx, slaveSts)
-			if err != nil {
-				logger.Error(err, "Slave StatefulSet 생성 실패", "StatefulSet.Namespace", slaveSts.Namespace, "StatefulSet.Name", slaveSts.Name)
-				return ctrl.Result{}, err
-			}
-
-			// 슬레이브 서비스 생성
-			slaveSvc := resource.CreateSlaveServiceForMaster(kredis, r.Scheme, i)
-			logger.Info("Redis Slave Service 생성", "Service.Namespace", slaveSvc.Namespace, "Service.Name", slaveSvc.Name)
-			err = r.Create(ctx, slaveSvc)
-			if err != nil {
-				logger.Error(err, "Slave Service 생성 실패", "Service.Namespace", slaveSvc.Namespace, "Service.Name", slaveSvc.Name)
-				return ctrl.Result{}, err
-			}
-
-			// 하나씩 생성 후 다음을 위해 리큐
-			return ctrl.Result{Requeue: true}, nil
-		} else if err != nil {
-			logger.Error(err, "Slave StatefulSet 조회 실패", "SlaveName", slaveName)
-			return ctrl.Result{}, err
-		} else {
-			// StatefulSet 발견, 통계 업데이트
-			totalSlaveReplicas += foundSlave.Status.Replicas
-			totalSlaveReadyReplicas += foundSlave.Status.ReadyReplicas
-		}
+	// 4. Update status
+	if err := r.updateStatus(ctx, kredis); err != nil {
+		logger.Error(err, "Failed to update status")
+		return ctrl.Result{RequeueAfter: time.Second * 30}, err
 	}
 
-	// Update metrics with master and all slave metrics
-	totalReplicas = foundMaster.Status.Replicas + totalSlaveReplicas
-	totalReadyReplicas = foundMaster.Status.ReadyReplicas + totalSlaveReadyReplicas
-
-	// Check if all replicas are ready
-	if foundMaster.Status.ReadyReplicas != foundMaster.Status.Replicas ||
-		totalSlaveReadyReplicas != totalSlaveReplicas {
-		allReady = false
-	}
-
-	// 로그에 슬레이브 현황 기록
-	logger.Info("슬레이브 현황",
-		"총 슬레이브 수", totalSlaveReplicas,
-		"준비된 슬레이브 수", totalSlaveReadyReplicas)
-
-	// Update the Kredis status
-	kredis.Status.Phase = "Running"
-	kredis.Status.ReadyReplicas = totalReadyReplicas
-	kredis.Status.Replicas = totalReplicas
-
-	// Add conditions if all masters and slaves are ready
-	if allReady {
-		condition := metav1.Condition{
-			Type:               "Available",
-			Status:             metav1.ConditionTrue,
-			Reason:             "AllReplicasReady",
-			Message:            fmt.Sprintf("All Redis instances (%d master(s) and %d slave(s)) are ready", kredis.Spec.Masters, kredis.Spec.Replicas),
-			LastTransitionTime: metav1.Now(),
-		}
-		kredis.Status.Conditions = []metav1.Condition{condition}
+	// Adjust reconcile interval based on cluster state
+	if clusterReady {
+		// Cluster is healthy - check less frequently
+		logger.V(1).Info("Cluster is healthy - scheduling next check in 10 minutes")
+		return ctrl.Result{RequeueAfter: time.Minute * 10}, nil
 	} else {
-		condition := metav1.Condition{
-			Type:               "Progressing",
-			Status:             metav1.ConditionTrue,
-			Reason:             "NotAllReplicasReady",
-			Message:            "Some Redis instances are not ready yet",
-			LastTransitionTime: metav1.Now(),
+		// Cluster needs attention - check more frequently
+		logger.V(1).Info("Cluster needs attention - scheduling next check in 2 minutes")
+		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
+	}
+}
+
+func (r *KredisReconciler) reconcileService(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
+	logger := log.FromContext(ctx)
+
+	foundService := &corev1.Service{}
+	err := r.Get(ctx, types.NamespacedName{Name: kredis.Name, Namespace: kredis.Namespace}, foundService)
+
+	if err != nil && errors.IsNotFound(err) {
+		svc := resource.CreateRedisService(kredis, r.Scheme)
+		logger.Info("Creating Redis headless service", "name", svc.Name)
+		return r.Create(ctx, svc)
+	}
+
+	return err
+}
+
+func (r *KredisReconciler) reconcileStatefulSet(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
+	logger := log.FromContext(ctx)
+
+	foundStatefulSet := &appsv1.StatefulSet{}
+	err := r.Get(ctx, types.NamespacedName{Name: kredis.Name, Namespace: kredis.Namespace}, foundStatefulSet)
+
+	expectedReplicas := kredis.Spec.Masters + (kredis.Spec.Masters * kredis.Spec.Replicas)
+
+	if err != nil && errors.IsNotFound(err) {
+		// Create new StatefulSet
+		sts := resource.CreateRedisStatefulSet(kredis, r.Scheme)
+		logger.Info("Creating unified Redis StatefulSet",
+			"name", sts.Name,
+			"totalReplicas", expectedReplicas,
+			"masters", kredis.Spec.Masters,
+			"replicasPerMaster", kredis.Spec.Replicas)
+		return r.Create(ctx, sts)
+	} else if err != nil {
+		return err
+	}
+
+	// Check if update needed
+	if *foundStatefulSet.Spec.Replicas != expectedReplicas {
+		logger.Info("Updating StatefulSet replicas",
+			"current", *foundStatefulSet.Spec.Replicas,
+			"expected", expectedReplicas)
+
+		foundStatefulSet.Spec.Replicas = &expectedReplicas
+
+		return r.Update(ctx, foundStatefulSet)
+	}
+
+	return nil
+}
+
+func (r *KredisReconciler) updateStatus(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Get the latest version of Kredis
+		currentKredis := &cachev1alpha1.Kredis{}
+		err := r.Get(ctx, types.NamespacedName{Name: kredis.Name, Namespace: kredis.Namespace}, currentKredis)
+		if err != nil {
+			return err
 		}
-		kredis.Status.Conditions = []metav1.Condition{condition}
+
+		// Calculate the new status
+		foundStatefulSet := &appsv1.StatefulSet{}
+		err = r.Get(ctx, types.NamespacedName{Name: kredis.Name, Namespace: kredis.Namespace}, foundStatefulSet)
+		if err != nil {
+			return err
+		}
+
+		newStatus := r.calculateStatus(currentKredis, foundStatefulSet)
+
+		// If the status has not changed, do nothing
+		if reflect.DeepEqual(currentKredis.Status, newStatus) {
+			return nil
+		}
+
+		currentKredis.Status = newStatus
+		return r.Status().Update(ctx, currentKredis)
+	})
+}
+
+func (r *KredisReconciler) calculateStatus(kredis *cachev1alpha1.Kredis, sts *appsv1.StatefulSet) cachev1alpha1.KredisStatus {
+	newStatus := kredis.Status.DeepCopy()
+
+	newStatus.Replicas = sts.Status.Replicas
+	newStatus.ReadyReplicas = sts.Status.ReadyReplicas
+
+	expectedReplicas := kredis.Spec.Masters + (kredis.Spec.Masters * kredis.Spec.Replicas)
+
+	if sts.Status.ReadyReplicas == expectedReplicas {
+		newStatus.Phase = "Ready"
+	} else if sts.Status.Replicas > 0 {
+		newStatus.Phase = "Pending"
+	} else {
+		newStatus.Phase = "Creating"
 	}
 
-	if err := r.Status().Update(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to update Kredis status")
-		return ctrl.Result{}, err
+	// Update condition
+	condition := metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             "NotReady",
+		Message:            fmt.Sprintf("Ready replicas: %d/%d", newStatus.ReadyReplicas, expectedReplicas),
+		LastTransitionTime: metav1.Now(),
 	}
 
-	return ctrl.Result{}, nil
+	if newStatus.ReadyReplicas == expectedReplicas && expectedReplicas > 0 {
+		condition.Status = metav1.ConditionTrue
+		condition.Reason = "AllReady"
+		condition.Message = "All Redis nodes are ready"
+	}
+
+	newStatus.Conditions = []metav1.Condition{condition}
+
+	return *newStatus
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *KredisReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cachev1alpha1.Kredis{}).
-		Owns(&appsv1.StatefulSet{}). // Watch StatefulSets owned by this controller
-		Owns(&corev1.Service{}).     // Watch Services owned by this controller
+		Owns(&appsv1.StatefulSet{}).
+		Owns(&corev1.Service{}).
+		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		Complete(r)
 }

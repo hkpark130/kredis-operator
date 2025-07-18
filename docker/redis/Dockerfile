@@ -1,4 +1,4 @@
-FROM redis:6.2
+FROM redis:8.2-rc1
 
 # 환경 변수 설정
 ENV REDIS_EXPORTER_WEB_LISTEN_ADDRESS="0.0.0.0:9121"

@@ -10,11 +10,11 @@ metadata:
   name: kredis-sample
   namespace: kredis-operator-system
 spec:
-  masters: 3  # Redis 마스터 노드 수
-  replicas: 1  # 각 마스터당 슬레이브(복제본) 노드 수
+  masters: 4 # Redis 마스터 노드 수
+  replicas: 2 # 각 마스터당 슬레이브(복제본) 노드 수
   memory: "1gb"
   basePort: 6379
-  image: "docker.direa.synology.me/redis-cluster:6.2"
+  image: "docker.direa.synology.me/redis-cluster:8.2-rc1"
   resources:
     limits:
       cpu: "0.5"

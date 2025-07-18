@@ -71,6 +71,50 @@ spec:
           status:
             description: KredisStatus defines the observed state of Kredis
             properties:
+              clusterNodes:
+                description: ClusterNodes contains information about cluster nodes
+                items:
+                  description: ClusterNode represents a Redis node in the cluster
+                  properties:
+                    ip:
+                      description: IP is the pod IP address
+                      type: string
+                    joined:
+                      description: Joined indicates if the node has joined the cluster
+                      type: boolean
+                    masterId:
+                      description: MasterID is the master node ID if this is a slave
+                      type: string
+                    nodeId:
+                      description: NodeID is the Redis cluster node ID
+                      type: string
+                    podName:
+                      description: PodName is the Kubernetes pod name
+                      type: string
+                    port:
+                      description: Port is the Redis port
+                      format: int32
+                      type: integer
+                    role:
+                      description: Role is either "master" or "slave"
+                      type: string
+                    status:
+                      description: Status is the node status (e.g., "ready", "failed",
+                        "pending")
+                      type: string
+                  required:
+                  - ip
+                  - joined
+                  - podName
+                  - port
+                  - role
+                  - status
+                  type: object
+                type: array
+              clusterState:
+                description: ClusterState represents the Redis cluster initialization
+                  state
+                type: string
               conditions:
                 description: Conditions represent the latest available observations
                 items:
@@ -140,6 +184,20 @@ spec:
                   - type
                   type: object
                 type: array
+              joinedPods:
+                description: JoinedPods contains the list of pod names that have joined
+                  the cluster
+                items:
+                  type: string
+                type: array
+              knownClusterNodes:
+                description: KnownClusterNodes represents the number of nodes in the
+                  cluster
+                type: integer
+              lastClusterOperation:
+                description: LastClusterOperation tracks the last cluster operation
+                  performed
+                type: string
               phase:
                 description: Phase represents the current state of the Kredis deployment
                 type: string

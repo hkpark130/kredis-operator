@@ -26,6 +26,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -33,6 +34,7 @@ import (
 
 	cachev1alpha1 "github.com/hkpark130/kredis-operator/api/v1alpha1"
 	"github.com/hkpark130/kredis-operator/controllers"
+	"github.com/hkpark130/kredis-operator/controllers/cluster"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -58,7 +60,7 @@ func main() {
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
 	opts := zap.Options{
-		Development: true,
+		Development: false,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -89,9 +91,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Create Kubernetes clientset for pod execution
+	clientset, err := kubernetes.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create kubernetes clientset")
+		os.Exit(1)
+	}
+
+	// Create pod executor
+	podExecutor := cluster.NewPodExecutor(clientset, mgr.GetConfig())
+
+	// Create cluster manager
+	clusterManager := cluster.NewClusterManager(mgr.GetClient(), podExecutor)
+
 	if err = (&controllers.KredisReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		RestConfig:     mgr.GetConfig(),
+		ClusterManager: clusterManager,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Kredis")
 		os.Exit(1)

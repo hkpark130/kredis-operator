@@ -44,6 +44,10 @@ func CreateMasterService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev
 				Port:       k.Spec.BasePort,
 				TargetPort: intstr.FromString("redis"),
 				Name:       "redis",
+			}, {
+				Port:       k.Spec.BasePort + 10000,
+				TargetPort: intstr.FromString("cluster-bus"),
+				Name:       "cluster-bus",
 			}},
 			// Headless 서비스로 설정하여 각 포드의 DNS 주소를 개별적으로 접근 가능하게 함
 			ClusterIP: "None",
