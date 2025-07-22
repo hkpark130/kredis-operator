@@ -204,7 +204,7 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 	logger := log.FromContext(ctx)
 
 	// Check if there's an ongoing operation
-	if cm.isOperationInProgress(kredis) {
+	if cm.isOperationInProgress(ctx, kredis, pods) {
 		lastOp := kredis.Status.LastClusterOperation
 		// rebalance-in-progress인 경우 특별 처리
 		if strings.Contains(lastOp, "rebalance-in-progress") {
@@ -303,6 +303,14 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 		// return OperationScaleDown // Future implementation
 	}
 
+	// Heal condition: Check for failed nodes in the cluster state
+	for _, node := range clusterState {
+		if strings.Contains(node.Status, "fail") {
+			logger.Info("Found failed node, initiating heal operation", "pod", node.PodName, "nodeID", node.NodeID)
+			return OperationHeal
+		}
+	}
+
 	// If none of the above, the cluster is stable.
 	logger.Info("Cluster is properly formed and scaled - no operation needed")
 	return ""
@@ -322,6 +330,8 @@ func (cm *ClusterManager) executeClusterOperation(ctx context.Context, kredis *c
 	case OperationRebalance:
 		// Pass the already discovered state to the rebalance function
 		return cm.rebalanceCluster(ctx, kredis, pods, clusterState)
+	case OperationHeal:
+		return cm.healCluster(ctx, kredis, pods, clusterState)
 	default:
 		return fmt.Errorf("unknown cluster operation: %s", operation)
 	}
@@ -750,6 +760,87 @@ func (cm *ClusterManager) rebalanceCluster(ctx context.Context, kredis *cachev1a
 	return nil
 }
 
+// healCluster handles healing a failed node in the cluster
+func (cm *ClusterManager) healCluster(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) error {
+	logger := log.FromContext(ctx)
+	logger.Info("Healing Redis cluster")
+
+	kredis.Status.LastClusterOperation = fmt.Sprintf("heal-in-progress:%d", time.Now().Unix())
+	if err := cm.Client.Status().Update(ctx, kredis); err != nil {
+		logger.Error(err, "Failed to update status to heal-in-progress")
+		return err
+	}
+
+	// 1. Find a healthy master pod to execute commands
+	commandPod := cm.findMasterPod(pods, kredis, clusterState)
+	if commandPod == nil {
+		return fmt.Errorf("failed to find a healthy master pod for healing command")
+	}
+	logger.Info("Using pod for healing command", "pod", commandPod.Name)
+
+	// 2. Identify failed nodes
+	var failedNodes []cachev1alpha1.ClusterNode
+	podMap := make(map[string]corev1.Pod)
+	for _, p := range pods {
+		podMap[p.Name] = p
+	}
+
+	for _, node := range clusterState {
+		if strings.Contains(node.Status, "fail") {
+			failedNodes = append(failedNodes, node)
+		}
+	}
+
+	if len(failedNodes) == 0 {
+		logger.Info("No failed nodes found, skipping heal operation.")
+		kredis.Status.LastClusterOperation = fmt.Sprintf("heal-skipped:%d", time.Now().Unix())
+		_ = cm.Client.Status().Update(ctx, kredis)
+		return nil
+	}
+
+	// 3. Process each failed node
+	for _, failedNode := range failedNodes {
+		logger.Info("Processing failed node", "pod", failedNode.PodName, "nodeID", failedNode.NodeID)
+
+		// 3a. Tell the cluster to forget the failed node
+		if failedNode.NodeID != "" {
+			logger.Info("Executing CLUSTER FORGET for failed node", "nodeID", failedNode.NodeID)
+			_, err := cm.PodExecutor.ExecuteRedisCommand(ctx, *commandPod, kredis.Spec.BasePort, "CLUSTER", "FORGET", failedNode.NodeID)
+			if err != nil {
+				// Log error but continue, as pod deletion is the main healing mechanism
+				logger.Error(err, "Failed to execute CLUSTER FORGET, but proceeding with pod deletion", "nodeID", failedNode.NodeID)
+			}
+		} else {
+			logger.Info("Failed node has no NodeID, cannot execute CLUSTER FORGET. This can happen if the node never fully joined.", "pod", failedNode.PodName)
+		}
+
+		// 3b. Delete the pod to let the StatefulSet recreate it
+		if failedPod, ok := podMap[failedNode.PodName]; ok {
+			logger.Info("Deleting pod for failed node to trigger recreation", "pod", failedPod.Name)
+			if err := cm.Client.Delete(ctx, &failedPod); err != nil {
+				kredis.Status.LastClusterOperation = fmt.Sprintf("heal-failed:%d", time.Now().Unix())
+				_ = cm.Client.Status().Update(ctx, kredis)
+				return fmt.Errorf("failed to delete pod %s for healing: %w", failedPod.Name, err)
+			}
+		} else {
+			logger.Info("Pod for failed node not found, it might have been deleted already", "podName", failedNode.PodName)
+		}
+	}
+
+	// The reconciliation loop will handle the rest:
+	// - StatefulSet will recreate the pod.
+	// - The `areAllPodsReady` check will wait for it.
+	// - `determineRequiredOperation` will trigger `OperationScale`.
+	// - `scaleCluster` will add the new node back to the cluster.
+	kredis.Status.LastClusterOperation = fmt.Sprintf("heal-pod-deleted:%d", time.Now().Unix())
+	if err := cm.Client.Status().Update(ctx, kredis); err != nil {
+		logger.Error(err, "Failed to update status after triggering heal")
+	}
+
+	logger.Info("Heal operation initiated. Waiting for reconciliation to add the new pod.")
+	return nil
+}
+
 // waitForClusterStabilization waits for the cluster to become healthy after an operation.
 func (cm *ClusterManager) waitForClusterStabilization(ctx context.Context, kredis *cachev1alpha1.Kredis, queryPod *corev1.Pod) error {
 	logger := log.FromContext(ctx)
@@ -906,7 +997,7 @@ func (cm *ClusterManager) executeRedisCommand(ctx context.Context, pod corev1.Po
 }
 
 // isOperationInProgress checks if there's an ongoing cluster operation
-func (cm *ClusterManager) isOperationInProgress(kredis *cachev1alpha1.Kredis) bool {
+func (cm *ClusterManager) isOperationInProgress(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod) bool {
 	lastOp := kredis.Status.LastClusterOperation
 	if lastOp == "" {
 		return false
@@ -917,41 +1008,149 @@ func (cm *ClusterManager) isOperationInProgress(kredis *cachev1alpha1.Kredis) bo
 		return false
 	}
 
+	logger := log.FromContext(ctx)
+
 	// Parse the timestamp from "operation-in-progress:timestamp" format
 	parts := strings.Split(lastOp, ":")
 	if len(parts) < 2 {
 		// Invalid format, treat as not in progress
+		logger.V(1).Info("Invalid operation format, treating as not in progress", "lastOperation", lastOp)
 		return false
 	}
 
 	timestamp, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
 	if err != nil {
 		// Invalid timestamp, treat as not in progress
+		logger.V(1).Info("Invalid timestamp in operation, treating as not in progress", "lastOperation", lastOp)
 		return false
 	}
 
 	currentTime := time.Now().Unix()
 	timeDiff := currentTime - timestamp
 
-	// rebalance 작업의 경우 더 긴 타임아웃 허용 (10분)
+	// 실제 클러스터 상태 확인을 위한 준비 작업 - ready pod 찾기
+	var queryPod *corev1.Pod
+	for i := range pods {
+		if cm.isPodReady(pods[i]) {
+			queryPod = &pods[i]
+			break
+		}
+	}
+
+	// 작업별 타임아웃 설정
 	var timeoutDuration int64 = 300 // 5분 (기본)
 	if strings.Contains(lastOp, "rebalance-in-progress") {
 		timeoutDuration = 600 // 10분 (rebalance는 시간이 더 오래 걸릴 수 있음)
+	} else if strings.Contains(lastOp, "create-in-progress") {
+		timeoutDuration = 420 // 7분 (클러스터 생성)
+	} else if strings.Contains(lastOp, "scale-in-progress") {
+		timeoutDuration = 480 // 8분 (스케일링)
 	}
 
-	// If the operation is "in-progress" but older than timeout, consider it stale and allow a new operation.
+	// 타임아웃 전이라면 실제 클러스터 상태 확인
+	if timeDiff <= timeoutDuration && queryPod != nil {
+		// 작업 종류별 실제 상태 검증
+		if strings.Contains(lastOp, "rebalance-in-progress") {
+			// 리밸런싱 중인지 실제로 확인
+			if isRebalancing := cm.checkIfRebalanceInProgress(ctx, *queryPod, kredis.Spec.BasePort); isRebalancing {
+				logger.V(1).Info("Rebalance operation is actually in progress")
+				return true
+			}
+		} else if strings.Contains(lastOp, "scale-in-progress") {
+			// 스케일링 중인지 확인 (cluster nodes에서 handshake 상태 확인)
+			if isScaling := cm.checkIfScalingInProgress(ctx, *queryPod, kredis.Spec.BasePort); isScaling {
+				logger.V(1).Info("Scale operation is actually in progress")
+				return true
+			}
+		} else if strings.Contains(lastOp, "create-in-progress") {
+			// 클러스터 생성 중인지 확인
+			if isCreating := cm.checkIfClusterCreationInProgress(ctx, *queryPod, kredis.Spec.BasePort); isCreating {
+				logger.V(1).Info("Cluster creation operation is actually in progress")
+				return true
+			}
+		}
+
+		// 실제 작업이 진행 중이 아니라면 완료된 것으로 간주
+		logger.Info("Operation marked as in-progress but not actually running, considering it completed",
+			"lastOperation", lastOp,
+			"timeDiff", timeDiff)
+		return false
+	}
+
+	// 타임아웃이 지났거나 상태 확인 불가능한 경우 타임스탬프 기반 판단
 	if timeDiff > timeoutDuration {
-		// Since we don't have context here, we use the global logger.
-		// A proper implementation might pass context to this function.
-		log.Log.Info("Stale operation found, allowing new operation",
+		logger.Info("Stale operation found, allowing new operation",
 			"lastOperation", lastOp,
 			"timeDiff", timeDiff,
 			"timeoutDuration", timeoutDuration)
 		return false
 	}
 
-	// Otherwise, an operation is in progress.
+	// 타임아웃 내이지만 상태 확인 불가능한 경우 (쿼리할 pod가 없음)
+	logger.V(1).Info("Cannot verify operation status, assuming in progress due to recent timestamp",
+		"lastOperation", lastOp,
+		"timeDiff", timeDiff)
 	return true
+}
+
+// checkIfRebalanceInProgress checks if cluster rebalancing is actually happening
+func (cm *ClusterManager) checkIfRebalanceInProgress(ctx context.Context, pod corev1.Pod, port int32) bool {
+	// cluster nodes 명령어로 마이그레이션 중인 슬롯이 있는지 확인
+	result, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, port, "cluster", "nodes")
+	if err != nil {
+		return false // 확인 불가능하면 false 반환
+	}
+
+	lines := strings.Split(result.Stdout, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// 마이그레이션 중인 슬롯이 있으면 리밸런싱 중
+		if strings.Contains(line, "[") && strings.Contains(line, ">-") {
+			return true
+		}
+		if strings.Contains(line, "[") && strings.Contains(line, "-<") {
+			return true
+		}
+	}
+	return false
+}
+
+// checkIfScalingInProgress checks if cluster scaling is actually happening
+func (cm *ClusterManager) checkIfScalingInProgress(ctx context.Context, pod corev1.Pod, port int32) bool {
+	// cluster nodes 명령어로 handshake 상태인 노드가 있는지 확인
+	result, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, port, "cluster", "nodes")
+	if err != nil {
+		return false
+	}
+
+	lines := strings.Split(result.Stdout, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// handshake 상태인 노드가 있으면 스케일링 중
+		if strings.Contains(line, "handshake") {
+			return true
+		}
+	}
+	return false
+}
+
+// checkIfClusterCreationInProgress checks if cluster creation is actually happening
+func (cm *ClusterManager) checkIfClusterCreationInProgress(ctx context.Context, pod corev1.Pod, port int32) bool {
+	// 클러스터가 아직 생성되지 않았거나 불안정한 상태인지 확인
+	isHealthy, err := cm.PodExecutor.IsClusterHealthy(ctx, pod, port)
+	if err != nil {
+		// Redis가 응답하지 않으면 아직 생성 중일 가능성이 높음
+		return true
+	}
+
+	// 클러스터가 건강하지 않으면 아직 생성 중
+	return !isHealthy
 }
 
 // getActualMasterCount gets the actual number of master nodes from Redis cluster
