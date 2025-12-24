@@ -9,8 +9,8 @@ namespace: kredis-operator-system
 namePrefix: kredis-operator-
 
 # Labels to add to all resources and selectors.
-#commonLabels:
-#  someName: someValue
+commonLabels:
+  app.kubernetes.io/name-prefix: kredis-operator
 
 bases:
 - ../crd

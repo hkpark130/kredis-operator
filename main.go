@@ -107,7 +107,6 @@ func main() {
 	if err = (&controllers.KredisReconciler{
 		Client:         mgr.GetClient(),
 		Scheme:         mgr.GetScheme(),
-		RestConfig:     mgr.GetConfig(),
 		ClusterManager: clusterManager,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Kredis")

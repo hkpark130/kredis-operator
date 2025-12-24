@@ -46,8 +46,9 @@ spec:
                 description: Redis Master Node count
                 format: int32
                 type: integer
-              memory:
-                description: Redis Memory size
+              maxMemory:
+                description: 'MaxMemory: Redis maxmemory 설정 (예: "512mb", "1gb"). 비우면
+                  제한 미적용.'
                 type: string
               replicas:
                 description: Redis Replica Node count
@@ -64,7 +65,6 @@ spec:
             - basePort
             - image
             - masters
-            - memory
             - replicas
             - resources
             type: object

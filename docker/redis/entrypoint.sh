@@ -60,6 +60,13 @@ logfile /logs/redis.log
 loglevel notice
 EOF
 
+    # MaxMemory 설정 (선택)
+    if [ -n "$REDIS_MAXMEMORY" ]; then
+        echo "maxmemory $REDIS_MAXMEMORY" >> "$config_file"
+        # 기본 정책: allkeys-lfu (LFU 는 인기/빈도 기반, 캐시 워크로드에서 더 일관된 hit ratio)
+        echo "maxmemory-policy allkeys-lfu" >> "$config_file"
+    fi
+
     log_info "Redis 설정 파일 생성됨: $config_file"
 }
 

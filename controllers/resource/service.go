@@ -17,8 +17,6 @@ limitations under the License.
 package resource
 
 import (
-	"fmt"
-
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -28,87 +26,34 @@ import (
 	cachev1alpha1 "github.com/hkpark130/kredis-operator/api/v1alpha1"
 )
 
-// CreateMasterService 함수는 Redis 마스터를 위한 Service를 생성합니다
-func CreateMasterService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
-	ls := LabelsForKredis(k.Name, "master")
-	name := fmt.Sprintf("%s-master", k.Name)
-
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: k.Namespace,
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: ls,
-			Ports: []corev1.ServicePort{{
-				Port:       k.Spec.BasePort,
-				TargetPort: intstr.FromString("redis"),
-				Name:       "redis",
-			}, {
-				Port:       k.Spec.BasePort + 10000,
-				TargetPort: intstr.FromString("cluster-bus"),
-				Name:       "cluster-bus",
-			}},
-			// Headless 서비스로 설정하여 각 포드의 DNS 주소를 개별적으로 접근 가능하게 함
-			ClusterIP: "None",
-		},
-	}
-
-	// Set Kredis instance as the owner and controller
-	controllerutil.SetControllerReference(k, svc, scheme)
-	return svc
-}
-
-// CreateSlaveService 함수는 Redis 슬레이브를 위한 Service를 생성합니다
-func CreateSlaveService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
-	ls := LabelsForKredis(k.Name, "slave")
-	name := fmt.Sprintf("%s-slave", k.Name)
-
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: k.Namespace,
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: ls,
-			Ports: []corev1.ServicePort{{
-				Port:       k.Spec.BasePort,
-				TargetPort: intstr.FromString("redis"),
-				Name:       "redis",
-			}},
-		},
-	}
-
-	// Set Kredis instance as the owner and controller
-	controllerutil.SetControllerReference(k, svc, scheme)
-	return svc
-}
-
-// CreateGeneralService 함수는 전체 Redis 클러스터를 위한 일반 Service를 생성합니다
-func CreateGeneralService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
-	// 일반 서비스는 모든 Redis 인스턴스를 대상으로 함
-	ls := map[string]string{
-		"app":                        "kredis",
-		"app.kubernetes.io/name":     k.Name,
-		"app.kubernetes.io/instance": k.Name,
+// CreateRedisService: 통합 Headless Service (cluster-bus 포함)
+// - Pod DNS 접근 및 클러스터 버스 포트 모두 제공
+func CreateRedisService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
+	// 전체 파드를 대상으로 하는 Headless Service.
+	// selector 에 role 제외 (role 은 동적으로 master/slave 로 변경됨)
+	podLabels := LabelsForKredis(k.Name, "redis")
+	selector := map[string]string{
+		"app":                        podLabels["app"],
+		"app.kubernetes.io/name":     podLabels["app.kubernetes.io/name"],
+		"app.kubernetes.io/instance": podLabels["app.kubernetes.io/instance"],
 	}
 
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      k.Name,
 			Namespace: k.Namespace,
+			Labels:    selector,
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: ls,
-			Ports: []corev1.ServicePort{{
-				Port:       k.Spec.BasePort,
-				TargetPort: intstr.FromString("redis"),
-				Name:       "redis",
-			}},
+			Selector:  selector,
+			ClusterIP: "None", // Headless -> per-pod DNS
+			Type:      corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{
+				{Name: "redis", Port: k.Spec.BasePort, TargetPort: intstr.FromString("redis")},
+				{Name: "cluster-bus", Port: k.Spec.BasePort + 10000, TargetPort: intstr.FromString("cluster-bus")},
+			},
 		},
 	}
-
-	// Set Kredis instance as the owner and controller
 	controllerutil.SetControllerReference(k, svc, scheme)
 	return svc
 }

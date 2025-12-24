@@ -249,6 +249,27 @@ func (pe *PodExecutor) RebalanceCluster(ctx context.Context, pod corev1.Pod, por
 	return pe.ExecuteCommand(ctx, pod, command)
 }
 
+// RepairCluster attempts to fix a degraded Redis cluster using redis-cli --cluster fix.
+func (pe *PodExecutor) RepairCluster(ctx context.Context, pod corev1.Pod, port int32) error {
+	logger := log.FromContext(ctx)
+	logger.Info("Repairing cluster", "pod", pod.Name)
+
+	nodeAddr := fmt.Sprintf("%s:%d", pod.Status.PodIP, port)
+	command := []string{
+		"redis-cli",
+		"--cluster",
+		"fix",
+		nodeAddr,
+		"--cluster-yes",
+	}
+
+	if _, err := pe.ExecuteCommand(ctx, pod, command); err != nil {
+		return fmt.Errorf("failed to repair cluster: %w", err)
+	}
+
+	return nil
+}
+
 // RedisNodeInfo represents a Redis cluster node
 type RedisNodeInfo struct {
 	NodeID   string

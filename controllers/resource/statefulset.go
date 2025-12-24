@@ -2,6 +2,7 @@ package resource
 
 import (
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -19,7 +20,13 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 	// 총 레플리카 수 계산: 마스터 + (마스터 * 슬레이브)
 	totalReplicas := k.Spec.Masters + (k.Spec.Masters * k.Spec.Replicas)
 
-	labels := LabelsForKredis(k.Name, "redis")
+	labels := LabelsForKredis(k.Name, "redis") // 포함: app, name/instance, role=unknown (초기)
+	// StatefulSet selector 에서는 role 같이 변경될 수 있는 라벨 제외 (변경되면 매칭 깨짐)
+	selectorLabels := map[string]string{
+		"app":                        labels["app"],
+		"app.kubernetes.io/name":     labels["app.kubernetes.io/name"],
+		"app.kubernetes.io/instance": labels["app.kubernetes.io/instance"],
+	}
 
 	// 환경 변수 설정 - 컨트롤러가 클러스터 관리를 담당하므로 최소한만 설정
 	env := []corev1.EnvVar{
@@ -30,6 +37,9 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{
 			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
 		}},
+	}
+	if k.Spec.MaxMemory != "" {
+		env = append(env, corev1.EnvVar{Name: "REDIS_MAXMEMORY", Value: k.Spec.MaxMemory})
 	}
 
 	// 리소스 요구사항
@@ -54,8 +64,10 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 		ProbeHandler: corev1.ProbeHandler{
 			TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(int(k.Spec.BasePort))},
 		},
-		InitialDelaySeconds: 30,
+		InitialDelaySeconds: 20,
 		PeriodSeconds:       10,
+		TimeoutSeconds:      3,
+		FailureThreshold:    5,
 	}
 
 	readinessProbe := &corev1.Probe{
@@ -66,9 +78,22 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 		},
 		InitialDelaySeconds: 5,
 		PeriodSeconds:       5,
-		TimeoutSeconds:      3,
+		TimeoutSeconds:      2,
 		SuccessThreshold:    1,
 		FailureThreshold:    3,
+	}
+
+	startupProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{"redis-cli", "-p", fmt.Sprintf("%d", k.Spec.BasePort), "ping"},
+			},
+		},
+		// Allow longer warmup before readiness/liveness kick in
+		InitialDelaySeconds: 0,
+		PeriodSeconds:       5,
+		TimeoutSeconds:      3,
+		FailureThreshold:    24, // ~2 minutes max
 	}
 
 	// Redis 컨테이너
@@ -89,6 +114,7 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 		Resources:      resources,
 		LivenessProbe:  livenessProbe,
 		ReadinessProbe: readinessProbe,
+		StartupProbe:   startupProbe,
 	}
 
 	// 볼륨 클레임 템플릿
@@ -127,16 +153,15 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:    &totalReplicas,
 			ServiceName: k.Name,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
+			Selector: &metav1.LabelSelector{ // role 제외
+				MatchLabels: selectorLabels,
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					Containers:       []corev1.Container{redisContainer},
-					ImagePullSecrets: []corev1.LocalObjectReference{{Name: "docker-secret"}},
+					Containers: []corev1.Container{redisContainer},
 				},
 			},
 			VolumeClaimTemplates: volumeClaimTemplates,
@@ -144,31 +169,20 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 		},
 	}
 
+	// Build imagePullSecret name with optional prefix from CR labels
+	secretName := "docker-secret"
+	if k != nil && k.Labels != nil {
+		if prefix, ok := k.Labels["app.kubernetes.io/name-prefix"]; ok && prefix != "" {
+			if !strings.HasSuffix(prefix, "-") {
+				prefix = prefix + "-"
+			}
+			secretName = prefix + secretName
+		}
+	}
+	ss.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: secretName}}
+
 	controllerutil.SetControllerReference(k, ss, scheme)
 	return ss
 }
 
 // CreateRedisService creates a headless service for the Redis StatefulSet
-func CreateRedisService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
-	labels := LabelsForKredis(k.Name, "redis")
-
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      k.Name,
-			Namespace: k.Namespace,
-			Labels:    labels,
-		},
-		Spec: corev1.ServiceSpec{
-			Selector:  labels,
-			ClusterIP: "None", // Headless service
-			Type:      corev1.ServiceTypeClusterIP,
-			Ports: []corev1.ServicePort{
-				{Name: "redis", Port: k.Spec.BasePort, TargetPort: intstr.FromInt(int(k.Spec.BasePort))},
-				{Name: "cluster-bus", Port: k.Spec.BasePort + 10000, TargetPort: intstr.FromInt(int(k.Spec.BasePort + 10000))},
-			},
-		},
-	}
-
-	controllerutil.SetControllerReference(k, svc, scheme)
-	return svc
-}

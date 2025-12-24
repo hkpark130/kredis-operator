@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -28,7 +29,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -44,7 +44,6 @@ import (
 type KredisReconciler struct {
 	client.Client
 	Scheme         *runtime.Scheme
-	RestConfig     *rest.Config
 	ClusterManager *cluster.ClusterManager
 }
 
@@ -93,27 +92,44 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// 3. Manage Redis cluster state
-	clusterReady, err := r.ClusterManager.ReconcileCluster(ctx, kredis)
+	clusterReady, delta, err := r.ClusterManager.ReconcileCluster(ctx, kredis)
 	if err != nil {
+		// 오류가 발생해도 delta에 담긴 진행중/실패 상태를 우선 반영하여 중복 작업을 방지
+		if delta != nil {
+			if uerr := r.updateStatus(ctx, kredis, delta); uerr != nil {
+				logger.Error(uerr, "Failed to update status after reconcile error")
+			}
+		}
 		logger.Error(err, "Failed to reconcile Redis cluster")
-		return ctrl.Result{RequeueAfter: time.Minute}, err
+		return ctrl.Result{RequeueAfter: time.Minute}, err // 클러스터 조정 실패 시 1분 후 재시도
 	}
 
 	// 4. Update status
-	if err := r.updateStatus(ctx, kredis); err != nil {
+	if err := r.updateStatus(ctx, kredis, delta); err != nil {
 		logger.Error(err, "Failed to update status")
-		return ctrl.Result{RequeueAfter: time.Second * 30}, err
+		return ctrl.Result{RequeueAfter: time.Second * 10}, err
 	}
 
-	// Adjust reconcile interval based on cluster state
+	// Adjust reconcile interval based on cluster state and in-progress
+	inProgress := false
+	if delta != nil && strings.Contains(delta.LastClusterOperation, "-in-progress") {
+		inProgress = true
+	} else if strings.Contains(kredis.Status.LastClusterOperation, "-in-progress") {
+		inProgress = true
+	}
+
 	if clusterReady {
 		// Cluster is healthy - check less frequently
 		logger.V(1).Info("Cluster is healthy - scheduling next check in 10 minutes")
 		return ctrl.Result{RequeueAfter: time.Minute * 10}, nil
+	} else if inProgress {
+		// While operations are in progress, poll more frequently
+		logger.V(1).Info("Operation in progress - scheduling next check in 10 seconds")
+		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
 	} else {
 		// Cluster needs attention - check more frequently
 		logger.V(1).Info("Cluster needs attention - scheduling next check in 2 minutes")
-		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
+		return ctrl.Result{RequeueAfter: time.Minute * 2}, nil
 	}
 }
 
@@ -167,7 +183,7 @@ func (r *KredisReconciler) reconcileStatefulSet(ctx context.Context, kredis *cac
 	return nil
 }
 
-func (r *KredisReconciler) updateStatus(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
+func (r *KredisReconciler) updateStatus(ctx context.Context, kredis *cachev1alpha1.Kredis, delta *cluster.ClusterStatusDelta) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Get the latest version of Kredis
 		currentKredis := &cachev1alpha1.Kredis{}
@@ -181,6 +197,25 @@ func (r *KredisReconciler) updateStatus(ctx context.Context, kredis *cachev1alph
 		err = r.Get(ctx, types.NamespacedName{Name: kredis.Name, Namespace: kredis.Namespace}, foundStatefulSet)
 		if err != nil {
 			return err
+		}
+
+		// Merge delta from ClusterManager first
+		if delta != nil {
+			if delta.LastClusterOperation != "" {
+				currentKredis.Status.LastClusterOperation = delta.LastClusterOperation
+			}
+			if delta.KnownClusterNodes != nil {
+				currentKredis.Status.KnownClusterNodes = *delta.KnownClusterNodes
+			}
+			if len(delta.JoinedPods) > 0 {
+				currentKredis.Status.JoinedPods = mergeUnique(currentKredis.Status.JoinedPods, delta.JoinedPods)
+			}
+			if len(delta.ClusterNodes) > 0 {
+				currentKredis.Status.ClusterNodes = delta.ClusterNodes
+			}
+			if delta.ClusterState != "" {
+				currentKredis.Status.ClusterState = delta.ClusterState
+			}
 		}
 
 		newStatus := r.calculateStatus(currentKredis, foundStatefulSet)
@@ -229,6 +264,25 @@ func (r *KredisReconciler) calculateStatus(kredis *cachev1alpha1.Kredis, sts *ap
 	newStatus.Conditions = []metav1.Condition{condition}
 
 	return *newStatus
+}
+
+// mergeUnique returns a union of two string slices, preserving existing order where possible.
+func mergeUnique(base []string, add []string) []string {
+	set := map[string]struct{}{}
+	out := make([]string, 0, len(base)+len(add))
+	for _, v := range base {
+		if _, ok := set[v]; !ok {
+			set[v] = struct{}{}
+			out = append(out, v)
+		}
+	}
+	for _, v := range add {
+		if _, ok := set[v]; !ok {
+			set[v] = struct{}{}
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // SetupWithManager sets up the controller with the Manager.

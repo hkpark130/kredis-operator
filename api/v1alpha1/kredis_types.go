@@ -31,8 +31,8 @@ type KredisSpec struct {
 	// Redis Replica Node count
 	Replicas int32 `json:"replicas"`
 
-	// Redis Memory size
-	Memory string `json:"memory"`
+	// MaxMemory: Redis maxmemory 설정 (예: "512mb", "1gb"). 비우면 제한 미적용.
+	MaxMemory string `json:"maxMemory,omitempty"`
 
 	// Base Port for Redis
 	BasePort int32 `json:"basePort"`

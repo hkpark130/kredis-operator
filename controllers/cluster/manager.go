@@ -39,14 +39,24 @@ const (
 	OperationHeal      ClusterOperation = "heal"
 )
 
+// ClusterStatusDelta carries status changes for the controller to persist.
+type ClusterStatusDelta struct {
+	LastClusterOperation string
+	KnownClusterNodes    *int
+	JoinedPods           []string
+	ClusterNodes         []cachev1alpha1.ClusterNode
+	ClusterState         string
+}
+
 // ReconcileCluster manages the Redis cluster state and returns whether cluster is ready
-func (cm *ClusterManager) ReconcileCluster(ctx context.Context, kredis *cachev1alpha1.Kredis) (bool, error) {
+func (cm *ClusterManager) ReconcileCluster(ctx context.Context, kredis *cachev1alpha1.Kredis) (bool, *ClusterStatusDelta, error) {
 	logger := log.FromContext(ctx)
+	delta := &ClusterStatusDelta{}
 
 	// 1. Get all pods for this Kredis instance
 	pods, err := cm.getKredisPods(ctx, kredis)
 	if err != nil {
-		return false, fmt.Errorf("failed to get kredis pods: %w", err)
+		return false, delta, fmt.Errorf("failed to get kredis pods: %w", err)
 	}
 
 	// 2. Check if all pods are ready
@@ -54,14 +64,16 @@ func (cm *ClusterManager) ReconcileCluster(ctx context.Context, kredis *cachev1a
 		logger.V(1).Info("Waiting for all pods to be ready",
 			"ready", len(cm.getReadyPods(pods)),
 			"expected", cm.getExpectedPodCount(kredis))
-		return false, nil
+		return false, delta, nil
 	}
 
 	// 3. Discover current cluster state ONCE and cache it for this reconciliation loop.
 	// This avoids multiple redundant calls to Redis.
-	clusterState, err := cm.discoverClusterState(ctx, kredis, pods)
-	// 4. Update status with discovered nodes
-	kredis.Status.ClusterNodes = clusterState
+	clusterState, _ := cm.discoverClusterState(ctx, kredis, pods)
+	// 4. Provide discovered nodes via delta
+	delta.ClusterNodes = clusterState
+	// 4.1 Sync pod role labels based on discovered cluster state (dynamic update)
+	cm.SyncPodRoleLabels(ctx, kredis, clusterState)
 
 	// 5. Determine what operation is needed based on the discovered state
 	operation := cm.determineRequiredOperation(ctx, kredis, clusterState, pods)
@@ -69,71 +81,16 @@ func (cm *ClusterManager) ReconcileCluster(ctx context.Context, kredis *cachev1a
 	// 6. Execute the operation if needed
 	if operation != "" {
 		// Pass the discovered state to the execution function to avoid re-querying
-		err := cm.executeClusterOperation(ctx, kredis, operation, pods, clusterState)
+		err := cm.executeClusterOperation(ctx, kredis, operation, pods, clusterState, delta)
 		if err != nil {
-			return false, err
+			return false, delta, err
 		}
 		// After operation, cluster might need time to stabilize
-		return false, nil
+		return false, delta, nil
 	}
 
 	// Cluster is stable and no operations needed
-	return true, nil
-}
-
-// getKredisPods retrieves all pods belonging to this Kredis instance
-func (cm *ClusterManager) getKredisPods(ctx context.Context, kredis *cachev1alpha1.Kredis) ([]corev1.Pod, error) {
-	podList := &corev1.PodList{}
-	labelSelector := client.MatchingLabels{
-		"app":    "redis",
-		"kredis": kredis.Name,
-	}
-
-	err := cm.List(ctx, podList, client.InNamespace(kredis.Namespace), labelSelector)
-	if err != nil {
-		return nil, err
-	}
-
-	// Sort pods by name to ensure consistent ordering
-	pods := podList.Items
-	sort.Slice(pods, func(i, j int) bool {
-		return pods[i].Name < pods[j].Name
-	})
-
-	return pods, nil
-}
-
-// areAllPodsReady checks if all expected pods are ready
-func (cm *ClusterManager) areAllPodsReady(pods []corev1.Pod, kredis *cachev1alpha1.Kredis) bool {
-	expectedCount := cm.getExpectedPodCount(kredis)
-	readyPods := cm.getReadyPods(pods)
-
-	return len(readyPods) == int(expectedCount) && len(pods) == int(expectedCount)
-}
-
-// getReadyPods returns only the ready pods
-func (cm *ClusterManager) getReadyPods(pods []corev1.Pod) []corev1.Pod {
-	var readyPods []corev1.Pod
-	for _, pod := range pods {
-		if cm.isPodReady(pod) {
-			readyPods = append(readyPods, pod)
-		}
-	}
-	return readyPods
-}
-
-// isPodReady checks if a pod is ready
-func (cm *ClusterManager) isPodReady(pod corev1.Pod) bool {
-	if pod.Status.Phase != corev1.PodRunning {
-		return false
-	}
-
-	for _, condition := range pod.Status.Conditions {
-		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
+	return true, delta, nil
 }
 
 // getExpectedPodCount calculates the expected number of pods
@@ -141,81 +98,37 @@ func (cm *ClusterManager) getExpectedPodCount(kredis *cachev1alpha1.Kredis) int3
 	return kredis.Spec.Masters + (kredis.Spec.Masters * kredis.Spec.Replicas)
 }
 
-// discoverClusterState queries Redis nodes to understand current cluster state
-func (cm *ClusterManager) discoverClusterState(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod) ([]cachev1alpha1.ClusterNode, error) {
-	var clusterNodes []cachev1alpha1.ClusterNode
-	for _, pod := range pods {
-		// Query this pod's Redis for cluster info
-		nodeInfo, err := cm.queryRedisNodeInfo(ctx, pod, kredis.Spec.BasePort)
-		if err != nil {
-			// Pod might not be part of cluster yet
-			clusterNodes = append(clusterNodes, cachev1alpha1.ClusterNode{
-				PodName: pod.Name,
-				IP:      pod.Status.PodIP,
-				Port:    kredis.Spec.BasePort,
-				Role:    "unknown", // Role is unknown until it joins the cluster
-				Status:  "pending",
-			})
-			continue
-		}
-
-		clusterNodes = append(clusterNodes, nodeInfo)
-	}
-
-	return clusterNodes, nil
-}
-
-// queryRedisNodeInfo queries a Redis pod for its cluster information
-func (cm *ClusterManager) queryRedisNodeInfo(ctx context.Context, pod corev1.Pod, port int32) (cachev1alpha1.ClusterNode, error) {
-	node := cachev1alpha1.ClusterNode{
-		PodName: pod.Name,
-		IP:      pod.Status.PodIP,
-		Port:    port,
-		Status:  "pending",
-	}
-
-	// Check if Redis is ready
-	if !cm.PodExecutor.IsRedisReady(ctx, pod, port) {
-		return node, fmt.Errorf("redis not ready")
-	}
-
-	// Get cluster node information
-	redisNodes, err := cm.PodExecutor.GetRedisClusterNodes(ctx, pod, port)
-	if err != nil {
-		return node, err
-	}
-
-	// Find this pod's node info
-	for _, redisNode := range redisNodes {
-		if redisNode.IP == pod.Status.PodIP {
-			node.NodeID = redisNode.NodeID
-			node.Role = redisNode.Role
-			node.MasterID = redisNode.MasterID
-			node.Status = redisNode.Status
-			break
-		}
-	}
-
-	return node, nil
-}
-
 // determineRequiredOperation analyzes current vs desired state
 func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis *cachev1alpha1.Kredis, clusterState []cachev1alpha1.ClusterNode, pods []corev1.Pod) ClusterOperation {
 	logger := log.FromContext(ctx)
 
-	// Check if there's an ongoing operation
+	// Check if there's an ongoing operation and resume verification if needed
+	lastOp := kredis.Status.LastClusterOperation
+	if strings.Contains(lastOp, "rebalance-in-progress") {
+		// 리밸런스는 검증/완료 마킹을 위해 별도 오퍼레이션으로 처리
+		logger.Info("Rebalance in progress - will run verification step",
+			"lastOperation", lastOp,
+			"currentTime", time.Now().Unix())
+		return OperationRebalance
+	}
+	if strings.Contains(lastOp, "scale-in-progress") {
+		// 스케일 도중 재시작 등의 상황에서 검증/후속 절차 재개
+		logger.Info("Scale in progress - will resume scale verification",
+			"lastOperation", lastOp,
+			"currentTime", time.Now().Unix())
+		return OperationScale
+	}
+	if strings.Contains(lastOp, "heal-in-progress") {
+		// 힐 작업 진행 중이면 검증/완료 단계 재실행
+		logger.Info("Heal in progress - will continue heal verification",
+			"lastOperation", lastOp,
+			"currentTime", time.Now().Unix())
+		return OperationHeal
+	}
 	if cm.isOperationInProgress(ctx, kredis, pods) {
-		lastOp := kredis.Status.LastClusterOperation
-		// rebalance-in-progress인 경우 특별 처리
-		if strings.Contains(lastOp, "rebalance-in-progress") {
-			logger.Info("Rebalance is in progress - waiting for completion",
-				"lastOperation", lastOp,
-				"currentTime", time.Now().Unix())
-		} else {
-			logger.Info("Operation already in progress - skipping new operation",
-				"lastOperation", lastOp,
-				"currentTime", time.Now().Unix())
-		}
+		logger.Info("Operation already in progress - skipping new operation",
+			"lastOperation", lastOp,
+			"currentTime", time.Now().Unix())
 		return ""
 	}
 
@@ -317,590 +230,23 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 }
 
 // executeClusterOperation performs the required cluster operation
-func (cm *ClusterManager) executeClusterOperation(ctx context.Context, kredis *cachev1alpha1.Kredis, operation ClusterOperation, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) error {
+func (cm *ClusterManager) executeClusterOperation(ctx context.Context, kredis *cachev1alpha1.Kredis, operation ClusterOperation, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode, delta *ClusterStatusDelta) error {
 	logger := log.FromContext(ctx)
 	logger.Info("Executing cluster operation", "operation", operation)
 
 	switch operation {
 	case OperationCreate:
-		return cm.createCluster(ctx, kredis, pods)
+		return cm.createCluster(ctx, kredis, pods, delta)
 	case OperationScale:
 		// Pass the already discovered state to the scale function
-		return cm.scaleCluster(ctx, kredis, pods, clusterState)
+		return cm.scaleCluster(ctx, kredis, pods, clusterState, delta)
 	case OperationRebalance:
 		// Pass the already discovered state to the rebalance function
-		return cm.rebalanceCluster(ctx, kredis, pods, clusterState)
+		return cm.rebalanceCluster(ctx, kredis, pods, clusterState, delta)
 	case OperationHeal:
-		return cm.healCluster(ctx, kredis, pods, clusterState)
+		return cm.healCluster(ctx, kredis, pods, clusterState, delta)
 	default:
 		return fmt.Errorf("unknown cluster operation: %s", operation)
-	}
-}
-
-// createCluster initializes a new Redis cluster
-func (cm *ClusterManager) createCluster(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod) error {
-	logger := log.FromContext(ctx)
-
-	// --- Pre-flight check: Reset all nodes before creating a cluster ---
-	logger.Info("Resetting all nodes before cluster creation to ensure a clean state.")
-	for _, pod := range pods {
-		logger.Info("Executing FLUSHALL on pod", "pod", pod.Name)
-		if _, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, kredis.Spec.BasePort, "FLUSHALL"); err != nil {
-			logger.Error(err, "Failed to flush node, but proceeding", "pod", pod.Name)
-			// Proceeding might be okay if the node was already empty.
-		}
-		logger.Info("Executing CLUSTER RESET on pod", "pod", pod.Name)
-		if _, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, kredis.Spec.BasePort, "CLUSTER", "RESET"); err != nil {
-			// This is more critical. If reset fails, creation is likely to fail.
-			return fmt.Errorf("failed to reset node %s: %w", pod.Name, err)
-		}
-	}
-	// Give nodes a moment to settle after reset
-	time.Sleep(2 * time.Second)
-	// --- End of pre-flight check ---
-
-	kredis.Status.LastClusterOperation = fmt.Sprintf("create-in-progress:%d", time.Now().Unix())
-	if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to update status to create-in-progress")
-		return err
-	}
-
-	// Find a pod to execute cluster create command from. Any ready pod will do.
-	var commandPod *corev1.Pod
-	for i := range pods {
-		if cm.isPodReady(pods[i]) {
-			commandPod = &pods[i]
-			break
-		}
-	}
-	if commandPod == nil {
-		return fmt.Errorf("no ready pod found for cluster creation")
-	}
-
-	logger.Info("Creating Redis cluster", "commandPod", commandPod.Name)
-
-	// Build the node IP list for the cluster create command
-	var nodeIPs []string
-	for _, pod := range pods {
-		if pod.Status.PodIP != "" {
-			nodeIPs = append(nodeIPs, pod.Status.PodIP)
-		}
-	}
-
-	if len(nodeIPs) != len(pods) {
-		return fmt.Errorf("not all pods have an IP address yet")
-	}
-
-	logger.Info("Node list for cluster creation", "nodeIPs", strings.Join(nodeIPs, " "), "nodeCount", len(nodeIPs))
-
-	// Execute cluster create command using the executor
-	_, err := cm.PodExecutor.CreateCluster(ctx, *commandPod, kredis.Spec.BasePort, nodeIPs, int(kredis.Spec.Replicas))
-	if err != nil {
-		kredis.Status.LastClusterOperation = fmt.Sprintf("create-failed:%d", time.Now().Unix())
-		if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-			logger.Error(err, "Failed to update status to create-failed")
-		}
-		return fmt.Errorf("failed to create cluster: %w", err)
-	}
-
-	// After creation, wait for stabilization
-	logger.Info("Waiting for cluster to stabilize after creation...")
-	err = cm.waitForClusterStabilization(ctx, kredis, commandPod)
-	if err != nil {
-		kredis.Status.LastClusterOperation = fmt.Sprintf("create-failed:%d", time.Now().Unix())
-		if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-			logger.Error(err, "Failed to update status to create-failed after stabilization")
-		}
-		return fmt.Errorf("cluster failed to stabilize after creation: %w", err)
-	}
-
-	kredis.Status.LastClusterOperation = fmt.Sprintf("create-success:%d", time.Now().Unix())
-	kredis.Status.ClusterState = "created"
-
-	// Wait a moment for the cluster to initialize
-	time.Sleep(2 * time.Second)
-
-	logger.Info("Successfully created Redis cluster")
-
-	// After successful creation, update the known node count and joined pods in the status
-	kredis.Status.KnownClusterNodes = len(pods)
-	// 클러스터 생성에 사용된 파드 이름을 JoinedPods에 저장
-	var joinedPodNames []string
-	for _, pod := range pods {
-		if pod.Status.PodIP != "" {
-			joinedPodNames = append(joinedPodNames, pod.Name)
-		}
-	}
-	kredis.Status.JoinedPods = joinedPodNames
-	if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to update Kredis status with known node count after creation")
-		return err // Return error but cluster might be created
-	}
-
-	return nil
-}
-
-// scaleCluster handles adding or removing nodes from the cluster
-func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) error {
-	logger := log.FromContext(ctx)
-	logger.Info("Scaling up Redis cluster")
-
-	kredis.Status.LastClusterOperation = fmt.Sprintf("scale-in-progress:%d", time.Now().Unix())
-	if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to update status to scale-in-progress")
-		return err
-	}
-
-	commandPod := cm.findMasterPod(pods, kredis, clusterState)
-	if commandPod == nil {
-		return fmt.Errorf("failed to find a pod for scaling command")
-	}
-	logger.Info("Using pod for scaling command", "pod", commandPod.Name)
-
-	newPods := filterNewPods(pods, kredis.Status.JoinedPods)
-	if len(newPods) == 0 {
-		logger.Info("No new pods to add to the cluster.")
-		kredis.Status.LastClusterOperation = fmt.Sprintf("scale-skipped-no-new-pods:%d", time.Now().Unix())
-		_ = cm.Client.Status().Update(ctx, kredis)
-		return nil
-	}
-
-	// --- Pre-flight check: Reset all NEW nodes before adding them to the cluster ---
-	logger.Info("Resetting new nodes before adding them to the cluster.")
-	for _, pod := range newPods {
-		logger.Info("Executing FLUSHALL on new pod", "pod", pod.Name)
-		if _, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, kredis.Spec.BasePort, "FLUSHALL"); err != nil {
-			logger.Error(err, "Failed to flush new node, but proceeding", "pod", pod.Name)
-		}
-		logger.Info("Executing CLUSTER RESET on new pod", "pod", pod.Name)
-		if _, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, kredis.Spec.BasePort, "CLUSTER", "RESET"); err != nil {
-			return fmt.Errorf("failed to reset new node %s: %w", pod.Name, err)
-		}
-	}
-	// Give nodes a moment to settle after reset
-	time.Sleep(2 * time.Second)
-	// --- End of pre-flight check ---
-
-	// 1. 현재 JoinedPods에 포함된 마스터 노드 집계
-	var masterNodes []cachev1alpha1.ClusterNode
-	joinedPodsSet := make(map[string]struct{})
-	for _, podName := range kredis.Status.JoinedPods {
-		joinedPodsSet[podName] = struct{}{}
-	}
-	for _, node := range clusterState {
-		if _, ok := joinedPodsSet[node.PodName]; ok && node.Role == "master" {
-			masterNodes = append(masterNodes, node)
-		}
-	}
-
-	// 2. 새로 추가될 파드 이름 오름차순 정렬
-	sort.Slice(newPods, func(i, j int) bool {
-		return newPods[i].Name < newPods[j].Name
-	})
-
-	// 3. 마스터 부족분만큼 마스터로 추가
-	var newMasters []corev1.Pod
-	var newSlaves []corev1.Pod
-	mastersNeeded := int(kredis.Spec.Masters) - len(masterNodes)
-	for idx, pod := range newPods {
-		if idx < mastersNeeded {
-			newMasters = append(newMasters, pod)
-		} else {
-			newSlaves = append(newSlaves, pod)
-		}
-	}
-
-	// 4. 마스터로 추가
-	for _, newMaster := range newMasters {
-		logger.Info("Adding new master node to cluster", "pod", newMaster.Name, "ip", newMaster.Status.PodIP)
-		err := cm.PodExecutor.AddNodeToCluster(ctx, newMaster, *commandPod, kredis.Spec.BasePort, "")
-		if err != nil {
-			kredis.Status.LastClusterOperation = fmt.Sprintf("scale-failed:%d", time.Now().Unix())
-			if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-				logger.Error(err, "Failed to update status to scale-failed")
-			}
-			return fmt.Errorf("failed to add master node %s to cluster: %w", newMaster.Name, err)
-		}
-		time.Sleep(1 * time.Second) // Short sleep to avoid overwhelming the cluster
-
-		// 마스터로 추가된 노드의 NodeID를 알아내기 위해 클러스터 상태 갱신
-		refreshedState, err := cm.PodExecutor.GetRedisClusterNodes(ctx, *commandPod, kredis.Spec.BasePort)
-		if err != nil {
-			return fmt.Errorf("failed to refresh cluster state after adding master: %w", err)
-		}
-		// NodeID 찾기
-		for _, redisNode := range refreshedState {
-			if redisNode.IP == newMaster.Status.PodIP {
-				masterNodes = append(masterNodes, cachev1alpha1.ClusterNode{
-					NodeID:   redisNode.NodeID,
-					PodName:  newMaster.Name,
-					IP:       redisNode.IP,
-					Port:     redisNode.Port,
-					Role:     "master",
-					MasterID: "",
-					Status:   redisNode.Status,
-					Joined:   true, // deprecated, 실제 사용은 JoinedPods
-				})
-				// Join된 파드로 추가
-				if !containsString(kredis.Status.JoinedPods, newMaster.Name) {
-					kredis.Status.JoinedPods = append(kredis.Status.JoinedPods, newMaster.Name)
-				}
-				break
-			}
-		}
-	}
-
-	// 5. 각 마스터별 replica 수 집계용 map
-	replicaMap := make(map[string]int)
-	for _, m := range masterNodes {
-		replicaMap[m.NodeID] = 0
-	}
-	// 기존 slave 집계
-	for _, node := range clusterState {
-		if _, ok := joinedPodsSet[node.PodName]; ok && node.Role == "slave" && node.MasterID != "" {
-			replicaMap[node.MasterID]++
-		}
-	}
-
-	// 6. 슬레이브로 추가 (각 마스터별로 kredis.Spec.Replicas 만큼만 할당)
-	for _, newSlave := range newSlaves {
-		// replica가 spec보다 적은 마스터 중 replica가 가장 적은 마스터 선택
-		var targetMasterID string
-		minReplicas := int(kredis.Spec.Replicas) + 1
-		for masterID, count := range replicaMap {
-			if count < int(kredis.Spec.Replicas) && count < minReplicas {
-				minReplicas = count
-				targetMasterID = masterID
-			}
-		}
-		if targetMasterID == "" {
-			return fmt.Errorf("no master available for new replica %s", newSlave.Name)
-		}
-		logger.Info("Adding new slave node to cluster", "pod", newSlave.Name, "ip", newSlave.Status.PodIP, "masterID", targetMasterID)
-		err := cm.PodExecutor.AddNodeToCluster(ctx, newSlave, *commandPod, kredis.Spec.BasePort, targetMasterID)
-		if err != nil {
-			kredis.Status.LastClusterOperation = fmt.Sprintf("scale-failed:%d", time.Now().Unix())
-			if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-				logger.Error(err, "Failed to update status to scale-failed")
-			}
-			return fmt.Errorf("failed to add slave node %s to cluster: %w", newSlave.Name, err)
-		}
-		// Join된 파드로 추가
-		if !containsString(kredis.Status.JoinedPods, newSlave.Name) {
-			kredis.Status.JoinedPods = append(kredis.Status.JoinedPods, newSlave.Name)
-		}
-		replicaMap[targetMasterID]++
-		time.Sleep(1 * time.Second)
-	}
-
-	// After adding all nodes, wait for them to be recognized by the cluster.
-	logger.Info("Waiting for all new nodes to be known by the cluster...")
-	expectedTotalPods := cm.getExpectedPodCount(kredis)
-	err := cm.waitForAllNodesToBeKnown(ctx, *commandPod, kredis.Spec.BasePort, int(expectedTotalPods))
-	if err != nil {
-		kredis.Status.LastClusterOperation = fmt.Sprintf("scale-failed:%d", time.Now().Unix())
-		if sErr := cm.Client.Status().Update(ctx, kredis); sErr != nil {
-			logger.Error(sErr, "Failed to update status to scale-failed")
-		}
-		return fmt.Errorf("cluster nodes did not report correct count after adding nodes: %w", err)
-	}
-
-	// Wait for the cluster to be generally healthy before rebalancing
-	logger.Info("Waiting for cluster to stabilize before rebalancing...")
-	err = cm.waitForClusterStabilization(ctx, kredis, commandPod)
-	if err != nil {
-		kredis.Status.LastClusterOperation = fmt.Sprintf("scale-failed:%d", time.Now().Unix())
-		if sErr := cm.Client.Status().Update(ctx, kredis); sErr != nil {
-			logger.Error(sErr, "Failed to update status to scale-failed")
-		}
-		return fmt.Errorf("cluster failed to stabilize before rebalancing: %w", err)
-	}
-
-	logger.Info("Starting Redis cluster rebalance after scaling")
-
-	// rebalance 시작 전 상태 설정
-	kredis.Status.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
-	if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to update status to rebalance-in-progress")
-		return err
-	}
-
-	// 클러스터 토폴로지 안정화 대기
-	logger.Info("Waiting for cluster topology to stabilize before rebalancing...")
-	time.Sleep(3 * time.Second)
-
-	// 단일 rebalance 시도
-	logger.Info("Executing cluster rebalance command")
-	_, rebalanceErr := cm.PodExecutor.RebalanceCluster(ctx, *commandPod, kredis.Spec.BasePort)
-	if rebalanceErr != nil {
-		if strings.Contains(rebalanceErr.Error(), "ERR Please use SETSLOT only with masters") {
-			logger.Info("Ignoring 'SETSLOT' error during rebalance, as it's expected when a master becomes a replica.")
-			rebalanceErr = nil
-		} else {
-			kredis.Status.LastClusterOperation = fmt.Sprintf("rebalance-failed:%d", time.Now().Unix())
-			if sErr := cm.Client.Status().Update(ctx, kredis); sErr != nil {
-				logger.Error(sErr, "Failed to update status to rebalance-failed")
-			}
-			return fmt.Errorf("rebalance command failed: %w", rebalanceErr)
-		}
-	}
-
-	// rebalance 명령어 실행 후 결과 검증을 위한 대기 및 재시도 로직
-	logger.Info("Waiting for rebalance to complete and verifying results...")
-	rebalanceTimeout := time.After(5 * time.Minute)
-	verificationTicker := time.NewTicker(10 * time.Second)
-	defer verificationTicker.Stop()
-
-	rebalanceCompleted := false
-	for !rebalanceCompleted {
-		select {
-		case <-ctx.Done():
-			kredis.Status.LastClusterOperation = fmt.Sprintf("rebalance-failed:%d", time.Now().Unix())
-			_ = cm.Client.Status().Update(ctx, kredis)
-			return ctx.Err()
-		case <-rebalanceTimeout:
-			kredis.Status.LastClusterOperation = fmt.Sprintf("rebalance-failed:%d", time.Now().Unix())
-			_ = cm.Client.Status().Update(ctx, kredis)
-			return fmt.Errorf("timed out waiting for rebalance to complete - cluster may still be processing slot migration")
-		case <-verificationTicker.C:
-			// 클러스터 건강 상태 확인
-			isHealthy, healthErr := cm.PodExecutor.IsClusterHealthy(ctx, *commandPod, kredis.Spec.BasePort)
-			if healthErr != nil {
-				logger.V(1).Info("Cluster health check failed during rebalance verification", "error", healthErr)
-				continue
-			}
-			if !isHealthy {
-				logger.Info("Cluster is not healthy yet, waiting for rebalance to complete...")
-				continue
-			}
-
-			// 모든 마스터가 슬롯을 가지고 있는지 확인
-			allMastersHaveSlots, checkErr := cm.checkAllMastersHaveSlots(ctx, *commandPod, kredis.Spec.BasePort)
-			if checkErr != nil {
-				logger.Error(checkErr, "Failed to check master slots during rebalance verification")
-				continue
-			}
-
-			if allMastersHaveSlots {
-				logger.Info("Rebalance completed successfully - all masters have slots assigned")
-				kredis.Status.LastClusterOperation = fmt.Sprintf("rebalance-success:%d", time.Now().Unix())
-				if sErr := cm.Client.Status().Update(ctx, kredis); sErr != nil {
-					logger.Error(sErr, "Failed to update status to rebalance-success")
-				}
-				rebalanceCompleted = true
-			} else {
-				logger.Info("Rebalance still in progress - some masters don't have slots yet")
-			}
-		}
-	}
-
-	// Wait for stabilization again after rebalancing
-	logger.Info("Waiting for cluster to stabilize after rebalancing...")
-	err = cm.waitForClusterStabilization(ctx, kredis, commandPod)
-	if err != nil {
-		kredis.Status.LastClusterOperation = fmt.Sprintf("scale-failed:%d", time.Now().Unix())
-		if sErr := cm.Client.Status().Update(ctx, kredis); sErr != nil {
-			logger.Error(sErr, "Failed to update status to scale-failed")
-		}
-		return fmt.Errorf("cluster failed to stabilize after rebalancing: %w", err)
-	}
-
-	kredis.Status.LastClusterOperation = fmt.Sprintf("scale-successful:%d", time.Now().Unix())
-	logger.Info("Successfully scaled up and rebalanced Redis cluster")
-
-	// After scaling and rebalancing, update the known node count to the expected final state
-	expectedCount := cm.getExpectedPodCount(kredis)
-	kredis.Status.KnownClusterNodes = int(expectedCount)
-	if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to update Kredis status with known node count after scaling")
-		// Don't block reconciliation, but log the error
-		return err
-	}
-
-	return nil
-}
-
-// rebalanceCluster rebalances the cluster slots
-func (cm *ClusterManager) rebalanceCluster(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) error {
-	logger := log.FromContext(ctx)
-
-	// Find a master pod to execute rebalance command
-	masterPod := cm.findMasterPod(pods, kredis, clusterState)
-	if masterPod == nil {
-		return fmt.Errorf("no master pod found for rebalancing")
-	}
-
-	logger.Info("Starting standalone Redis cluster rebalance", "masterPod", masterPod.Name)
-
-	// rebalance 시작 상태 설정
-	kredis.Status.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
-	if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to update status to rebalance-in-progress")
-		return err
-	}
-
-	// Execute cluster rebalance command
-	_, err := cm.PodExecutor.RebalanceCluster(ctx, *masterPod, kredis.Spec.BasePort)
-	if err != nil {
-		if strings.Contains(err.Error(), "ERR Please use SETSLOT only with masters") {
-			logger.Info("Ignoring 'SETSLOT' error during rebalance, as it's expected when a master becomes a replica.")
-		} else {
-			kredis.Status.LastClusterOperation = fmt.Sprintf("rebalance-failed:%d", time.Now().Unix())
-			if sErr := cm.Client.Status().Update(ctx, kredis); sErr != nil {
-				logger.Error(sErr, "Failed to update status to rebalance-failed")
-			}
-			return fmt.Errorf("failed to rebalance cluster: %w", err)
-		}
-	}
-
-	kredis.Status.LastClusterOperation = fmt.Sprintf("rebalance-success:%d", time.Now().Unix())
-	if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to update status to rebalance-success")
-	}
-	return nil
-}
-
-// healCluster handles healing a failed node in the cluster
-func (cm *ClusterManager) healCluster(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) error {
-	logger := log.FromContext(ctx)
-	logger.Info("Healing Redis cluster")
-
-	kredis.Status.LastClusterOperation = fmt.Sprintf("heal-in-progress:%d", time.Now().Unix())
-	if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to update status to heal-in-progress")
-		return err
-	}
-
-	// 1. Find a healthy master pod to execute commands
-	commandPod := cm.findMasterPod(pods, kredis, clusterState)
-	if commandPod == nil {
-		return fmt.Errorf("failed to find a healthy master pod for healing command")
-	}
-	logger.Info("Using pod for healing command", "pod", commandPod.Name)
-
-	// 2. Identify failed nodes
-	var failedNodes []cachev1alpha1.ClusterNode
-	podMap := make(map[string]corev1.Pod)
-	for _, p := range pods {
-		podMap[p.Name] = p
-	}
-
-	for _, node := range clusterState {
-		if strings.Contains(node.Status, "fail") {
-			failedNodes = append(failedNodes, node)
-		}
-	}
-
-	if len(failedNodes) == 0 {
-		logger.Info("No failed nodes found, skipping heal operation.")
-		kredis.Status.LastClusterOperation = fmt.Sprintf("heal-skipped:%d", time.Now().Unix())
-		_ = cm.Client.Status().Update(ctx, kredis)
-		return nil
-	}
-
-	// 3. Process each failed node
-	for _, failedNode := range failedNodes {
-		logger.Info("Processing failed node", "pod", failedNode.PodName, "nodeID", failedNode.NodeID)
-
-		// 3a. Tell the cluster to forget the failed node
-		if failedNode.NodeID != "" {
-			logger.Info("Executing CLUSTER FORGET for failed node", "nodeID", failedNode.NodeID)
-			_, err := cm.PodExecutor.ExecuteRedisCommand(ctx, *commandPod, kredis.Spec.BasePort, "CLUSTER", "FORGET", failedNode.NodeID)
-			if err != nil {
-				// Log error but continue, as pod deletion is the main healing mechanism
-				logger.Error(err, "Failed to execute CLUSTER FORGET, but proceeding with pod deletion", "nodeID", failedNode.NodeID)
-			}
-		} else {
-			logger.Info("Failed node has no NodeID, cannot execute CLUSTER FORGET. This can happen if the node never fully joined.", "pod", failedNode.PodName)
-		}
-
-		// 3b. Delete the pod to let the StatefulSet recreate it
-		if failedPod, ok := podMap[failedNode.PodName]; ok {
-			logger.Info("Deleting pod for failed node to trigger recreation", "pod", failedPod.Name)
-			if err := cm.Client.Delete(ctx, &failedPod); err != nil {
-				kredis.Status.LastClusterOperation = fmt.Sprintf("heal-failed:%d", time.Now().Unix())
-				_ = cm.Client.Status().Update(ctx, kredis)
-				return fmt.Errorf("failed to delete pod %s for healing: %w", failedPod.Name, err)
-			}
-		} else {
-			logger.Info("Pod for failed node not found, it might have been deleted already", "podName", failedNode.PodName)
-		}
-	}
-
-	// The reconciliation loop will handle the rest:
-	// - StatefulSet will recreate the pod.
-	// - The `areAllPodsReady` check will wait for it.
-	// - `determineRequiredOperation` will trigger `OperationScale`.
-	// - `scaleCluster` will add the new node back to the cluster.
-	kredis.Status.LastClusterOperation = fmt.Sprintf("heal-pod-deleted:%d", time.Now().Unix())
-	if err := cm.Client.Status().Update(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to update status after triggering heal")
-	}
-
-	logger.Info("Heal operation initiated. Waiting for reconciliation to add the new pod.")
-	return nil
-}
-
-// waitForClusterStabilization waits for the cluster to become healthy after an operation.
-func (cm *ClusterManager) waitForClusterStabilization(ctx context.Context, kredis *cachev1alpha1.Kredis, queryPod *corev1.Pod) error {
-	logger := log.FromContext(ctx)
-	timeout := time.After(2 * time.Minute)
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-timeout:
-			return fmt.Errorf("timed out waiting for cluster to stabilize")
-		case <-ticker.C:
-			isHealthy, err := cm.PodExecutor.IsClusterHealthy(ctx, *queryPod, kredis.Spec.BasePort)
-			if err != nil {
-				logger.V(1).Info("Waiting for cluster stabilization, health check failed", "error", err)
-				continue
-			}
-			if isHealthy {
-				logger.Info("Cluster has stabilized.")
-				return nil
-			}
-			logger.Info("Waiting for cluster to stabilize...")
-		}
-	}
-}
-
-// waitForAllNodesToBeKnown waits until the cluster reports a certain number of nodes.
-func (cm *ClusterManager) waitForAllNodesToBeKnown(ctx context.Context, commandPod corev1.Pod, port int32, expectedCount int) error {
-	logger := log.FromContext(ctx)
-	logger.Info("Waiting for all nodes to be known by the cluster", "expectedCount", expectedCount)
-
-	timeout := time.After(5 * time.Minute)
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-timeout:
-			return fmt.Errorf("timed out waiting for all nodes to be known")
-		case <-ticker.C:
-			nodes, err := cm.PodExecutor.GetRedisClusterNodes(ctx, commandPod, port)
-			if err != nil {
-				logger.Error(err, "Failed to get cluster nodes, retrying...")
-				continue
-			}
-
-			// Filter out nodes in handshake state, as they are not fully joined yet.
-			knownNodes := 0
-			for _, node := range nodes {
-				if !strings.Contains(node.Status, "handshake") {
-					knownNodes++
-				}
-			}
-
-			logger.Info("Checking number of known nodes", "current", knownNodes, "expected", expectedCount)
-			if knownNodes >= expectedCount {
-				logger.Info("All nodes are known by the cluster.")
-				return nil
-			}
-		}
 	}
 }
 
@@ -944,6 +290,7 @@ func (cm *ClusterManager) isClusterAlreadyExists(ctx context.Context, kredis *ca
 
 	// A healthy cluster with a node count matching the last known good state is considered to exist.
 	// knownNodes := kredis.Status.KnownClusterNodes
+	// KnownClusterNodes 으로 판별하면 하나라도 에러나면 기존 클러스터 없다고 판별함
 	// if knownNodes > 0 && len(nodes) == knownNodes {
 	if isHealthy && len(nodes) > 0 {
 		logger.Info("Found existing healthy cluster.")
@@ -954,23 +301,165 @@ func (cm *ClusterManager) isClusterAlreadyExists(ctx context.Context, kredis *ca
 	return false, nil
 }
 
-// findMasterPod finds a pod that is a known master and can execute cluster commands
+// getKredisPods retrieves all pods belonging to this Kredis instance
+func (cm *ClusterManager) getKredisPods(ctx context.Context, kredis *cachev1alpha1.Kredis) ([]corev1.Pod, error) {
+	podList := &corev1.PodList{}
+	labelSelector := client.MatchingLabels{
+		"app":                    "kredis",
+		"app.kubernetes.io/name": kredis.Name,
+	}
+
+	if err := cm.List(ctx, podList, client.InNamespace(kredis.Namespace), labelSelector); err != nil {
+		return nil, err
+	}
+	pods := podList.Items
+	sort.Slice(pods, func(i, j int) bool { return pods[i].Name < pods[j].Name })
+	return pods, nil
+}
+
+// discoverClusterState queries Redis nodes to understand current cluster state
+func (cm *ClusterManager) discoverClusterState(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod) ([]cachev1alpha1.ClusterNode, error) {
+	var clusterNodes []cachev1alpha1.ClusterNode
+	for _, pod := range pods {
+		nodeInfo, err := cm.queryRedisNodeInfo(ctx, pod, kredis.Spec.BasePort)
+		if err != nil {
+			clusterNodes = append(clusterNodes, cachev1alpha1.ClusterNode{
+				PodName: pod.Name,
+				IP:      pod.Status.PodIP,
+				Port:    kredis.Spec.BasePort,
+				Role:    "unknown",
+				Status:  "pending",
+			})
+			continue
+		}
+		clusterNodes = append(clusterNodes, nodeInfo)
+	}
+	return clusterNodes, nil
+}
+
+// queryRedisNodeInfo queries a Redis pod for its cluster information
+func (cm *ClusterManager) queryRedisNodeInfo(ctx context.Context, pod corev1.Pod, port int32) (cachev1alpha1.ClusterNode, error) {
+	node := cachev1alpha1.ClusterNode{PodName: pod.Name, IP: pod.Status.PodIP, Port: port, Status: "pending"}
+	if !cm.PodExecutor.IsRedisReady(ctx, pod, port) {
+		return node, fmt.Errorf("redis not ready")
+	}
+	redisNodes, err := cm.PodExecutor.GetRedisClusterNodes(ctx, pod, port)
+	if err != nil {
+		return node, err
+	}
+	for _, redisNode := range redisNodes {
+		if redisNode.IP == pod.Status.PodIP {
+			node.NodeID = redisNode.NodeID
+			node.Role = redisNode.Role
+			node.MasterID = redisNode.MasterID
+			node.Status = redisNode.Status
+			break
+		}
+	}
+	return node, nil
+}
+
+// areAllPodsReady checks if all expected pods are ready
+func (cm *ClusterManager) areAllPodsReady(pods []corev1.Pod, kredis *cachev1alpha1.Kredis) bool {
+	expectedCount := cm.getExpectedPodCount(kredis)
+	readyPods := cm.getReadyPods(pods)
+	return len(readyPods) == int(expectedCount) && len(pods) == int(expectedCount)
+}
+
+// getReadyPods returns only the ready pods
+func (cm *ClusterManager) getReadyPods(pods []corev1.Pod) []corev1.Pod {
+	var readyPods []corev1.Pod
+	for _, pod := range pods {
+		if cm.isPodReady(pod) {
+			readyPods = append(readyPods, pod)
+		}
+	}
+	return readyPods
+}
+
+// isPodReady checks if a pod is ready
+func (cm *ClusterManager) isPodReady(pod corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForClusterStabilization waits for the cluster to become healthy after an operation.
+func (cm *ClusterManager) waitForClusterStabilization(ctx context.Context, kredis *cachev1alpha1.Kredis, queryPod *corev1.Pod) error {
+	logger := log.FromContext(ctx)
+	timeout := time.After(2 * time.Minute)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-timeout:
+			return fmt.Errorf("timed out waiting for cluster to stabilize")
+		case <-ticker.C:
+			isHealthy, err := cm.PodExecutor.IsClusterHealthy(ctx, *queryPod, kredis.Spec.BasePort)
+			if err != nil {
+				logger.V(1).Info("Waiting for cluster stabilization, health check failed", "error", err)
+				continue
+			}
+			if isHealthy {
+				logger.Info("Cluster has stabilized.")
+				return nil
+			}
+			logger.Info("Waiting for cluster to stabilize...")
+		}
+	}
+}
+
+// waitForAllNodesToBeKnown waits until the cluster reports a certain number of nodes.
+func (cm *ClusterManager) waitForAllNodesToBeKnown(ctx context.Context, commandPod corev1.Pod, port int32, expectedCount int) error {
+	logger := log.FromContext(ctx)
+	logger.Info("Waiting for all nodes to be known by the cluster", "expectedCount", expectedCount)
+	timeout := time.After(5 * time.Minute)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-timeout:
+			return fmt.Errorf("timed out waiting for all nodes to be known")
+		case <-ticker.C:
+			nodes, err := cm.PodExecutor.GetRedisClusterNodes(ctx, commandPod, port)
+			if err != nil {
+				logger.Error(err, "Failed to get cluster nodes, retrying...")
+				continue
+			}
+			knownNodes := 0
+			for _, node := range nodes {
+				if !strings.Contains(node.Status, "handshake") {
+					knownNodes++
+				}
+			}
+			logger.Info("Checking number of known nodes", "current", knownNodes, "expected", expectedCount)
+			if knownNodes >= expectedCount {
+				logger.Info("All nodes are known by the cluster.")
+				return nil
+			}
+		}
+	}
+}
+
+// findMasterPod returns a ready master pod if possible, otherwise any ready pod.
 func (cm *ClusterManager) findMasterPod(pods []corev1.Pod, kredis *cachev1alpha1.Kredis, clusterState []cachev1alpha1.ClusterNode) *corev1.Pod {
-	// Use the provided clusterState to find a master without new queries.
 	podMap := make(map[string]corev1.Pod)
 	for _, p := range pods {
 		podMap[p.Name] = p
 	}
-
 	for _, node := range clusterState {
 		if node.Role == "master" {
 			if pod, ok := podMap[node.PodName]; ok && cm.isPodReady(pod) {
-				return &pod // Found a ready master
+				return &pod
 			}
 		}
 	}
-
-	// Fallback to any ready pod if no master was found in the state
 	for i := range pods {
 		if cm.isPodReady(pods[i]) {
 			return &pods[i]
@@ -979,135 +468,17 @@ func (cm *ClusterManager) findMasterPod(pods []corev1.Pod, kredis *cachev1alpha1
 	return nil
 }
 
-// buildNodeListForClusterCreate builds the node list for cluster create command
-func (cm *ClusterManager) buildNodeListForClusterCreate(pods []corev1.Pod, kredis *cachev1alpha1.Kredis) []string {
-	var nodes []string
-	for _, pod := range pods {
-		if cm.isPodReady(pod) {
-			nodes = append(nodes, fmt.Sprintf("%s:%d", pod.Status.PodIP, kredis.Spec.BasePort))
-		}
-	}
-	return nodes
-}
-
-// executeRedisCommand executes a redis-cli command in a pod
-func (cm *ClusterManager) executeRedisCommand(ctx context.Context, pod corev1.Pod, args ...string) error {
-	_, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, 6379, args...)
-	return err
-}
-
-// isOperationInProgress checks if there's an ongoing cluster operation
-func (cm *ClusterManager) isOperationInProgress(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod) bool {
-	lastOp := kredis.Status.LastClusterOperation
-	if lastOp == "" {
-		return false
-	}
-
-	// Only consider operations with "-in-progress" as ongoing
-	if !strings.Contains(lastOp, "-in-progress") {
-		return false
-	}
-
-	logger := log.FromContext(ctx)
-
-	// Parse the timestamp from "operation-in-progress:timestamp" format
-	parts := strings.Split(lastOp, ":")
-	if len(parts) < 2 {
-		// Invalid format, treat as not in progress
-		logger.V(1).Info("Invalid operation format, treating as not in progress", "lastOperation", lastOp)
-		return false
-	}
-
-	timestamp, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
-	if err != nil {
-		// Invalid timestamp, treat as not in progress
-		logger.V(1).Info("Invalid timestamp in operation, treating as not in progress", "lastOperation", lastOp)
-		return false
-	}
-
-	currentTime := time.Now().Unix()
-	timeDiff := currentTime - timestamp
-
-	// 실제 클러스터 상태 확인을 위한 준비 작업 - ready pod 찾기
-	var queryPod *corev1.Pod
-	for i := range pods {
-		if cm.isPodReady(pods[i]) {
-			queryPod = &pods[i]
-			break
-		}
-	}
-
-	// 작업별 타임아웃 설정
-	var timeoutDuration int64 = 300 // 5분 (기본)
-	if strings.Contains(lastOp, "rebalance-in-progress") {
-		timeoutDuration = 600 // 10분 (rebalance는 시간이 더 오래 걸릴 수 있음)
-	} else if strings.Contains(lastOp, "create-in-progress") {
-		timeoutDuration = 420 // 7분 (클러스터 생성)
-	} else if strings.Contains(lastOp, "scale-in-progress") {
-		timeoutDuration = 480 // 8분 (스케일링)
-	}
-
-	// 타임아웃 전이라면 실제 클러스터 상태 확인
-	if timeDiff <= timeoutDuration && queryPod != nil {
-		// 작업 종류별 실제 상태 검증
-		if strings.Contains(lastOp, "rebalance-in-progress") {
-			// 리밸런싱 중인지 실제로 확인
-			if isRebalancing := cm.checkIfRebalanceInProgress(ctx, *queryPod, kredis.Spec.BasePort); isRebalancing {
-				logger.V(1).Info("Rebalance operation is actually in progress")
-				return true
-			}
-		} else if strings.Contains(lastOp, "scale-in-progress") {
-			// 스케일링 중인지 확인 (cluster nodes에서 handshake 상태 확인)
-			if isScaling := cm.checkIfScalingInProgress(ctx, *queryPod, kredis.Spec.BasePort); isScaling {
-				logger.V(1).Info("Scale operation is actually in progress")
-				return true
-			}
-		} else if strings.Contains(lastOp, "create-in-progress") {
-			// 클러스터 생성 중인지 확인
-			if isCreating := cm.checkIfClusterCreationInProgress(ctx, *queryPod, kredis.Spec.BasePort); isCreating {
-				logger.V(1).Info("Cluster creation operation is actually in progress")
-				return true
-			}
-		}
-
-		// 실제 작업이 진행 중이 아니라면 완료된 것으로 간주
-		logger.Info("Operation marked as in-progress but not actually running, considering it completed",
-			"lastOperation", lastOp,
-			"timeDiff", timeDiff)
-		return false
-	}
-
-	// 타임아웃이 지났거나 상태 확인 불가능한 경우 타임스탬프 기반 판단
-	if timeDiff > timeoutDuration {
-		logger.Info("Stale operation found, allowing new operation",
-			"lastOperation", lastOp,
-			"timeDiff", timeDiff,
-			"timeoutDuration", timeoutDuration)
-		return false
-	}
-
-	// 타임아웃 내이지만 상태 확인 불가능한 경우 (쿼리할 pod가 없음)
-	logger.V(1).Info("Cannot verify operation status, assuming in progress due to recent timestamp",
-		"lastOperation", lastOp,
-		"timeDiff", timeDiff)
-	return true
-}
-
-// checkIfRebalanceInProgress checks if cluster rebalancing is actually happening
 func (cm *ClusterManager) checkIfRebalanceInProgress(ctx context.Context, pod corev1.Pod, port int32) bool {
-	// cluster nodes 명령어로 마이그레이션 중인 슬롯이 있는지 확인
 	result, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, port, "cluster", "nodes")
 	if err != nil {
-		return false // 확인 불가능하면 false 반환
+		return false
 	}
-
 	lines := strings.Split(result.Stdout, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		// 마이그레이션 중인 슬롯이 있으면 리밸런싱 중
 		if strings.Contains(line, "[") && strings.Contains(line, ">-") {
 			return true
 		}
@@ -1118,21 +489,17 @@ func (cm *ClusterManager) checkIfRebalanceInProgress(ctx context.Context, pod co
 	return false
 }
 
-// checkIfScalingInProgress checks if cluster scaling is actually happening
 func (cm *ClusterManager) checkIfScalingInProgress(ctx context.Context, pod corev1.Pod, port int32) bool {
-	// cluster nodes 명령어로 handshake 상태인 노드가 있는지 확인
 	result, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, port, "cluster", "nodes")
 	if err != nil {
 		return false
 	}
-
 	lines := strings.Split(result.Stdout, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		// handshake 상태인 노드가 있으면 스케일링 중
 		if strings.Contains(line, "handshake") {
 			return true
 		}
@@ -1140,30 +507,21 @@ func (cm *ClusterManager) checkIfScalingInProgress(ctx context.Context, pod core
 	return false
 }
 
-// checkIfClusterCreationInProgress checks if cluster creation is actually happening
 func (cm *ClusterManager) checkIfClusterCreationInProgress(ctx context.Context, pod corev1.Pod, port int32) bool {
-	// 클러스터가 아직 생성되지 않았거나 불안정한 상태인지 확인
 	isHealthy, err := cm.PodExecutor.IsClusterHealthy(ctx, pod, port)
 	if err != nil {
-		// Redis가 응답하지 않으면 아직 생성 중일 가능성이 높음
 		return true
 	}
-
-	// 클러스터가 건강하지 않으면 아직 생성 중
 	return !isHealthy
 }
 
-// getActualMasterCount gets the actual number of master nodes from Redis cluster
 func (cm *ClusterManager) getActualMasterCount(ctx context.Context, pods []corev1.Pod, port int32) (int, error) {
-	// Find any ready pod to query cluster info
 	for _, pod := range pods {
 		if cm.isPodReady(pod) && cm.PodExecutor.IsRedisReady(ctx, pod, port) {
-			// Execute redis-cli cluster nodes and count masters
 			result, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, port, "cluster", "nodes")
 			if err != nil {
-				continue // Try next pod
+				continue
 			}
-
 			masterCount := 0
 			lines := strings.Split(result.Stdout, "\n")
 			for _, line := range lines {
@@ -1171,28 +529,21 @@ func (cm *ClusterManager) getActualMasterCount(ctx context.Context, pods []corev
 				if line == "" {
 					continue
 				}
-
-				// Check if line contains "master" flag
 				if strings.Contains(line, " master ") || strings.Contains(line, ",master,") || strings.Contains(line, ",master ") {
 					masterCount++
 				}
 			}
-
 			return masterCount, nil
 		}
 	}
-
 	return 0, fmt.Errorf("no ready Redis pods found to query cluster info")
 }
 
-// checkAllMastersHaveSlots checks if all master nodes in the cluster have slots assigned.
 func (cm *ClusterManager) checkAllMastersHaveSlots(ctx context.Context, commandPod corev1.Pod, port int32) (bool, error) {
-	logger := log.FromContext(ctx)
 	result, err := cm.PodExecutor.ExecuteRedisCommand(ctx, commandPod, port, "cluster", "nodes")
 	if err != nil {
 		return false, fmt.Errorf("failed to get cluster nodes for slot check: %w", err)
 	}
-
 	lines := strings.Split(result.Stdout, "\n")
 	masterCount := 0
 	mastersWithSlots := 0
@@ -1201,30 +552,20 @@ func (cm *ClusterManager) checkAllMastersHaveSlots(ctx context.Context, commandP
 		if line == "" {
 			continue
 		}
-
-		// Check if the line represents a master node that is not in a failed state
 		if strings.Contains(line, "master") && !strings.Contains(line, "fail") {
 			masterCount++
-			// A master line with slots has more than 8 fields.
-			// <id> <ip:port@cport> <flags> <master> <ping-sent> <pong-recv> <config-epoch> <link-state> [slot_range ...]
 			fields := strings.Fields(line)
 			if len(fields) > 8 {
 				mastersWithSlots++
-			} else {
-				logger.Info("Found master with no slots", "nodeLine", line)
 			}
 		}
 	}
-
 	if masterCount == 0 {
-		logger.Info("No active masters found during slot check.")
 		return false, nil
 	}
-
 	return masterCount == mastersWithSlots, nil
 }
 
-// filterNewPods는 JoinedPods 기반으로 미가입 파드만 반환합니다.
 func filterNewPods(pods []corev1.Pod, joinedPods []string) []corev1.Pod {
 	joinedPodsSet := make(map[string]struct{})
 	for _, podName := range joinedPods {
@@ -1239,7 +580,6 @@ func filterNewPods(pods []corev1.Pod, joinedPods []string) []corev1.Pod {
 	return newPods
 }
 
-// containsString returns true if the slice contains the string
 func containsString(slice []string, s string) bool {
 	for _, v := range slice {
 		if v == s {
@@ -1247,4 +587,117 @@ func containsString(slice []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// SyncPodRoleLabels: discovered cluster state 를 바탕으로 각 파드의 role 라벨(master/replica/unknown)을 동기화
+// StatefulSet selector 에 포함되지 않은 라벨만 수정해야 함 (현재 selector 는 app, app.kubernetes.io/name, app.kubernetes.io/instance, role
+// 이므로 role 은 selector 에 포함되어 StatefulSet 자체의 PodTemplate 라벨 변경은 재생성 위험 -> Patch 로 개별 Pod 업데이트)
+func (cm *ClusterManager) SyncPodRoleLabels(ctx context.Context, kredis *cachev1alpha1.Kredis, clusterState []cachev1alpha1.ClusterNode) {
+	logger := log.FromContext(ctx)
+	for _, node := range clusterState {
+		if node.PodName == "" {
+			continue
+		}
+		desired := strings.ToLower(node.Role)
+		switch desired {
+		case "master":
+			// ok
+		case "slave", "replica":
+			desired = "slave" // 서비스 selector 와 일치
+		default:
+			desired = "unknown"
+		}
+		var pod corev1.Pod
+		if err := cm.Get(ctx, client.ObjectKey{Namespace: kredis.Namespace, Name: node.PodName}, &pod); err != nil {
+			logger.V(1).Info("Skip role label sync - cannot get pod", "pod", node.PodName, "err", err)
+			continue
+		}
+		if pod.Labels == nil {
+			pod.Labels = map[string]string{}
+		}
+		current := pod.Labels["role"]
+		if current == desired {
+			continue
+		}
+		// Patch only the metadata.labels.role field to avoid touching spec for StatefulSet managed pods
+		patch := client.MergeFrom(pod.DeepCopy())
+		pod.Labels["role"] = desired
+		if err := cm.Patch(ctx, &pod, patch); err != nil {
+			logger.V(1).Info("Failed to patch role label", "pod", pod.Name, "desired", desired, "err", err)
+			continue
+		}
+		logger.V(1).Info("Patched pod role label", "pod", pod.Name, "role", desired)
+	}
+}
+
+// isOperationInProgress checks if there's an ongoing cluster operation
+func (cm *ClusterManager) isOperationInProgress(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod) bool {
+	lastOp := kredis.Status.LastClusterOperation
+	if lastOp == "" {
+		return false
+	}
+	if !strings.Contains(lastOp, "-in-progress") {
+		return false
+	}
+	logger := log.FromContext(ctx)
+	parts := strings.Split(lastOp, ":")
+	if len(parts) < 2 {
+		logger.V(1).Info("Invalid operation format, treating as not in progress", "lastOperation", lastOp)
+		return false
+	}
+	timestamp, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
+	if err != nil {
+		logger.V(1).Info("Invalid timestamp in operation, treating as not in progress", "lastOperation", lastOp)
+		return false
+	}
+	currentTime := time.Now().Unix()
+	timeDiff := currentTime - timestamp
+	var queryPod *corev1.Pod
+	for i := range pods {
+		if cm.isPodReady(pods[i]) {
+			queryPod = &pods[i]
+			break
+		}
+	}
+	var timeoutDuration int64 = 300
+	if strings.Contains(lastOp, "rebalance-in-progress") {
+		timeoutDuration = 600
+	} else if strings.Contains(lastOp, "create-in-progress") {
+		timeoutDuration = 420
+	} else if strings.Contains(lastOp, "scale-in-progress") {
+		timeoutDuration = 480
+	}
+	if timeDiff <= timeoutDuration && queryPod != nil {
+		if strings.Contains(lastOp, "rebalance-in-progress") {
+			if isRebalancing := cm.checkIfRebalanceInProgress(ctx, *queryPod, kredis.Spec.BasePort); isRebalancing {
+				logger.V(1).Info("Rebalance operation is actually in progress")
+				return true
+			}
+		} else if strings.Contains(lastOp, "scale-in-progress") {
+			if isScaling := cm.checkIfScalingInProgress(ctx, *queryPod, kredis.Spec.BasePort); isScaling {
+				logger.V(1).Info("Scale operation is actually in progress")
+				return true
+			}
+		} else if strings.Contains(lastOp, "create-in-progress") {
+			if isCreating := cm.checkIfClusterCreationInProgress(ctx, *queryPod, kredis.Spec.BasePort); isCreating {
+				logger.V(1).Info("Cluster creation operation is actually in progress")
+				return true
+			}
+		}
+		logger.Info("Operation marked as in-progress but not actually running, considering it completed",
+			"lastOperation", lastOp,
+			"timeDiff", timeDiff)
+		return false
+	}
+	if timeDiff > timeoutDuration {
+		logger.Info("Stale operation found, allowing new operation",
+			"lastOperation", lastOp,
+			"timeDiff", timeDiff,
+			"timeoutDuration", timeoutDuration)
+		return false
+	}
+	log.FromContext(ctx).V(1).Info("Cannot verify operation status, assuming in progress due to recent timestamp",
+		"lastOperation", lastOp,
+		"timeDiff", timeDiff)
+	return true
 }
