@@ -45,15 +45,15 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 	// 리소스 요구사항
 	resources := corev1.ResourceRequirements{}
 	if k.Spec.Resources != nil {
-		if limitMap, ok := k.Spec.Resources["limits"]; ok {
+		if k.Spec.Resources.Limits != nil {
 			resources.Limits = corev1.ResourceList{}
-			for key, value := range limitMap {
+			for key, value := range k.Spec.Resources.Limits {
 				resources.Limits[corev1.ResourceName(key)] = resource.MustParse(value)
 			}
 		}
-		if requestMap, ok := k.Spec.Resources["requests"]; ok {
+		if k.Spec.Resources.Requests != nil {
 			resources.Requests = corev1.ResourceList{}
-			for key, value := range requestMap {
+			for key, value := range k.Spec.Resources.Requests {
 				resources.Requests[corev1.ResourceName(key)] = resource.MustParse(value)
 			}
 		}

@@ -17,11 +17,22 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+
+// ResourceRequirements describes the compute resource requirements.
+type ResourceRequirements struct {
+	// Limits describes the maximum amount of compute resources allowed.
+	// +optional
+	Limits corev1.ResourceList `json:"limits,omitempty"`
+	// Requests describes the minimum amount of compute resources required.
+	// +optional
+	Requests corev1.ResourceList `json:"requests,omitempty"`
+}
 
 // KredisSpec defines the desired state of Kredis
 type KredisSpec struct {
@@ -41,7 +52,8 @@ type KredisSpec struct {
 	Image string `json:"image"`
 
 	// Resource requirements
-	Resources map[string]map[string]string `json:"resources"`
+	// +optional
+	Resources ResourceRequirements `json:"resources,omitempty"`
 }
 
 // KredisStatus defines the observed state of Kredis
