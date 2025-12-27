@@ -317,23 +317,79 @@ func (cm *ClusterManager) getKredisPods(ctx context.Context, kredis *cachev1alph
 	return pods, nil
 }
 
-// discoverClusterState queries Redis nodes to understand current cluster state
+// discoverClusterState queries Redis cluster state from a single ready pod.
+// Optimized: "cluster nodes" returns the entire cluster state from any node.
 func (cm *ClusterManager) discoverClusterState(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod) ([]cachev1alpha1.ClusterNode, error) {
-	var clusterNodes []cachev1alpha1.ClusterNode
-	for _, pod := range pods {
-		nodeInfo, err := cm.queryRedisNodeInfo(ctx, pod, kredis.Spec.BasePort)
-		if err != nil {
+	logger := log.FromContext(ctx)
+	port := kredis.Spec.BasePort
+
+	// Find a single ready pod to query cluster state
+	var queryPod *corev1.Pod
+	for i := range pods {
+		if cm.isPodReady(pods[i]) && cm.PodExecutor.IsRedisReady(ctx, pods[i], port) {
+			queryPod = &pods[i]
+			break
+		}
+	}
+
+	// If no ready pod found, return all pods as pending
+	if queryPod == nil {
+		logger.V(1).Info("No ready pod found to query cluster state")
+		var clusterNodes []cachev1alpha1.ClusterNode
+		for _, pod := range pods {
 			clusterNodes = append(clusterNodes, cachev1alpha1.ClusterNode{
 				PodName: pod.Name,
 				IP:      pod.Status.PodIP,
-				Port:    kredis.Spec.BasePort,
+				Port:    port,
 				Role:    "unknown",
 				Status:  "pending",
 			})
-			continue
 		}
-		clusterNodes = append(clusterNodes, nodeInfo)
+		return clusterNodes, nil
 	}
+
+	// Query cluster nodes from the single ready pod (1 call instead of N calls)
+	redisNodes, err := cm.PodExecutor.GetRedisClusterNodes(ctx, *queryPod, port)
+	if err != nil {
+		logger.V(1).Info("Failed to get cluster nodes", "pod", queryPod.Name, "error", err)
+		var clusterNodes []cachev1alpha1.ClusterNode
+		for _, pod := range pods {
+			clusterNodes = append(clusterNodes, cachev1alpha1.ClusterNode{
+				PodName: pod.Name,
+				IP:      pod.Status.PodIP,
+				Port:    port,
+				Role:    "unknown",
+				Status:  "pending",
+			})
+		}
+		return clusterNodes, nil
+	}
+
+	// Map Redis nodes by IP for quick lookup
+	redisNodeByIP := make(map[string]*RedisNodeInfo)
+	for i := range redisNodes {
+		redisNodeByIP[redisNodes[i].IP] = &redisNodes[i]
+	}
+
+	// Build cluster state by matching pods with Redis node info
+	var clusterNodes []cachev1alpha1.ClusterNode
+	for _, pod := range pods {
+		node := cachev1alpha1.ClusterNode{
+			PodName: pod.Name,
+			IP:      pod.Status.PodIP,
+			Port:    port,
+			Role:    "unknown",
+			Status:  "pending",
+		}
+		if redisNode, ok := redisNodeByIP[pod.Status.PodIP]; ok {
+			node.NodeID = redisNode.NodeID
+			node.Role = redisNode.Role
+			node.MasterID = redisNode.MasterID
+			node.Status = redisNode.Status
+		}
+		clusterNodes = append(clusterNodes, node)
+	}
+
 	return clusterNodes, nil
 }
 

@@ -134,8 +134,8 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
 	} else {
 		// Cluster needs attention - check more frequently
-		logger.V(1).Info("Cluster needs attention - scheduling next check in 2 minutes")
-		return ctrl.Result{RequeueAfter: time.Minute * 2}, nil
+		logger.V(1).Info("Cluster needs attention - scheduling next check in 15 seconds")
+		return ctrl.Result{RequeueAfter: time.Second * 15}, nil
 	}
 }
 
