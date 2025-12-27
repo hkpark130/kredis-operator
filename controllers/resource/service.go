@@ -57,3 +57,35 @@ func CreateRedisService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1
 	controllerutil.SetControllerReference(k, svc, scheme)
 	return svc
 }
+
+// CreateRedisNodePortService: 외부 접근용 NodePort Service
+func CreateRedisNodePortService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
+	podLabels := LabelsForKredis(k.Name, "redis")
+	selector := map[string]string{
+		"app":                        podLabels["app"],
+		"app.kubernetes.io/name":     podLabels["app.kubernetes.io/name"],
+		"app.kubernetes.io/instance": podLabels["app.kubernetes.io/instance"],
+	}
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      k.Name + "-nodeport",
+			Namespace: k.Namespace,
+			Labels:    selector,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: selector,
+			Type:     corev1.ServiceTypeNodePort,
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "redis",
+					Port:       k.Spec.BasePort,
+					TargetPort: intstr.FromString("redis"),
+					NodePort:   30379, // 30000-32767 범위에서 지정 (또는 생략하면 자동 할당)
+				},
+			},
+		},
+	}
+	controllerutil.SetControllerReference(k, svc, scheme)
+	return svc
+}

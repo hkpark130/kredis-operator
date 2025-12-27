@@ -44,19 +44,11 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 
 	// 리소스 요구사항
 	resources := corev1.ResourceRequirements{}
-	if k.Spec.Resources != nil {
-		if k.Spec.Resources.Limits != nil {
-			resources.Limits = corev1.ResourceList{}
-			for key, value := range k.Spec.Resources.Limits {
-				resources.Limits[corev1.ResourceName(key)] = resource.MustParse(value)
-			}
-		}
-		if k.Spec.Resources.Requests != nil {
-			resources.Requests = corev1.ResourceList{}
-			for key, value := range k.Spec.Resources.Requests {
-				resources.Requests[corev1.ResourceName(key)] = resource.MustParse(value)
-			}
-		}
+	if k.Spec.Resources.Limits != nil {
+		resources.Limits = k.Spec.Resources.Limits.DeepCopy()
+	}
+	if k.Spec.Resources.Requests != nil {
+		resources.Requests = k.Spec.Resources.Requests.DeepCopy()
 	}
 
 	// 프로브 설정

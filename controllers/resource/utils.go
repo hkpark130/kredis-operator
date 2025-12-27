@@ -17,21 +17,7 @@ limitations under the License.
 package resource
 
 import (
-	"bytes"
-	"context"
-	"fmt"
 	"strings"
-
-	cachev1alpha1 "github.com/hkpark130/kredis-operator/api/v1alpha1"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/remotecommand"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // LabelsForKredis returns the labels for selecting the resources
