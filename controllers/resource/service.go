@@ -26,52 +26,22 @@ import (
 	cachev1alpha1 "github.com/hkpark130/kredis-operator/api/v1alpha1"
 )
 
-// CreateRedisService: 통합 Headless Service (cluster-bus 포함)
-// - Pod DNS 접근 및 클러스터 버스 포트 모두 제공
-func CreateRedisService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
-	// 전체 파드를 대상으로 하는 Headless Service.
-	// selector 에 role 제외 (role 은 동적으로 master/slave 로 변경됨)
-	podLabels := LabelsForKredis(k.Name, "redis")
+// CreateRedisMasterNodePortService: 외부 쓰기용 Master 전용 NodePort Service
+/*
+func CreateRedisMasterNodePortService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
+	baseLabels := BaseLabelsForKredis(k.Name)
 	selector := map[string]string{
-		"app":                        podLabels["app"],
-		"app.kubernetes.io/name":     podLabels["app.kubernetes.io/name"],
-		"app.kubernetes.io/instance": podLabels["app.kubernetes.io/instance"],
+		"app":                        baseLabels["app"],
+		"app.kubernetes.io/name":     baseLabels["app.kubernetes.io/name"],
+		"app.kubernetes.io/instance": baseLabels["app.kubernetes.io/instance"],
+		"role":                       "master", // Master Pod만 선택
 	}
 
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      k.Name,
+			Name:      k.Name + "-master-nodeport",
 			Namespace: k.Namespace,
-			Labels:    selector,
-		},
-		Spec: corev1.ServiceSpec{
-			Selector:  selector,
-			ClusterIP: "None", // Headless -> per-pod DNS
-			Type:      corev1.ServiceTypeClusterIP,
-			Ports: []corev1.ServicePort{
-				{Name: "redis", Port: k.Spec.BasePort, TargetPort: intstr.FromString("redis")},
-				{Name: "cluster-bus", Port: k.Spec.BasePort + 10000, TargetPort: intstr.FromString("cluster-bus")},
-			},
-		},
-	}
-	controllerutil.SetControllerReference(k, svc, scheme)
-	return svc
-}
-
-// CreateRedisNodePortService: 외부 접근용 NodePort Service
-func CreateRedisNodePortService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
-	podLabels := LabelsForKredis(k.Name, "redis")
-	selector := map[string]string{
-		"app":                        podLabels["app"],
-		"app.kubernetes.io/name":     podLabels["app.kubernetes.io/name"],
-		"app.kubernetes.io/instance": podLabels["app.kubernetes.io/instance"],
-	}
-
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      k.Name + "-nodeport",
-			Namespace: k.Namespace,
-			Labels:    selector,
+			Labels:    baseLabels,
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: selector,
@@ -83,6 +53,100 @@ func CreateRedisNodePortService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme)
 					TargetPort: intstr.FromString("redis"),
 					NodePort:   30379, // 30000-32767 범위에서 지정 (또는 생략하면 자동 할당)
 				},
+			},
+		},
+	}
+	controllerutil.SetControllerReference(k, svc, scheme)
+	return svc
+}
+*/
+
+// CreateRedisSlaveNodePortService: 외부 읽기용 Slave 전용 NodePort Service
+/*
+func CreateRedisSlaveNodePortService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
+	baseLabels := BaseLabelsForKredis(k.Name)
+	selector := map[string]string{
+		"app":                        baseLabels["app"],
+		"app.kubernetes.io/name":     baseLabels["app.kubernetes.io/name"],
+		"app.kubernetes.io/instance": baseLabels["app.kubernetes.io/instance"],
+		"role":                       "slave", // Slave Pod만 선택
+	}
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      k.Name + "-slave-nodeport",
+			Namespace: k.Namespace,
+			Labels:    baseLabels,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: selector,
+			Type:     corev1.ServiceTypeNodePort,
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "redis",
+					Port:       k.Spec.BasePort,
+					TargetPort: intstr.FromString("redis"),
+					NodePort:   30380, // 30000-32767 범위에서 지정 (또는 생략하면 자동 할당)
+				},
+			},
+		},
+	}
+	controllerutil.SetControllerReference(k, svc, scheme)
+	return svc
+}
+*/
+
+// CreateRedisMasterService: 쓰기용 Master 전용 서비스
+func CreateRedisMasterService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
+	baseLabels := BaseLabelsForKredis(k.Name)
+	selector := map[string]string{
+		"app":                        baseLabels["app"],
+		"app.kubernetes.io/name":     baseLabels["app.kubernetes.io/name"],
+		"app.kubernetes.io/instance": baseLabels["app.kubernetes.io/instance"],
+		"role":                       "master", // Master Pod만 선택
+	}
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      k.Name + "-master",
+			Namespace: k.Namespace,
+			Labels:    baseLabels,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector:  selector,
+			ClusterIP: "None", // Headless for direct pod access
+			Type:      corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{
+				{Name: "redis", Port: k.Spec.BasePort, TargetPort: intstr.FromString("redis")},
+			},
+		},
+	}
+	controllerutil.SetControllerReference(k, svc, scheme)
+	return svc
+}
+
+// CreateRedisSlaveService: 읽기용 Slave 전용 서비스
+func CreateRedisSlaveService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
+	baseLabels := BaseLabelsForKredis(k.Name)
+	selector := map[string]string{
+		"app":                        baseLabels["app"],
+		"app.kubernetes.io/name":     baseLabels["app.kubernetes.io/name"],
+		"app.kubernetes.io/instance": baseLabels["app.kubernetes.io/instance"],
+		"role":                       "slave", // Slave Pod만 선택
+	}
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      k.Name + "-slave",
+			Namespace: k.Namespace,
+			Labels:    baseLabels,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector:  selector,
+			ClusterIP: "None", // Headless for direct pod access
+			Type:      corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{
+				{Name: "redis", Port: k.Spec.BasePort, TargetPort: intstr.FromString("redis")},
 			},
 		},
 	}

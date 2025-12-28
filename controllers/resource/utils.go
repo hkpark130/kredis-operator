@@ -32,6 +32,15 @@ func LabelsForKredis(name string, role string) map[string]string {
 	}
 }
 
+// BaseLabelsForKredis returns labels without role (for StatefulSet, etc.)
+func BaseLabelsForKredis(name string) map[string]string {
+	return map[string]string{
+		"app":                        "kredis",
+		"app.kubernetes.io/name":     name,
+		"app.kubernetes.io/instance": name,
+	}
+}
+
 // normalizeRole: redis cluster 에서 수집된 role 문자열을 라벨에 안전하게 기록하기 위한 정규화
 // master -> master, slave/replica -> replica, 그 외/미정 -> unknown
 func normalizeRole(r string) string {

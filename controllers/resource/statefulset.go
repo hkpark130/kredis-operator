@@ -20,13 +20,9 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 	// 총 레플리카 수 계산: 마스터 + (마스터 * 슬레이브)
 	totalReplicas := k.Spec.Masters + (k.Spec.Masters * k.Spec.Replicas)
 
-	labels := LabelsForKredis(k.Name, "redis") // 포함: app, name/instance, role=unknown (초기)
-	// StatefulSet selector 에서는 role 같이 변경될 수 있는 라벨 제외 (변경되면 매칭 깨짐)
-	selectorLabels := map[string]string{
-		"app":                        labels["app"],
-		"app.kubernetes.io/name":     labels["app.kubernetes.io/name"],
-		"app.kubernetes.io/instance": labels["app.kubernetes.io/instance"],
-	}
+	// StatefulSet 자체에는 role 라벨 불필요 (Pod에만 동적으로 부여됨)
+	labels := BaseLabelsForKredis(k.Name)
+	selectorLabels := labels // role 없으므로 그대로 사용 가능
 
 	// 환경 변수 설정 - 컨트롤러가 클러스터 관리를 담당하므로 최소한만 설정
 	env := []corev1.EnvVar{
@@ -176,5 +172,3 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 	controllerutil.SetControllerReference(k, ss, scheme)
 	return ss
 }
-
-// CreateRedisService creates a headless service for the Redis StatefulSet

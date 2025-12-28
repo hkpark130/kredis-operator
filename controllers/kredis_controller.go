@@ -85,12 +85,6 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
-	// 1.1. Create NodePort service for external access
-	// if err := r.reconcileNodePortService(ctx, kredis); err != nil {
-	// 	logger.Error(err, "Failed to reconcile NodePort service")
-	// 	return ctrl.Result{}, err
-	// }
-
 	// 2. Create unified StatefulSet
 	if err := r.reconcileStatefulSet(ctx, kredis); err != nil {
 		logger.Error(err, "Failed to reconcile StatefulSet")
@@ -142,32 +136,35 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 func (r *KredisReconciler) reconcileService(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
 	logger := log.FromContext(ctx)
 
-	foundService := &corev1.Service{}
-	err := r.Get(ctx, types.NamespacedName{Name: kredis.Name, Namespace: kredis.Namespace}, foundService)
-
+	// Master 서비스 생성 (쓰기용)
+	masterSvcName := kredis.Name + "-master"
+	foundMasterSvc := &corev1.Service{}
+	err := r.Get(ctx, types.NamespacedName{Name: masterSvcName, Namespace: kredis.Namespace}, foundMasterSvc)
 	if err != nil && errors.IsNotFound(err) {
-		svc := resource.CreateRedisService(kredis, r.Scheme)
-		logger.Info("Creating Redis headless service", "name", svc.Name)
-		return r.Create(ctx, svc)
+		svc := resource.CreateRedisMasterService(kredis, r.Scheme)
+		logger.Info("Creating Redis master service", "name", svc.Name)
+		if err := r.Create(ctx, svc); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
 	}
 
-	return err
-}
-
-func (r *KredisReconciler) reconcileNodePortService(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
-	logger := log.FromContext(ctx)
-
-	foundService := &corev1.Service{}
-	serviceName := kredis.Name + "-nodeport"
-	err := r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: kredis.Namespace}, foundService)
-
+	// Slave 서비스 생성 (읽기용)
+	slaveSvcName := kredis.Name + "-slave"
+	foundSlaveSvc := &corev1.Service{}
+	err = r.Get(ctx, types.NamespacedName{Name: slaveSvcName, Namespace: kredis.Namespace}, foundSlaveSvc)
 	if err != nil && errors.IsNotFound(err) {
-		svc := resource.CreateRedisNodePortService(kredis, r.Scheme)
-		logger.Info("Creating Redis NodePort service", "name", svc.Name)
-		return r.Create(ctx, svc)
+		svc := resource.CreateRedisSlaveService(kredis, r.Scheme)
+		logger.Info("Creating Redis slave service", "name", svc.Name)
+		if err := r.Create(ctx, svc); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
 	}
 
-	return err
+	return nil
 }
 
 func (r *KredisReconciler) reconcileStatefulSet(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
