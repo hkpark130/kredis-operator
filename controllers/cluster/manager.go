@@ -104,6 +104,13 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 
 	// Check if there's an ongoing operation and resume verification if needed
 	lastOp := kredis.Status.LastClusterOperation
+	if strings.Contains(lastOp, "rebalance-needed") {
+		// 스케일 후 리밸런스가 필요한 상태 - 리밸런스 시작
+		logger.Info("Rebalance needed after scale - will start rebalance",
+			"lastOperation", lastOp,
+			"currentTime", time.Now().Unix())
+		return OperationRebalance
+	}
 	if strings.Contains(lastOp, "rebalance-in-progress") {
 		// 리밸런스는 검증/완료 마킹을 위해 별도 오퍼레이션으로 처리
 		logger.Info("Rebalance in progress - will run verification step",

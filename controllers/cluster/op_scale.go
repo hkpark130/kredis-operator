@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -28,32 +27,8 @@ func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha
 
 	newPods := filterNewPods(pods, kredis.Status.JoinedPods)
 	if len(newPods) == 0 {
-		// 스케일 재개/검증 경로: 새 파드가 없지만 상태가 scale-in-progress였다면
-		logger.Info("No new pods to add; resuming scale verification if needed")
-		// 현재 파드 수가 스펙과 일치하는지 확인하고 KnownClusterNodes 갱신 시도
-		expectedTotalPods := cm.getExpectedPodCount(kredis)
-		if int32(len(pods)) == expectedTotalPods {
-			if commandPod != nil {
-				if err := cm.waitForAllNodesToBeKnown(ctx, *commandPod, kredis.Spec.BasePort, int(expectedTotalPods)); err == nil {
-					known := int(expectedTotalPods)
-					delta.KnownClusterNodes = &known
-					// 리밸런스가 필요한 상태면 in-progress로 넘기기
-					delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
-					logger.Info("Triggering rebalance after resume of scale")
-					time.Sleep(2 * time.Second)
-					if _, rebalanceErr := cm.PodExecutor.RebalanceCluster(ctx, *commandPod, kredis.Spec.BasePort); rebalanceErr != nil {
-						if strings.Contains(rebalanceErr.Error(), "ERR Please use SETSLOT only with masters") {
-							logger.Info("Ignoring 'SETSLOT' error during rebalance trigger")
-						} else {
-							delta.LastClusterOperation = fmt.Sprintf("rebalance-failed:%d", time.Now().Unix())
-							return fmt.Errorf("rebalance command failed to start: %w", rebalanceErr)
-						}
-					}
-					return nil
-				}
-			}
-		}
-		// 재개도 필요 없으면 스킵 마킹
+		// 새 파드가 없으면 스케일 작업 스킵
+		logger.Info("No new pods to add; scale operation skipped")
 		delta.LastClusterOperation = fmt.Sprintf("scale-skipped-no-new-pods:%d", time.Now().Unix())
 		return nil
 	}
@@ -189,28 +164,18 @@ func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha
 		return fmt.Errorf("cluster nodes did not report correct count after adding nodes: %w", err)
 	}
 
-	// All nodes are now known by the cluster; reflect this before starting rebalance
+	// All nodes are now known by the cluster
 	known := int(expectedTotalPods)
 	delta.KnownClusterNodes = &known
 
-	// Wait for the cluster to be generally healthy before rebalancing
-	logger.Info("Starting Redis cluster rebalance after scaling")
-
-	// rebalance 시작 전 상태 설정 후 즉시 반환 (검증은 별도 OperationRebalance에서 수행)
-	delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
-
-	// 토폴로지 잠깐 안정화 대기 후 리밸런스 명령만 트리거
-	logger.Info("Triggering rebalance command and returning; verification will happen next reconcile loop")
-	time.Sleep(3 * time.Second)
-	if _, rebalanceErr := cm.PodExecutor.RebalanceCluster(ctx, *commandPod, kredis.Spec.BasePort); rebalanceErr != nil {
-		if strings.Contains(rebalanceErr.Error(), "ERR Please use SETSLOT only with masters") {
-			logger.Info("Ignoring 'SETSLOT' error during rebalance trigger")
-		} else {
-			delta.LastClusterOperation = fmt.Sprintf("rebalance-failed:%d", time.Now().Unix())
-			return fmt.Errorf("rebalance command failed to start: %w", rebalanceErr)
-		}
+	// 마스터가 추가된 경우에만 리밸런스 필요
+	if len(newMasters) > 0 {
+		logger.Info("New masters added, rebalance needed", "newMastersCount", len(newMasters))
+		delta.LastClusterOperation = fmt.Sprintf("rebalance-needed:%d", time.Now().Unix())
+	} else {
+		logger.Info("Only replicas added, scale completed successfully")
+		delta.LastClusterOperation = fmt.Sprintf("scale-success:%d", time.Now().Unix())
 	}
 
-	// 검증과 성공 마킹은 다음 리컨실에서 OperationRebalance가 처리
 	return nil
 }

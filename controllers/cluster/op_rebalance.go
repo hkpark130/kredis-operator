@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -14,18 +15,44 @@ import (
 // rebalanceCluster rebalances slots across masters and replicates
 func (cm *ClusterManager) rebalanceCluster(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode, delta *ClusterStatusDelta) error {
 	logger := log.FromContext(ctx)
-	// 이미 in-progress라면 검증/완료 단계만 수행, 아니면 트리거 + 검증
-	delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
+	lastOp := kredis.Status.LastClusterOperation
 
 	masterPod := cm.findMasterPod(pods, kredis, clusterState)
 	if masterPod == nil {
 		return fmt.Errorf("no master pod found for rebalancing")
 	}
+
+	// rebalance-needed 상태면 리밸런스 시작, in-progress면 검증만 수행
+	if strings.Contains(lastOp, "rebalance-needed") {
+		logger.Info("Starting rebalance triggered by scale operation")
+		delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
+
+		// 토폴로지 안정화 대기 후 리밸런스 트리거
+		time.Sleep(2 * time.Second)
+		if _, err := cm.PodExecutor.RebalanceCluster(ctx, *masterPod, kredis.Spec.BasePort); err != nil {
+			if strings.Contains(err.Error(), "ERR Please use SETSLOT only with masters") {
+				logger.Info("Ignoring 'SETSLOT' error during rebalance trigger")
+			} else {
+				delta.LastClusterOperation = fmt.Sprintf("rebalance-failed:%d", time.Now().Unix())
+				return fmt.Errorf("rebalance failed to start: %w", err)
+			}
+		}
+		// 다음 reconcile에서 검증 수행
+		return nil
+	}
+
+	// rebalance-in-progress 상태: 검증 단계
+	delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
+
 	// 리밸런스가 실제 진행 중인지 확인; 진행 중이 아니면 한번 트리거
 	if !cm.checkIfRebalanceInProgress(ctx, *masterPod, kredis.Spec.BasePort) {
 		if _, err := cm.PodExecutor.RebalanceCluster(ctx, *masterPod, kredis.Spec.BasePort); err != nil {
-			delta.LastClusterOperation = fmt.Sprintf("rebalance-failed:%d", time.Now().Unix())
-			return fmt.Errorf("rebalance failed to start: %w", err)
+			if strings.Contains(err.Error(), "ERR Please use SETSLOT only with masters") {
+				logger.Info("Ignoring 'SETSLOT' error during rebalance trigger")
+			} else {
+				delta.LastClusterOperation = fmt.Sprintf("rebalance-failed:%d", time.Now().Unix())
+				return fmt.Errorf("rebalance failed to start: %w", err)
+			}
 		}
 	}
 
