@@ -108,9 +108,6 @@ type ClusterNode struct {
 
 	// Status is the node status (e.g., "ready", "failed", "pending")
 	Status string `json:"status"`
-
-	// Joined indicates if the node has joined the cluster
-	Joined bool `json:"joined"`
 }
 
 //+kubebuilder:object:root=true

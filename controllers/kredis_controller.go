@@ -124,8 +124,8 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: time.Minute * 10}, nil
 	} else if inProgress {
 		// While operations are in progress, poll more frequently
-		logger.V(1).Info("Operation in progress - scheduling next check in 10 seconds")
-		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
+		logger.V(1).Info("Operation in progress - scheduling next check in 5 seconds")
+		return ctrl.Result{RequeueAfter: time.Second * 5}, nil
 	} else {
 		// Cluster needs attention - check more frequently
 		logger.V(1).Info("Cluster needs attention - scheduling next check in 15 seconds")

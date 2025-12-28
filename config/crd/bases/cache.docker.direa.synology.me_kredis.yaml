@@ -99,9 +99,6 @@ spec:
                     ip:
                       description: IP is the pod IP address
                       type: string
-                    joined:
-                      description: Joined indicates if the node has joined the cluster
-                      type: boolean
                     masterId:
                       description: MasterID is the master node ID if this is a slave
                       type: string
@@ -124,7 +121,6 @@ spec:
                       type: string
                   required:
                   - ip
-                  - joined
                   - podName
                   - port
                   - role

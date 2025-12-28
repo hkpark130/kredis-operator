@@ -27,8 +27,7 @@ func (cm *ClusterManager) rebalanceCluster(ctx context.Context, kredis *cachev1a
 		logger.Info("Starting rebalance triggered by scale operation")
 		delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
 
-		// 토폴로지 안정화 대기 후 리밸런스 트리거
-		time.Sleep(2 * time.Second)
+		// 리밸런스 트리거 (다음 reconcile에서 검증)
 		if _, err := cm.PodExecutor.RebalanceCluster(ctx, *masterPod, kredis.Spec.BasePort); err != nil {
 			if strings.Contains(err.Error(), "ERR Please use SETSLOT only with masters") {
 				logger.Info("Ignoring 'SETSLOT' error during rebalance trigger")
