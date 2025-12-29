@@ -14,7 +14,27 @@ spec:
     singular: kredis
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - description: Number of master nodes
+      jsonPath: .spec.masters
+      name: Masters
+      type: integer
+    - description: Number of replicas per master
+      jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - description: Current cluster state
+      jsonPath: .status.clusterState
+      name: State
+      type: string
+    - description: Ready replicas
+      jsonPath: .status.readyReplicas
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Kredis is the Schema for the kredis API

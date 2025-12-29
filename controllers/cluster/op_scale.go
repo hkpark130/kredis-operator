@@ -19,6 +19,7 @@ func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha
 	logger.Info("Scaling up Redis cluster")
 
 	delta.LastClusterOperation = fmt.Sprintf("scale-in-progress:%d", time.Now().Unix())
+	delta.ClusterState = string(cachev1alpha1.ClusterStateScaling)
 
 	commandPod := cm.findMasterPod(pods, kredis, clusterState)
 	if commandPod == nil {
@@ -66,6 +67,7 @@ func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha
 		logger.Info("Adding new master node to cluster", "pod", targetPod.Name, "ip", targetPod.Status.PodIP)
 		if err := cm.PodExecutor.AddNodeToCluster(ctx, targetPod, *commandPod, kredis.Spec.BasePort, ""); err != nil {
 			delta.LastClusterOperation = fmt.Sprintf("scale-failed:%d", time.Now().Unix())
+			delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
 			return fmt.Errorf("failed to add master node %s to cluster: %w", targetPod.Name, err)
 		}
 	} else {
@@ -77,6 +79,7 @@ func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha
 		logger.Info("Adding new slave node to cluster", "pod", targetPod.Name, "ip", targetPod.Status.PodIP, "masterID", targetMasterID)
 		if err := cm.PodExecutor.AddNodeToCluster(ctx, targetPod, *commandPod, kredis.Spec.BasePort, targetMasterID); err != nil {
 			delta.LastClusterOperation = fmt.Sprintf("scale-failed:%d", time.Now().Unix())
+			delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
 			return fmt.Errorf("failed to add slave node %s to cluster: %w", targetPod.Name, err)
 		}
 	}
@@ -201,12 +204,14 @@ func (cm *ClusterManager) finalizeScale(ctx context.Context, kredis *cachev1alph
 		if currentMasters > prevMasterCount || cm.needsRebalance(ctx, *commandPod, kredis.Spec.BasePort) {
 			logger.Info("New masters added or rebalance needed", "currentMasters", currentMasters)
 			delta.LastClusterOperation = fmt.Sprintf("rebalance-needed:%d", time.Now().Unix())
+			delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
 			return nil
 		}
 	}
 
 	logger.Info("Scale completed successfully")
 	delta.LastClusterOperation = fmt.Sprintf("scale-success:%d", time.Now().Unix())
+	delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
 	return nil
 }
 

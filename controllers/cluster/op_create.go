@@ -30,6 +30,7 @@ func (cm *ClusterManager) createCluster(ctx context.Context, kredis *cachev1alph
 	time.Sleep(2 * time.Second)
 
 	delta.LastClusterOperation = fmt.Sprintf("create-in-progress:%d", time.Now().Unix())
+	delta.ClusterState = string(cachev1alpha1.ClusterStateCreating)
 
 	var commandPod *corev1.Pod
 	for i := range pods {
@@ -58,6 +59,7 @@ func (cm *ClusterManager) createCluster(ctx context.Context, kredis *cachev1alph
 	_, err := cm.PodExecutor.CreateCluster(ctx, *commandPod, kredis.Spec.BasePort, nodeIPs, int(kredis.Spec.Replicas))
 	if err != nil {
 		delta.LastClusterOperation = fmt.Sprintf("create-failed:%d", time.Now().Unix())
+		delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
 		return fmt.Errorf("failed to create cluster: %w", err)
 	}
 
@@ -65,11 +67,12 @@ func (cm *ClusterManager) createCluster(ctx context.Context, kredis *cachev1alph
 	err = cm.waitForClusterStabilization(ctx, kredis, commandPod)
 	if err != nil {
 		delta.LastClusterOperation = fmt.Sprintf("create-failed:%d", time.Now().Unix())
+		delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
 		return fmt.Errorf("cluster failed to stabilize after creation: %w", err)
 	}
 
 	delta.LastClusterOperation = fmt.Sprintf("create-success:%d", time.Now().Unix())
-	delta.ClusterState = "created"
+	delta.ClusterState = string(cachev1alpha1.ClusterStateInitialized)
 	time.Sleep(2 * time.Second)
 	logger.Info("Successfully created Redis cluster")
 

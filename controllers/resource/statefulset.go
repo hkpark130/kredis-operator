@@ -9,7 +9,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	cachev1alpha1 "github.com/hkpark130/kredis-operator/api/v1alpha1"
@@ -48,28 +47,10 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 	}
 
 	// 프로브 설정
-	livenessProbe := &corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
-			TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(int(k.Spec.BasePort))},
-		},
-		InitialDelaySeconds: 20,
-		PeriodSeconds:       10,
-		TimeoutSeconds:      3,
-		FailureThreshold:    5,
-	}
-
-	readinessProbe := &corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
-			Exec: &corev1.ExecAction{
-				Command: []string{"redis-cli", "-p", fmt.Sprintf("%d", k.Spec.BasePort), "ping"},
-			},
-		},
-		InitialDelaySeconds: 5,
-		PeriodSeconds:       5,
-		TimeoutSeconds:      2,
-		SuccessThreshold:    1,
-		FailureThreshold:    3,
-	}
+	// Liveness/Readiness Probe는 사용하지 않음 - Redis Cluster는 자체 장애 감지/페일오버 메커니즘이 있음
+	// - 리밸런싱 등 무거운 작업 중 Probe 실패로 인한 파드 재시작/unready 상태 방지
+	// - Redis Cluster 클라이언트는 MOVED/ASK 리다이렉션을 통해 올바른 노드를 찾음
+	// - Startup Probe만 유지하여 초기 시작 시간 확보
 
 	startupProbe := &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
@@ -77,11 +58,10 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 				Command: []string{"redis-cli", "-p", fmt.Sprintf("%d", k.Spec.BasePort), "ping"},
 			},
 		},
-		// Allow longer warmup before readiness/liveness kick in
 		InitialDelaySeconds: 0,
 		PeriodSeconds:       5,
-		TimeoutSeconds:      3,
-		FailureThreshold:    24, // ~2 minutes max
+		TimeoutSeconds:      5,
+		FailureThreshold:    30, // ~2.5 minutes max
 	}
 
 	// Redis 컨테이너
@@ -99,10 +79,9 @@ func CreateRedisStatefulSet(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *ap
 			{Name: "redis-data", MountPath: "/data"},
 			{Name: "redis-logs", MountPath: "/logs"},
 		},
-		Resources:      resources,
-		LivenessProbe:  livenessProbe,
-		ReadinessProbe: readinessProbe,
-		StartupProbe:   startupProbe,
+		Resources:    resources,
+		StartupProbe: startupProbe,
+		// Liveness/Readiness Probe는 사용하지 않음 - Redis Cluster 자체 HA 메커니즘 활용
 	}
 
 	// 볼륨 클레임 템플릿

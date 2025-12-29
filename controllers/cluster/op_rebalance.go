@@ -26,6 +26,7 @@ func (cm *ClusterManager) rebalanceCluster(ctx context.Context, kredis *cachev1a
 	if strings.Contains(lastOp, "rebalance-needed") {
 		logger.Info("Starting rebalance triggered by scale operation")
 		delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
+		delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
 
 		// 리밸런스 트리거 (다음 reconcile에서 검증)
 		if _, err := cm.PodExecutor.RebalanceCluster(ctx, *masterPod, kredis.Spec.BasePort); err != nil {
@@ -33,6 +34,7 @@ func (cm *ClusterManager) rebalanceCluster(ctx context.Context, kredis *cachev1a
 				logger.Info("Ignoring 'SETSLOT' error during rebalance trigger")
 			} else {
 				delta.LastClusterOperation = fmt.Sprintf("rebalance-failed:%d", time.Now().Unix())
+				delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
 				return fmt.Errorf("rebalance failed to start: %w", err)
 			}
 		}
@@ -42,6 +44,7 @@ func (cm *ClusterManager) rebalanceCluster(ctx context.Context, kredis *cachev1a
 
 	// rebalance-in-progress 상태: 검증 단계
 	delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
+	delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
 
 	// 리밸런스가 실제 진행 중인지 확인; 진행 중이 아니면 한번 트리거
 	if !cm.checkIfRebalanceInProgress(ctx, *masterPod, kredis.Spec.BasePort) {
@@ -50,6 +53,7 @@ func (cm *ClusterManager) rebalanceCluster(ctx context.Context, kredis *cachev1a
 				logger.Info("Ignoring 'SETSLOT' error during rebalance trigger")
 			} else {
 				delta.LastClusterOperation = fmt.Sprintf("rebalance-failed:%d", time.Now().Unix())
+				delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
 				return fmt.Errorf("rebalance failed to start: %w", err)
 			}
 		}
@@ -58,6 +62,7 @@ func (cm *ClusterManager) rebalanceCluster(ctx context.Context, kredis *cachev1a
 	logger.Info("Waiting for cluster to stabilize after rebalance...")
 	if err := cm.waitForClusterStabilization(ctx, kredis, masterPod); err != nil {
 		delta.LastClusterOperation = fmt.Sprintf("rebalance-failed:%d", time.Now().Unix())
+		delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
 		return fmt.Errorf("cluster failed to stabilize after rebalance: %w", err)
 	}
 
@@ -71,5 +76,6 @@ func (cm *ClusterManager) rebalanceCluster(ctx context.Context, kredis *cachev1a
 	}
 
 	delta.LastClusterOperation = fmt.Sprintf("rebalance-success:%d", time.Now().Unix())
+	delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
 	return nil
 }

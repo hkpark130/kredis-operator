@@ -21,6 +21,28 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// ClusterState represents the state of Redis cluster
+type ClusterState string
+
+const (
+	// ClusterStateCreating - 클러스터 생성 중
+	ClusterStateCreating ClusterState = "Creating"
+	// ClusterStateInitialized - 초기 생성 완료
+	ClusterStateInitialized ClusterState = "Initialized"
+	// ClusterStateRunning - 정상 동작 중
+	ClusterStateRunning ClusterState = "Running"
+	// ClusterStateScaling - 스케일링 중
+	ClusterStateScaling ClusterState = "Scaling"
+	// ClusterStateRebalancing - 리밸런싱 중
+	ClusterStateRebalancing ClusterState = "Rebalancing"
+	// ClusterStateHealing - 복구 중
+	ClusterStateHealing ClusterState = "Healing"
+	// ClusterStateDegraded - 일부 노드 장애
+	ClusterStateDegraded ClusterState = "Degraded"
+	// ClusterStateFailed - 심각한 장애
+	ClusterStateFailed ClusterState = "Failed"
+)
+
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
@@ -112,6 +134,11 @@ type ClusterNode struct {
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
+//+kubebuilder:printcolumn:name="Masters",type="integer",JSONPath=".spec.masters",description="Number of master nodes"
+//+kubebuilder:printcolumn:name="Replicas",type="integer",JSONPath=".spec.replicas",description="Number of replicas per master"
+//+kubebuilder:printcolumn:name="State",type="string",JSONPath=".status.clusterState",description="Current cluster state"
+//+kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.readyReplicas",description="Ready replicas"
+//+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // Kredis is the Schema for the kredis API
 type Kredis struct {

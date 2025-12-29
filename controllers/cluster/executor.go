@@ -244,6 +244,7 @@ func (pe *PodExecutor) RebalanceCluster(ctx context.Context, pod corev1.Pod, por
 		"rebalance",
 		nodeAddr,
 		"--cluster-use-empty-masters",
+		"--cluster-pipeline", "1000",
 	}
 
 	return pe.ExecuteCommand(ctx, pod, command)
