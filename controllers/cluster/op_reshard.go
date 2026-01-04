@@ -19,19 +19,19 @@ const (
 	InitialReshardSlots = 100
 )
 
-// reshardCluster performs Phase 1 of rebalancing: move slots to empty masters via reshard.
+// reshardCluster performs Phase 1 of rebalancing: move slots to empty masters via reshard Job.
 // This is called when lastOp is "rebalance-needed" or "reshard-in-progress".
+// Non-blocking: Creates ONE Job at a time to avoid conflicts, subsequent reconciles handle the rest.
 func (cm *ClusterManager) reshardCluster(ctx context.Context, kredis *cachev1alpha1.Kredis, masterPod *corev1.Pod, clusterState []cachev1alpha1.ClusterNode, delta *ClusterStatusDelta) error {
 	logger := log.FromContext(ctx)
 	lastOp := kredis.Status.LastClusterOperation
 
-	// Determine current phase
+	// Check if reshard is already in progress
 	if strings.Contains(lastOp, "reshard-in-progress") {
-		// Verify reshard completion, then move to rebalance phase
-		return cm.verifyReshardAndProceed(ctx, kredis, masterPod, delta)
+		return cm.checkReshardJobsAndProceed(ctx, kredis, masterPod, delta)
 	}
 
-	// Start reshard phase: find empty masters and move slots to them
+	// Start reshard phase: find empty masters
 	emptyMasters := cm.findEmptyMasters(ctx, *masterPod, kredis.Spec.BasePort)
 	if len(emptyMasters) == 0 {
 		// No empty masters found, skip reshard and go directly to rebalance
@@ -41,69 +41,143 @@ func (cm *ClusterManager) reshardCluster(ctx context.Context, kredis *cachev1alp
 		return nil
 	}
 
-	logger.Info("Starting reshard phase for empty masters", "emptyMasterCount", len(emptyMasters))
+	// Check if empty masters are expected based on desired master count
+	// If actual master count equals desired, empty masters are a transient state (e.g., during scale-down)
+	// and should not trigger rebalancing
+	actualMasterCount, err := cm.getActualMasterCount(ctx, []corev1.Pod{*masterPod}, kredis.Spec.BasePort)
+	if err == nil {
+		desiredMasters := int(kredis.Spec.Masters)
+		mastersWithSlots := actualMasterCount - len(emptyMasters)
+
+		// If masters with slots already equals or exceeds desired count, ignore empty masters
+		// This handles cases like:
+		// - Scale-down scenario: 5 masters → 3 masters (2 masters become empty before removal)
+		// - Already at desired state: 3 masters with slots, spec wants 3
+		if mastersWithSlots >= desiredMasters {
+			logger.Info("Ignoring empty masters - current slot-holding masters meets desired count",
+				"mastersWithSlots", mastersWithSlots,
+				"desiredMasters", desiredMasters,
+				"emptyMasters", len(emptyMasters))
+			delta.LastClusterOperation = fmt.Sprintf("rebalance-success:%d", time.Now().Unix())
+			delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
+			return nil
+		}
+	}
+
+	logger.Info("Starting reshard phase", "emptyMasterCount", len(emptyMasters))
 	delta.LastClusterOperation = fmt.Sprintf("reshard-in-progress:%d", time.Now().Unix())
 	delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
 
-	// Reshard slots to each empty master using --cluster-from all
-	for _, emptyMaster := range emptyMasters {
-		logger.Info("Resharding slots to empty master",
-			"nodeID", emptyMaster.NodeID,
-			"podName", emptyMaster.PodName,
-			"slots", InitialReshardSlots)
+	// Build cluster address for redis-cli
+	clusterAddr := fmt.Sprintf("%s:%d", masterPod.Status.PodIP, kredis.Spec.BasePort)
 
-		// Use --cluster-from all to take slots evenly from all existing masters
-		result, err := cm.PodExecutor.ReshardCluster(ctx, *masterPod, kredis.Spec.BasePort, emptyMaster.NodeID, InitialReshardSlots, nil)
-		if err != nil {
-			// Reshard failed - this is a critical error, stop and retry in next reconcile
-			logger.Error(err, "Reshard failed for empty master",
-				"nodeID", emptyMaster.NodeID,
-				"stdout", result.Stdout)
-			delta.LastClusterOperation = fmt.Sprintf("reshard-failed:%d", time.Now().Unix())
-			delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
-			return fmt.Errorf("reshard failed for node %s: %w", emptyMaster.NodeID, err)
-		}
-		logger.Info("Reshard command completed successfully",
-			"nodeID", emptyMaster.NodeID,
-			"podName", emptyMaster.PodName)
+	// IMPORTANT: Create only ONE reshard Job at a time to avoid conflicts
+	// Multiple concurrent reshard operations can cause cluster state inconsistency
+	firstEmptyMaster := emptyMasters[0]
+	targetAddr := fmt.Sprintf("%s:%d", firstEmptyMaster.IP, kredis.Spec.BasePort)
+
+	logger.Info("Creating reshard Job for first empty master (sequential processing)",
+		"nodeID", firstEmptyMaster.NodeID,
+		"ip", firstEmptyMaster.IP,
+		"slots", InitialReshardSlots,
+		"remainingEmptyMasters", len(emptyMasters)-1)
+
+	if err := cm.JobManager.CreateReshardJob(ctx, kredis, firstEmptyMaster.NodeID, targetAddr, clusterAddr, InitialReshardSlots); err != nil {
+		logger.Error(err, "Failed to create reshard Job", "nodeID", firstEmptyMaster.NodeID)
+		return err
 	}
 
-	// Next reconcile will verify and proceed to rebalance
+	// Return immediately - next reconcile will check Job status and process remaining empty masters
 	return nil
 }
 
-// verifyReshardAndProceed checks if reshard is complete and cluster is healthy,
-// then transitions to rebalance phase.
-func (cm *ClusterManager) verifyReshardAndProceed(ctx context.Context, kredis *cachev1alpha1.Kredis, masterPod *corev1.Pod, delta *ClusterStatusDelta) error {
+// checkReshardJobsAndProceed monitors reshard Job status and proceeds to next empty master or rebalance.
+// Processes ONE empty master at a time to avoid concurrent reshard conflicts.
+func (cm *ClusterManager) checkReshardJobsAndProceed(ctx context.Context, kredis *cachev1alpha1.Kredis, masterPod *corev1.Pod, delta *ClusterStatusDelta) error {
 	logger := log.FromContext(ctx)
 
-	// Check cluster health
-	healthy, err := cm.PodExecutor.IsClusterHealthy(ctx, *masterPod, kredis.Spec.BasePort)
+	// Check reshard Job status
+	jobResult, err := cm.JobManager.GetJobStatus(ctx, kredis, JobTypeReshard)
 	if err != nil {
-		logger.Error(err, "Failed to check cluster health after reshard")
+		logger.Error(err, "Failed to get reshard Job status")
 		return nil // Will retry in next reconcile
 	}
 
-	if !healthy {
-		logger.Info("Cluster not yet healthy after reshard, waiting...")
-		return nil // Will retry in next reconcile
-	}
-
-	// Verify all masters now have slots
-	emptyMasters := cm.findEmptyMasters(ctx, *masterPod, kredis.Spec.BasePort)
-	if len(emptyMasters) > 0 {
-		logger.Info("Some masters still have no slots after reshard, retrying reshard",
-			"emptyMasterCount", len(emptyMasters))
-		// Retry reshard for remaining empty masters
-		delta.LastClusterOperation = fmt.Sprintf("rebalance-needed:%d", time.Now().Unix())
+	switch jobResult.Status {
+	case JobStatusNotFound:
+		// No reshard jobs - check if there are still empty masters
+		emptyMasters := cm.findEmptyMasters(ctx, *masterPod, kredis.Spec.BasePort)
+		if len(emptyMasters) > 0 {
+			logger.Info("No reshard Job found but empty masters exist - creating Job for first one", "count", len(emptyMasters))
+			// Create Job for first empty master only
+			clusterAddr := fmt.Sprintf("%s:%d", masterPod.Status.PodIP, kredis.Spec.BasePort)
+			firstEM := emptyMasters[0]
+			targetAddr := fmt.Sprintf("%s:%d", firstEM.IP, kredis.Spec.BasePort)
+			if err := cm.JobManager.CreateReshardJob(ctx, kredis, firstEM.NodeID, targetAddr, clusterAddr, InitialReshardSlots); err != nil {
+				logger.Error(err, "Failed to create reshard Job")
+			}
+			return nil
+		}
+		// No empty masters, proceed to rebalance
+		logger.Info("No empty masters remaining, proceeding to rebalance")
+		delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
 		return nil
+
+	case JobStatusPending, JobStatusRunning:
+		// Job is still in progress - just return and wait
+		logger.Info("Reshard Job still running", "job", jobResult.JobName)
+		return nil
+
+	case JobStatusSucceeded:
+		logger.Info("Reshard Job succeeded", "job", jobResult.JobName)
+
+		// Wait for cluster to stabilize BEFORE cleaning up the Job
+		// This ensures we can re-enter this case if stabilization fails
+		healthy, err := cm.PodExecutor.IsClusterHealthy(ctx, *masterPod, kredis.Spec.BasePort)
+		if err != nil || !healthy {
+			logger.Info("Waiting for cluster to stabilize after reshard")
+			return nil // Job still exists, will re-enter JobStatusSucceeded on next reconcile
+		}
+
+		// Cleanup the completed job only after cluster is stable
+		_ = cm.JobManager.CleanupCompletedJobs(ctx, kredis)
+
+		// Check if more empty masters exist
+		emptyMasters := cm.findEmptyMasters(ctx, *masterPod, kredis.Spec.BasePort)
+		if len(emptyMasters) > 0 {
+			logger.Info("More empty masters found - creating Job for next one (sequential)", "count", len(emptyMasters))
+			// Create Job for ONLY the first remaining empty master
+			clusterAddr := fmt.Sprintf("%s:%d", masterPod.Status.PodIP, kredis.Spec.BasePort)
+			firstEM := emptyMasters[0]
+			targetAddr := fmt.Sprintf("%s:%d", firstEM.IP, kredis.Spec.BasePort)
+			if err := cm.JobManager.CreateReshardJob(ctx, kredis, firstEM.NodeID, targetAddr, clusterAddr, InitialReshardSlots); err != nil {
+				logger.Error(err, "Failed to create reshard Job")
+			}
+			return nil
+		}
+
+		// All empty masters handled, proceed to rebalance
+		logger.Info("All reshard Jobs complete, proceeding to rebalance phase")
+		delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
+		return nil
+
+	case JobStatusFailed:
+		logger.Error(nil, "Reshard Job failed", "job", jobResult.JobName, "message", jobResult.Message)
+
+		// Try to fix the cluster before retrying
+		logger.Info("Attempting to fix cluster before retry")
+		if err := cm.PodExecutor.RepairCluster(ctx, *masterPod, kredis.Spec.BasePort); err != nil {
+			logger.Error(err, "Failed to repair cluster")
+		}
+
+		// Cleanup the failed job
+		_ = cm.JobManager.CleanupCompletedJobs(ctx, kredis)
+
+		// Reset to rebalance-needed to retry
+		delta.LastClusterOperation = fmt.Sprintf("rebalance-needed:%d", time.Now().Unix())
+		delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
+		return nil // Don't return error - let it retry
 	}
-
-	logger.Info("Reshard complete - all masters have slots, proceeding to rebalance phase")
-
-	// Move to Phase 2: Rebalance
-	delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
-	delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
 
 	return nil
 }

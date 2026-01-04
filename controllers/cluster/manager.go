@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -19,13 +18,15 @@ import (
 type ClusterManager struct {
 	client.Client
 	PodExecutor *PodExecutor
+	JobManager  *JobManager
 }
 
 // NewClusterManager creates a new cluster manager
-func NewClusterManager(client client.Client, podExecutor *PodExecutor) *ClusterManager {
+func NewClusterManager(c client.Client, podExecutor *PodExecutor) *ClusterManager {
 	return &ClusterManager{
-		Client:      client,
+		Client:      c,
 		PodExecutor: podExecutor,
+		JobManager:  NewJobManager(c),
 	}
 }
 
@@ -104,6 +105,13 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 
 	// Check if there's an ongoing operation and resume verification if needed
 	lastOp := kredis.Status.LastClusterOperation
+	if strings.Contains(lastOp, "create-in-progress") {
+		// 클러스터 생성 진행 중 - Job 상태 확인 및 완료 처리
+		logger.Info("Create in progress - will verify and finalize",
+			"lastOperation", lastOp,
+			"currentTime", time.Now().Unix())
+		return OperationCreate
+	}
 	if strings.Contains(lastOp, "rebalance-needed") {
 		// 스케일 후 리밸런스가 필요한 상태 - 리밸런스 시작 (Phase 1: reshard)
 		logger.Info("Rebalance needed after scale - will start reshard phase",
@@ -460,61 +468,23 @@ func (cm *ClusterManager) isPodReady(pod corev1.Pod) bool {
 	return false
 }
 
-// waitForClusterStabilization waits for the cluster to become healthy after an operation.
-func (cm *ClusterManager) waitForClusterStabilization(ctx context.Context, kredis *cachev1alpha1.Kredis, queryPod *corev1.Pod) error {
+// areAllNodesKnown checks if the cluster knows about exactly the expected number of nodes (non-blocking).
+// Uses exact match (==) to work correctly for both scale-up and scale-down scenarios.
+func (cm *ClusterManager) areAllNodesKnown(ctx context.Context, commandPod corev1.Pod, port int32, expectedCount int) bool {
 	logger := log.FromContext(ctx)
-	timeout := time.After(2 * time.Minute)
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-timeout:
-			return fmt.Errorf("timed out waiting for cluster to stabilize")
-		case <-ticker.C:
-			isHealthy, err := cm.PodExecutor.IsClusterHealthy(ctx, *queryPod, kredis.Spec.BasePort)
-			if err != nil {
-				logger.V(1).Info("Waiting for cluster stabilization, health check failed", "error", err)
-				continue
-			}
-			if isHealthy {
-				logger.Info("Cluster has stabilized.")
-				return nil
-			}
-			logger.Info("Waiting for cluster to stabilize...")
+	nodes, err := cm.PodExecutor.GetRedisClusterNodes(ctx, commandPod, port)
+	if err != nil {
+		logger.V(1).Info("Failed to get cluster nodes for node count check", "error", err)
+		return false
+	}
+	knownNodes := 0
+	for _, node := range nodes {
+		if !strings.Contains(node.Status, "handshake") {
+			knownNodes++
 		}
 	}
-}
-
-// waitForAllNodesToBeKnown waits until the cluster reports a certain number of nodes.
-func (cm *ClusterManager) waitForAllNodesToBeKnown(ctx context.Context, commandPod corev1.Pod, port int32, expectedCount int) error {
-	logger := log.FromContext(ctx)
-	logger.Info("Waiting for all nodes to be known by the cluster", "expectedCount", expectedCount)
-	timeout := time.After(5 * time.Minute)
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-timeout:
-			return fmt.Errorf("timed out waiting for all nodes to be known")
-		case <-ticker.C:
-			nodes, err := cm.PodExecutor.GetRedisClusterNodes(ctx, commandPod, port)
-			if err != nil {
-				logger.Error(err, "Failed to get cluster nodes, retrying...")
-				continue
-			}
-			knownNodes := 0
-			for _, node := range nodes {
-				if !strings.Contains(node.Status, "handshake") {
-					knownNodes++
-				}
-			}
-			logger.Info("Checking number of known nodes", "current", knownNodes, "expected", expectedCount)
-			if knownNodes >= expectedCount {
-				logger.Info("All nodes are known by the cluster.")
-				return nil
-			}
-		}
-	}
+	logger.Info("Checking known nodes", "current", knownNodes, "expected", expectedCount)
+	return knownNodes == expectedCount
 }
 
 // findMasterPod returns a ready master pod if possible, otherwise any ready pod.
@@ -536,53 +506,6 @@ func (cm *ClusterManager) findMasterPod(pods []corev1.Pod, kredis *cachev1alpha1
 		}
 	}
 	return nil
-}
-
-func (cm *ClusterManager) checkIfRebalanceInProgress(ctx context.Context, pod corev1.Pod, port int32) bool {
-	result, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, port, "cluster", "nodes")
-	if err != nil {
-		return false
-	}
-	lines := strings.Split(result.Stdout, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if strings.Contains(line, "[") && strings.Contains(line, ">-") {
-			return true
-		}
-		if strings.Contains(line, "[") && strings.Contains(line, "-<") {
-			return true
-		}
-	}
-	return false
-}
-
-func (cm *ClusterManager) checkIfScalingInProgress(ctx context.Context, pod corev1.Pod, port int32) bool {
-	result, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, port, "cluster", "nodes")
-	if err != nil {
-		return false
-	}
-	lines := strings.Split(result.Stdout, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if strings.Contains(line, "handshake") {
-			return true
-		}
-	}
-	return false
-}
-
-func (cm *ClusterManager) checkIfClusterCreationInProgress(ctx context.Context, pod corev1.Pod, port int32) bool {
-	isHealthy, err := cm.PodExecutor.IsClusterHealthy(ctx, pod, port)
-	if err != nil {
-		return true
-	}
-	return !isHealthy
 }
 
 func (cm *ClusterManager) getActualMasterCount(ctx context.Context, pods []corev1.Pod, port int32) (int, error) {
@@ -700,74 +623,34 @@ func (cm *ClusterManager) SyncPodRoleLabels(ctx context.Context, kredis *cachev1
 	}
 }
 
-// isOperationInProgress checks if there's an ongoing cluster operation
+// isOperationInProgress checks if there's an ongoing cluster operation by checking Job status.
 func (cm *ClusterManager) isOperationInProgress(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod) bool {
+	logger := log.FromContext(ctx)
 	lastOp := kredis.Status.LastClusterOperation
+
 	if lastOp == "" {
 		return false
 	}
 	if !strings.Contains(lastOp, "-in-progress") {
 		return false
 	}
-	logger := log.FromContext(ctx)
-	parts := strings.Split(lastOp, ":")
-	if len(parts) < 2 {
-		logger.V(1).Info("Invalid operation format, treating as not in progress", "lastOperation", lastOp)
-		return false
-	}
-	timestamp, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
+
+	// Check if any Jobs are incomplete (pending, running, or retrying)
+	// This correctly handles jobs that are created but Pod not yet scheduled
+	hasIncompleteJobs, err := cm.JobManager.HasIncompleteJobs(ctx, kredis)
 	if err != nil {
-		logger.V(1).Info("Invalid timestamp in operation, treating as not in progress", "lastOperation", lastOp)
-		return false
+		logger.Error(err, "Failed to check incomplete Jobs")
+		// If we can't check, assume operation is still in progress
+		return true
 	}
-	currentTime := time.Now().Unix()
-	timeDiff := currentTime - timestamp
-	var queryPod *corev1.Pod
-	for i := range pods {
-		if cm.isPodReady(pods[i]) {
-			queryPod = &pods[i]
-			break
-		}
+
+	if hasIncompleteJobs {
+		logger.V(1).Info("Incomplete Jobs found, operation in progress")
+		return true
 	}
-	var timeoutDuration int64 = 300
-	if strings.Contains(lastOp, "rebalance-in-progress") {
-		timeoutDuration = 600
-	} else if strings.Contains(lastOp, "create-in-progress") {
-		timeoutDuration = 420
-	} else if strings.Contains(lastOp, "scale-in-progress") {
-		timeoutDuration = 480
-	}
-	if timeDiff <= timeoutDuration && queryPod != nil {
-		if strings.Contains(lastOp, "rebalance-in-progress") {
-			if isRebalancing := cm.checkIfRebalanceInProgress(ctx, *queryPod, kredis.Spec.BasePort); isRebalancing {
-				logger.V(1).Info("Rebalance operation is actually in progress")
-				return true
-			}
-		} else if strings.Contains(lastOp, "scale-in-progress") {
-			if isScaling := cm.checkIfScalingInProgress(ctx, *queryPod, kredis.Spec.BasePort); isScaling {
-				logger.V(1).Info("Scale operation is actually in progress")
-				return true
-			}
-		} else if strings.Contains(lastOp, "create-in-progress") {
-			if isCreating := cm.checkIfClusterCreationInProgress(ctx, *queryPod, kredis.Spec.BasePort); isCreating {
-				logger.V(1).Info("Cluster creation operation is actually in progress")
-				return true
-			}
-		}
-		logger.Info("Operation marked as in-progress but not actually running, considering it completed",
-			"lastOperation", lastOp,
-			"timeDiff", timeDiff)
-		return false
-	}
-	if timeDiff > timeoutDuration {
-		logger.Info("Stale operation found, allowing new operation",
-			"lastOperation", lastOp,
-			"timeDiff", timeDiff,
-			"timeoutDuration", timeoutDuration)
-		return false
-	}
-	log.FromContext(ctx).V(1).Info("Cannot verify operation status, assuming in progress due to recent timestamp",
-		"lastOperation", lastOp,
-		"timeDiff", timeDiff)
-	return true
+
+	// No incomplete jobs - operation has completed (success or failure)
+	// The actual status will be updated by the operation handler
+	logger.V(1).Info("No incomplete Jobs, operation is no longer in progress", "lastOperation", lastOp)
+	return false
 }

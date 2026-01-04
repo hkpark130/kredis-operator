@@ -36,11 +36,11 @@ func (cm *ClusterManager) healCluster(ctx context.Context, kredis *cachev1alpha1
 		return fmt.Errorf("heal failed: %w", err)
 	}
 
-	logger.Info("Waiting for cluster to stabilize after heal...")
-	if err := cm.waitForClusterStabilization(ctx, kredis, masterPod); err != nil {
-		delta.LastClusterOperation = fmt.Sprintf("heal-failed:%d", time.Now().Unix())
-		delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
-		return fmt.Errorf("cluster failed to stabilize after heal: %w", err)
+	// Non-blocking: check stability and return, next reconcile will verify
+	isHealthy, _ := cm.PodExecutor.IsClusterHealthy(ctx, *masterPod, kredis.Spec.BasePort)
+	if !isHealthy {
+		logger.Info("Heal command executed but cluster not yet stable, will verify in next reconcile")
+		return nil
 	}
 
 	delta.LastClusterOperation = fmt.Sprintf("heal-success:%d", time.Now().Unix())

@@ -175,10 +175,9 @@ func (cm *ClusterManager) finalizeScale(ctx context.Context, kredis *cachev1alph
 
 	expectedTotalPods := cm.getExpectedPodCount(kredis)
 
-	// 모든 노드가 클러스터에 인식되었는지 확인
-	if err := cm.waitForAllNodesToBeKnown(ctx, *commandPod, kredis.Spec.BasePort, int(expectedTotalPods)); err != nil {
-		// 아직 안정화 안됨 → scale-in-progress 유지, 다음 reconcile에서 재시도
-		logger.Info("Cluster not yet stable, will retry in next reconcile", "error", err)
+	// Non-blocking: check if all nodes are known
+	if !cm.areAllNodesKnown(ctx, *commandPod, kredis.Spec.BasePort, int(expectedTotalPods)) {
+		logger.Info("Not all nodes known yet, will check in next reconcile")
 		return nil
 	}
 

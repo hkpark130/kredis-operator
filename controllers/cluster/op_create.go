@@ -12,9 +12,16 @@ import (
 	cachev1alpha1 "github.com/hkpark130/kredis-operator/api/v1alpha1"
 )
 
-// createCluster initializes a new Redis cluster
+// createCluster initializes a new Redis cluster using a Job.
+// Non-blocking: Creates a Job and returns immediately, subsequent reconciles check Job status.
 func (cm *ClusterManager) createCluster(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, delta *ClusterStatusDelta) error {
 	logger := log.FromContext(ctx)
+	lastOp := kredis.Status.LastClusterOperation
+
+	// If creation is already in progress, check Job status
+	if strings.Contains(lastOp, "create-in-progress") {
+		return cm.checkCreateJobAndFinalize(ctx, kredis, pods, delta)
+	}
 
 	logger.Info("Resetting all nodes before cluster creation to ensure a clean state.")
 	for _, pod := range pods {
@@ -29,9 +36,78 @@ func (cm *ClusterManager) createCluster(ctx context.Context, kredis *cachev1alph
 	}
 	time.Sleep(2 * time.Second)
 
+	// Prepare node addresses
+	var nodeAddrs []string
+	for _, pod := range pods {
+		if pod.Status.PodIP != "" {
+			nodeAddrs = append(nodeAddrs, fmt.Sprintf("%s:%d", pod.Status.PodIP, kredis.Spec.BasePort))
+		}
+	}
+	if len(nodeAddrs) != len(pods) {
+		return fmt.Errorf("not all pods have an IP address yet")
+	}
+	logger.Info("Node list for cluster creation", "nodeAddrs", strings.Join(nodeAddrs, " "), "nodeCount", len(nodeAddrs))
+
+	// Create the cluster creation Job
+	// Note: JoinedPods is NOT set here - it will be set after cluster creation succeeds
+	// because JoinedPods represents pods that have actually joined the cluster
+	if err := cm.JobManager.CreateClusterJob(ctx, kredis, nodeAddrs, int(kredis.Spec.Replicas)); err != nil {
+		return fmt.Errorf("failed to create cluster job: %w", err)
+	}
+
 	delta.LastClusterOperation = fmt.Sprintf("create-in-progress:%d", time.Now().Unix())
 	delta.ClusterState = string(cachev1alpha1.ClusterStateCreating)
 
+	logger.Info("Cluster creation Job created, waiting for completion")
+	return nil
+}
+
+// checkCreateJobAndFinalize checks the cluster creation Job status and finalizes if complete.
+func (cm *ClusterManager) checkCreateJobAndFinalize(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, delta *ClusterStatusDelta) error {
+	logger := log.FromContext(ctx)
+
+	// Note: JoinedPods is intentionally NOT set here during in-progress state
+	// It will only be set after cluster creation succeeds in verifyClusterCreation()
+
+	// Check Job status
+	jobResult, err := cm.JobManager.GetJobStatus(ctx, kredis, JobTypeCreate)
+	if err != nil {
+		logger.Error(err, "Failed to get create Job status")
+		return nil // Will retry in next reconcile
+	}
+
+	switch jobResult.Status {
+	case JobStatusNotFound:
+		// Job not found - might have been cleaned up, check cluster health directly
+		logger.Info("Create Job not found, checking cluster health directly")
+		return cm.verifyClusterCreation(ctx, kredis, pods, delta)
+
+	case JobStatusPending, JobStatusRunning:
+		// Job is still in progress - just return and wait
+		logger.Info("Create cluster Job still running", "job", jobResult.JobName)
+		return nil
+
+	case JobStatusSucceeded:
+		logger.Info("Create cluster Job succeeded", "job", jobResult.JobName)
+		return cm.verifyClusterCreation(ctx, kredis, pods, delta)
+
+	case JobStatusFailed:
+		logger.Error(nil, "Create cluster Job failed", "job", jobResult.JobName, "message", jobResult.Message)
+		delta.LastClusterOperation = fmt.Sprintf("create-failed:%d", time.Now().Unix())
+		delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
+		// Cleanup the failed job so we can retry
+		_ = cm.JobManager.CleanupCompletedJobs(ctx, kredis)
+		return fmt.Errorf("create cluster Job failed: %s", jobResult.Message)
+	}
+
+	return nil
+}
+
+// verifyClusterCreation checks if the cluster was created successfully and marks it as complete.
+func (cm *ClusterManager) verifyClusterCreation(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, delta *ClusterStatusDelta) error {
+	logger := log.FromContext(ctx)
+
+	// Find a pod to check cluster health
 	var commandPod *corev1.Pod
 	for i := range pods {
 		if cm.isPodReady(pods[i]) {
@@ -40,51 +116,42 @@ func (cm *ClusterManager) createCluster(ctx context.Context, kredis *cachev1alph
 		}
 	}
 	if commandPod == nil {
-		return fmt.Errorf("no ready pod found for cluster creation")
+		logger.Info("No ready pod found to verify cluster creation")
+		return nil
 	}
 
-	logger.Info("Creating Redis cluster", "commandPod", commandPod.Name)
-
-	var nodeIPs []string
-	for _, pod := range pods {
-		if pod.Status.PodIP != "" {
-			nodeIPs = append(nodeIPs, pod.Status.PodIP)
-		}
-	}
-	if len(nodeIPs) != len(pods) {
-		return fmt.Errorf("not all pods have an IP address yet")
-	}
-	logger.Info("Node list for cluster creation", "nodeIPs", strings.Join(nodeIPs, " "), "nodeCount", len(nodeIPs))
-
-	_, err := cm.PodExecutor.CreateCluster(ctx, *commandPod, kredis.Spec.BasePort, nodeIPs, int(kredis.Spec.Replicas))
+	// Check if cluster is healthy
+	isHealthy, err := cm.PodExecutor.IsClusterHealthy(ctx, *commandPod, kredis.Spec.BasePort)
 	if err != nil {
-		delta.LastClusterOperation = fmt.Sprintf("create-failed:%d", time.Now().Unix())
-		delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
-		return fmt.Errorf("failed to create cluster: %w", err)
+		logger.Error(err, "Failed to check cluster health")
+		return nil
 	}
 
-	logger.Info("Waiting for cluster to stabilize after creation...")
-	err = cm.waitForClusterStabilization(ctx, kredis, commandPod)
-	if err != nil {
-		delta.LastClusterOperation = fmt.Sprintf("create-failed:%d", time.Now().Unix())
-		delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
-		return fmt.Errorf("cluster failed to stabilize after creation: %w", err)
+	if !isHealthy {
+		logger.Info("Cluster not yet healthy after creation, waiting...")
+		return nil
 	}
 
+	// Cluster is healthy - mark as success
+	logger.Info("Cluster created and healthy!")
 	delta.LastClusterOperation = fmt.Sprintf("create-success:%d", time.Now().Unix())
 	delta.ClusterState = string(cachev1alpha1.ClusterStateInitialized)
-	time.Sleep(2 * time.Second)
-	logger.Info("Successfully created Redis cluster")
 
-	known := len(pods)
-	delta.KnownClusterNodes = &known
-	var joinedPodNames []string
-	for _, pod := range pods {
-		if pod.Status.PodIP != "" {
-			joinedPodNames = append(joinedPodNames, pod.Name)
+	// Ensure JoinedPods is set
+	if len(delta.JoinedPods) == 0 {
+		var joinedPodNames []string
+		for _, pod := range pods {
+			if pod.Status.PodIP != "" {
+				joinedPodNames = append(joinedPodNames, pod.Name)
+			}
 		}
+		delta.JoinedPods = joinedPodNames
+		known := len(pods)
+		delta.KnownClusterNodes = &known
 	}
-	delta.JoinedPods = joinedPodNames
+
+	// Cleanup completed jobs
+	_ = cm.JobManager.CleanupCompletedJobs(ctx, kredis)
 
 	return nil
 }
