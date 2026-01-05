@@ -105,6 +105,20 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 
 	// Check if there's an ongoing operation and resume verification if needed
 	lastOp := kredis.Status.LastClusterOperation
+	if strings.Contains(lastOp, "create-reset-pending") {
+		// 클러스터 생성 전 노드 리셋 대기 중
+		logger.Info("Create reset pending - will check if all nodes are reset",
+			"lastOperation", lastOp,
+			"currentTime", time.Now().Unix())
+		return OperationCreate
+	}
+	if strings.Contains(lastOp, "scale-reset-pending") {
+		// 스케일 전 노드 리셋 대기 중
+		logger.Info("Scale reset pending - will check if node is reset",
+			"lastOperation", lastOp,
+			"currentTime", time.Now().Unix())
+		return OperationScale
+	}
 	if strings.Contains(lastOp, "create-in-progress") {
 		// 클러스터 생성 진행 중 - Job 상태 확인 및 완료 처리
 		logger.Info("Create in progress - will verify and finalize",
@@ -163,10 +177,8 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 	}
 
 	// kredis.Status.JoinedPods를 사용하여 클러스터 멤버를 식별합니다.
-	joinedPodsSet := make(map[string]struct{})
-	for _, podName := range kredis.Status.JoinedPods {
-		joinedPodsSet[podName] = struct{}{}
-	}
+	// Use helper function to avoid duplicating slice-to-set conversion.
+	joinedPodsSet := buildJoinedPodsSet(kredis.Status.JoinedPods)
 
 	for _, node := range clusterState {
 		// A node is considered a member only if its name is in JoinedPods.
@@ -181,7 +193,8 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 	// --- Decision Logic ---
 
 	// Check if a functional cluster already exists.
-	clusterExists, err := cm.isClusterAlreadyExists(ctx, kredis, pods)
+	// Pass clusterState to avoid redundant GetRedisClusterNodes call.
+	clusterExists, err := cm.isClusterAlreadyExists(ctx, kredis, pods, clusterState)
 	if err != nil {
 		logger.Error(err, "Failed to check for cluster existence")
 		return ""
@@ -273,18 +286,15 @@ func (cm *ClusterManager) executeClusterOperation(ctx context.Context, kredis *c
 }
 
 // isClusterAlreadyExists checks if a functional Redis cluster is already formed.
-func (cm *ClusterManager) isClusterAlreadyExists(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod) (bool, error) {
+// clusterState is passed from discoverClusterState to avoid redundant Redis queries.
+func (cm *ClusterManager) isClusterAlreadyExists(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) (bool, error) {
 	logger := log.FromContext(ctx)
 	port := kredis.Spec.BasePort
 
 	// Find a ready pod to query for cluster info.
-	var queryPod *corev1.Pod
-	for i := range pods {
-		if cm.isPodReady(pods[i]) {
-			queryPod = &pods[i]
-			break
-		}
-	}
+	// Priority: JoinedPods first (known cluster members), then any ready pod.
+	// This prevents new unjoined pods (e.g., pod-0) from being selected over existing cluster members.
+	queryPod := cm.findQueryPod(pods, kredis.Status.JoinedPods, port)
 	if queryPod == nil {
 		// Not an error, just means we can't check yet.
 		logger.Info("No ready pods available to check cluster existence")
@@ -303,23 +313,22 @@ func (cm *ClusterManager) isClusterAlreadyExists(ctx context.Context, kredis *ca
 		return false, nil
 	}
 
-	// 2. Check the number of nodes in the cluster against the known state.
-	nodes, err := cm.PodExecutor.GetRedisClusterNodes(ctx, *queryPod, port)
-	if err != nil {
-		logger.V(1).Info("Could not get cluster nodes, assuming cluster does not exist", "error", err)
-		return false, nil
+	// 2. Use clusterState (already fetched by discoverClusterState) to count nodes.
+	// This avoids a redundant GetRedisClusterNodes call.
+	connectedNodes := 0
+	for _, node := range clusterState {
+		if node.Status == "connected" || node.Role == "master" || node.Role == "slave" {
+			connectedNodes++
+		}
 	}
 
-	// A healthy cluster with a node count matching the last known good state is considered to exist.
-	// knownNodes := kredis.Status.KnownClusterNodes
-	// KnownClusterNodes 으로 판별하면 하나라도 에러나면 기존 클러스터 없다고 판별함
-	// if knownNodes > 0 && len(nodes) == knownNodes {
-	if isHealthy && len(nodes) > 0 {
-		logger.Info("Found existing healthy cluster.")
+	// A healthy cluster with connected nodes is considered to exist.
+	if isHealthy && connectedNodes > 0 {
+		logger.Info("Found existing healthy cluster.", "connectedNodes", connectedNodes)
 		return true, nil
 	}
 
-	logger.Info("Cluster check completed, but does not meet existence criteria", "isHealthy", isHealthy, "nodeCount", len(nodes))
+	logger.Info("Cluster check completed, but does not meet existence criteria", "isHealthy", isHealthy, "connectedNodes", connectedNodes)
 	return false, nil
 }
 
@@ -345,14 +354,10 @@ func (cm *ClusterManager) discoverClusterState(ctx context.Context, kredis *cach
 	logger := log.FromContext(ctx)
 	port := kredis.Spec.BasePort
 
-	// Find a single ready pod to query cluster state
-	var queryPod *corev1.Pod
-	for i := range pods {
-		if cm.isPodReady(pods[i]) && cm.PodExecutor.IsRedisReady(ctx, pods[i], port) {
-			queryPod = &pods[i]
-			break
-		}
-	}
+	// Find a single ready pod to query cluster state.
+	// Priority: JoinedPods first (known cluster members), then any ready pod.
+	// This prevents new unjoined pods from returning incomplete cluster info.
+	queryPod := cm.findQueryPod(pods, kredis.Status.JoinedPods, port)
 
 	// If no ready pod found, return all pods as pending
 	if queryPod == nil {
@@ -506,6 +511,49 @@ func (cm *ClusterManager) findMasterPod(pods []corev1.Pod, kredis *cachev1alpha1
 		}
 	}
 	return nil
+}
+
+// findQueryPod selects the best pod to query for cluster state.
+// Priority: JoinedPods (known cluster members) first, then any ready pod.
+// This prevents newly created pods (not yet joined) from being selected,
+// which would return incomplete cluster info (e.g., cluster_state:fail).
+func (cm *ClusterManager) findQueryPod(pods []corev1.Pod, joinedPods []string, port int32) *corev1.Pod {
+	joinedPodsSet := buildJoinedPodsSet(joinedPods)
+	podMap := make(map[string]corev1.Pod)
+	for _, p := range pods {
+		podMap[p.Name] = p
+	}
+
+	// First priority: Select from JoinedPods (known cluster members)
+	for _, podName := range joinedPods {
+		if pod, ok := podMap[podName]; ok {
+			if cm.isPodReady(pod) && cm.PodExecutor.IsRedisReady(context.Background(), pod, port) {
+				return &pod
+			}
+		}
+	}
+
+	// Second priority: Any ready pod (fallback for initial cluster creation)
+	for i := range pods {
+		if _, isJoined := joinedPodsSet[pods[i].Name]; !isJoined {
+			// Skip joined pods (already checked above)
+			if cm.isPodReady(pods[i]) && cm.PodExecutor.IsRedisReady(context.Background(), pods[i], port) {
+				return &pods[i]
+			}
+		}
+	}
+
+	return nil
+}
+
+// buildJoinedPodsSet creates a set from JoinedPods slice for O(1) lookup.
+// Use this helper to avoid duplicating slice-to-set conversion logic.
+func buildJoinedPodsSet(joinedPods []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(joinedPods))
+	for _, podName := range joinedPods {
+		set[podName] = struct{}{}
+	}
+	return set
 }
 
 func (cm *ClusterManager) getActualMasterCount(ctx context.Context, pods []corev1.Pod, port int32) (int, error) {

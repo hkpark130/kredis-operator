@@ -23,18 +23,44 @@ func (cm *ClusterManager) createCluster(ctx context.Context, kredis *cachev1alph
 		return cm.checkCreateJobAndFinalize(ctx, kredis, pods, delta)
 	}
 
-	logger.Info("Resetting all nodes before cluster creation to ensure a clean state.")
+	// If reset is pending, check if all nodes have completed reset
+	if strings.Contains(lastOp, "create-reset-pending") {
+		if !cm.areAllNodesReset(ctx, pods, kredis.Spec.BasePort) {
+			logger.Info("Nodes still resetting, waiting for next reconcile")
+			return nil
+		}
+		logger.Info("All nodes reset complete, proceeding to cluster creation")
+		// Fall through to create cluster Job
+		return cm.createClusterJob(ctx, kredis, pods, delta)
+	}
+
+	logger.Info("Resetting all nodes before cluster creation to ensure a clean state.", "podCount", len(pods))
 	for _, pod := range pods {
-		logger.Info("Executing FLUSHALL on pod", "pod", pod.Name)
+		logger.V(1).Info("Executing FLUSHALL on pod", "pod", pod.Name)
 		if _, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, kredis.Spec.BasePort, "FLUSHALL"); err != nil {
 			logger.Error(err, "Failed to flush node, but proceeding", "pod", pod.Name)
 		}
-		logger.Info("Executing CLUSTER RESET on pod", "pod", pod.Name)
+		logger.V(1).Info("Executing CLUSTER RESET on pod", "pod", pod.Name)
 		if _, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, kredis.Spec.BasePort, "CLUSTER", "RESET"); err != nil {
 			return fmt.Errorf("failed to reset node %s: %w", pod.Name, err)
 		}
 	}
-	time.Sleep(2 * time.Second)
+
+	// Verify all nodes are reset (each node should only see itself in cluster nodes)
+	// This replaces the blocking time.Sleep with proper state verification
+	if !cm.areAllNodesReset(ctx, pods, kredis.Spec.BasePort) {
+		logger.Info("Not all nodes have completed reset, waiting for next reconcile")
+		delta.LastClusterOperation = fmt.Sprintf("create-reset-pending:%d", time.Now().Unix())
+		return nil // Return without error - next reconcile will retry
+	}
+
+	// All nodes are reset, proceed to create cluster
+	return cm.createClusterJob(ctx, kredis, pods, delta)
+}
+
+// createClusterJob creates the cluster creation Job after all nodes are reset.
+func (cm *ClusterManager) createClusterJob(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, delta *ClusterStatusDelta) error {
+	logger := log.FromContext(ctx)
 
 	// Prepare node addresses
 	var nodeAddrs []string
@@ -154,4 +180,46 @@ func (cm *ClusterManager) verifyClusterCreation(ctx context.Context, kredis *cac
 	_ = cm.JobManager.CleanupCompletedJobs(ctx, kredis)
 
 	return nil
+}
+
+// areAllNodesReset checks if all nodes have completed FLUSHALL + CLUSTER RESET.
+// Checks both:
+// - DBSIZE == 0 (FLUSHALL complete)
+// - cluster_known_nodes == 1 (CLUSTER RESET complete)
+func (cm *ClusterManager) areAllNodesReset(ctx context.Context, pods []corev1.Pod, port int32) bool {
+	logger := log.FromContext(ctx)
+
+	for _, pod := range pods {
+		if !cm.isPodReady(pod) {
+			logger.V(1).Info("Pod not ready yet", "pod", pod.Name)
+			return false
+		}
+
+		// Check DBSIZE - must be 0 after FLUSHALL
+		dbsizeResult, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, port, "DBSIZE")
+		if err != nil {
+			logger.V(1).Info("Failed to get DBSIZE", "pod", pod.Name, "error", err)
+			return false
+		}
+		// DBSIZE returns "(integer) 0" or similar format
+		if !strings.Contains(dbsizeResult.Stdout, "0") {
+			logger.V(1).Info("Node still has data (FLUSHALL not complete)", "pod", pod.Name, "dbsize", dbsizeResult.Stdout)
+			return false
+		}
+
+		// Check CLUSTER INFO - cluster_known_nodes must be 1 after CLUSTER RESET
+		info, err := cm.PodExecutor.CheckRedisClusterInfo(ctx, pod, port)
+		if err != nil {
+			logger.V(1).Info("Failed to get cluster info", "pod", pod.Name, "error", err)
+			return false
+		}
+		knownNodes := info["cluster_known_nodes"]
+		if knownNodes != "1" {
+			logger.V(1).Info("Node not yet reset (still knows other nodes)", "pod", pod.Name, "knownNodes", knownNodes)
+			return false
+		}
+	}
+
+	logger.Info("All nodes have been reset (DBSIZE=0, cluster_known_nodes=1)")
+	return true
 }

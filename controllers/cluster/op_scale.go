@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -16,6 +17,13 @@ import (
 // 노드를 하나씩 추가하고 scale-in-progress 상태로 반환, 다음 reconcile에서 나머지 처리
 func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode, delta *ClusterStatusDelta) error {
 	logger := log.FromContext(ctx)
+	lastOp := kredis.Status.LastClusterOperation
+
+	// If scale reset is pending, check if node has completed reset
+	if strings.Contains(lastOp, "scale-reset-pending") {
+		return cm.checkScaleResetAndProceed(ctx, kredis, pods, clusterState, delta)
+	}
+
 	logger.Info("Scaling up Redis cluster")
 
 	delta.LastClusterOperation = fmt.Sprintf("scale-in-progress:%d", time.Now().Unix())
@@ -62,7 +70,23 @@ func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha
 		return err
 	}
 
-	// 5. 노드 추가
+	// 5. Verify node is reset before adding to cluster
+	if !cm.isNodeReset(ctx, targetPod, kredis.Spec.BasePort) {
+		logger.Info("Node not yet reset, waiting for next reconcile", "pod", targetPod.Name)
+		// Store target pod info for next reconcile
+		delta.LastClusterOperation = fmt.Sprintf("scale-reset-pending:%s:%v:%d", targetPod.Name, isMaster, time.Now().Unix())
+		return nil
+	}
+
+	// 6. 노드 추가
+	return cm.addNodeToCluster(ctx, kredis, targetPod, commandPod, isMaster, clusterState, delta)
+}
+
+// addNodeToCluster adds a single node to the cluster (master or slave)
+func (cm *ClusterManager) addNodeToCluster(ctx context.Context, kredis *cachev1alpha1.Kredis, targetPod corev1.Pod, commandPod *corev1.Pod, isMaster bool, clusterState []cachev1alpha1.ClusterNode, delta *ClusterStatusDelta) error {
+	logger := log.FromContext(ctx)
+	masterNodes := cm.getJoinedMasterNodes(kredis, clusterState)
+
 	if isMaster {
 		logger.Info("Adding new master node to cluster", "pod", targetPod.Name, "ip", targetPod.Status.PodIP)
 		if err := cm.PodExecutor.AddNodeToCluster(ctx, targetPod, *commandPod, kredis.Spec.BasePort, ""); err != nil {
@@ -84,22 +108,94 @@ func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha
 		}
 	}
 
-	// 6. JoinedPods에 추가
+	// JoinedPods에 추가
 	if !containsString(delta.JoinedPods, targetPod.Name) {
 		delta.JoinedPods = append(delta.JoinedPods, targetPod.Name)
 	}
 
-	// 7. 남은 노드가 있으면 scale-in-progress 유지, 다음 reconcile에서 계속
-	remainingNewPods := len(newPods) - 1
-	if remainingNewPods > 0 {
-		logger.Info("Node added, more nodes pending", "added", targetPod.Name, "remaining", remainingNewPods)
-		// scale-in-progress 유지하고 반환 → 다음 reconcile에서 나머지 처리
+	// Update operation status
+	delta.LastClusterOperation = fmt.Sprintf("scale-in-progress:%d", time.Now().Unix())
+	delta.ClusterState = string(cachev1alpha1.ClusterStateScaling)
+
+	return nil
+}
+
+// checkScaleResetAndProceed checks if the pending reset is complete and proceeds with node addition
+func (cm *ClusterManager) checkScaleResetAndProceed(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode, delta *ClusterStatusDelta) error {
+	logger := log.FromContext(ctx)
+	lastOp := kredis.Status.LastClusterOperation
+
+	// Parse target pod info from lastOp: "scale-reset-pending:podName:isMaster:timestamp"
+	parts := strings.Split(lastOp, ":")
+	if len(parts) < 3 {
+		logger.Info("Invalid scale-reset-pending format, restarting scale", "lastOp", lastOp)
+		delta.LastClusterOperation = ""
 		return nil
 	}
 
-	// 8. 모든 노드 추가 완료 → 완료 처리
-	logger.Info("All nodes added, finalizing scale operation")
-	return cm.finalizeScale(ctx, kredis, pods, clusterState, commandPod, delta)
+	targetPodName := parts[1]
+	isMaster := parts[2] == "true"
+
+	// Find target pod
+	var targetPod *corev1.Pod
+	for i := range pods {
+		if pods[i].Name == targetPodName {
+			targetPod = &pods[i]
+			break
+		}
+	}
+	if targetPod == nil {
+		logger.Info("Target pod not found, restarting scale", "pod", targetPodName)
+		delta.LastClusterOperation = fmt.Sprintf("scale-in-progress:%d", time.Now().Unix())
+		return nil
+	}
+
+	// Check if node is reset
+	if !cm.isNodeReset(ctx, *targetPod, kredis.Spec.BasePort) {
+		logger.Info("Node still resetting, waiting for next reconcile", "pod", targetPodName)
+		return nil
+	}
+
+	logger.Info("Node reset complete, proceeding to add to cluster", "pod", targetPodName, "isMaster", isMaster)
+
+	// Find command pod
+	commandPod := cm.findMasterPod(pods, kredis, clusterState)
+	if commandPod == nil {
+		return fmt.Errorf("failed to find a pod for scaling command")
+	}
+
+	return cm.addNodeToCluster(ctx, kredis, *targetPod, commandPod, isMaster, clusterState, delta)
+}
+
+// isNodeReset checks if a single node has completed FLUSHALL + CLUSTER RESET
+// Checks both DBSIZE (must be 0) and cluster_known_nodes (must be 1)
+func (cm *ClusterManager) isNodeReset(ctx context.Context, pod corev1.Pod, port int32) bool {
+	logger := log.FromContext(ctx)
+
+	if !cm.isPodReady(pod) {
+		return false
+	}
+
+	// Check DBSIZE - must be 0 after FLUSHALL
+	dbsizeResult, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, port, "DBSIZE")
+	if err != nil {
+		logger.V(1).Info("Failed to get DBSIZE", "pod", pod.Name, "error", err)
+		return false
+	}
+	// DBSIZE returns "(integer) 0" or similar format
+	if !strings.Contains(dbsizeResult.Stdout, "0") {
+		logger.V(1).Info("Node still has data (FLUSHALL not complete)", "pod", pod.Name, "dbsize", dbsizeResult.Stdout)
+		return false
+	}
+
+	// Check CLUSTER INFO - cluster_known_nodes must be 1 after CLUSTER RESET
+	info, err := cm.PodExecutor.CheckRedisClusterInfo(ctx, pod, port)
+	if err != nil {
+		logger.V(1).Info("Failed to get cluster info", "pod", pod.Name, "error", err)
+		return false
+	}
+	knownNodes := info["cluster_known_nodes"]
+	return knownNodes == "1"
 }
 
 // getJoinedMasterNodes returns master nodes that are in JoinedPods
