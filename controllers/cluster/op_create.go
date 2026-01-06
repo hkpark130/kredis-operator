@@ -174,6 +174,10 @@ func (cm *ClusterManager) verifyClusterCreation(ctx context.Context, kredis *cac
 		delta.JoinedPods = joinedPodNames
 		known := len(pods)
 		delta.KnownClusterNodes = &known
+	} else {
+    	// 비정상 케이스: 이미 JoinedPods가 설정되어 있음
+		logger.Warn("JoinedPods already set during cluster creation !!",
+			"existingJoinedPods", delta.JoinedPods)
 	}
 
 	// Cleanup completed jobs

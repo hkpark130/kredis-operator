@@ -38,7 +38,7 @@ type ExecResult struct {
 // ExecuteCommand executes a command in a pod and returns the result
 func (pe *PodExecutor) ExecuteCommand(ctx context.Context, pod corev1.Pod, command []string) (*ExecResult, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Executing command in pod",
+	logger.V(1).Info("Executing command in pod",
 		"pod", pod.Name,
 		"namespace", pod.Namespace,
 		"command", strings.Join(command, " "))
@@ -84,7 +84,7 @@ func (pe *PodExecutor) ExecuteCommand(ctx context.Context, pod corev1.Pod, comma
 	}
 
 	result.ExitCode = 0
-	logger.Info("Command executed successfully",
+	logger.V(1).Info("Command executed successfully",
 		"stdout", result.Stdout,
 		"stderr", result.Stderr)
 

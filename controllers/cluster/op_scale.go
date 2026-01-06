@@ -217,12 +217,12 @@ func (cm *ClusterManager) getJoinedMasterNodes(kredis *cachev1alpha1.Kredis, clu
 func (cm *ClusterManager) resetNode(ctx context.Context, pod corev1.Pod, basePort int32) error {
 	logger := log.FromContext(ctx)
 
-	logger.Info("Executing FLUSHALL on new pod", "pod", pod.Name)
+	logger.V(1).Info("Executing FLUSHALL on new pod", "pod", pod.Name)
 	if _, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, basePort, "FLUSHALL"); err != nil {
 		logger.Error(err, "Failed to flush new node, but proceeding", "pod", pod.Name)
 	}
 
-	logger.Info("Executing CLUSTER RESET on new pod", "pod", pod.Name)
+	logger.V(1).Info("Executing CLUSTER RESET on new pod", "pod", pod.Name)
 	if _, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, basePort, "CLUSTER", "RESET"); err != nil {
 		return fmt.Errorf("failed to reset new node %s: %w", pod.Name, err)
 	}

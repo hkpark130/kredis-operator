@@ -40,14 +40,6 @@ const (
 
 // BuildClusterOperationJob constructs a Kubernetes Job for Redis cluster operations.
 // This function creates a Job resource that will execute redis-cli commands in a Pod.
-//
-// Parameters:
-//   - kredis: The Kredis custom resource that owns this Job
-//   - jobName: Unique name for the Job (e.g., "my-redis-reshard-abc12345")
-//   - jobType: Type of operation (e.g., "reshard", "rebalance", "add-node")
-//   - targetNodeID: The target Redis node ID (used in annotations for tracking)
-//   - command: The redis-cli command to execute (e.g., ["redis-cli", "--cluster", "reshard", ...])
-//
 // The Job is configured with:
 //   - TTLSecondsAfterFinished: 300 (auto-cleanup after 5 minutes)
 //   - BackoffLimit: 3 (retry up to 3 times on failure)
