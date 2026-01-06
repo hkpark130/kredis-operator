@@ -24,6 +24,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,12 +33,18 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	cachev1alpha1 "github.com/hkpark130/kredis-operator/api/v1alpha1"
 	"github.com/hkpark130/kredis-operator/controllers/cluster"
 	"github.com/hkpark130/kredis-operator/controllers/resource"
+)
+
+const (
+	// kredisFinalizer is the finalizer name for Kredis resources
+	kredisFinalizer = "cache.docker.direa.synology.me/finalizer"
 )
 
 // KredisReconciler reconciles a Kredis object
@@ -72,6 +79,39 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 		logger.Error(err, "Failed to get Kredis")
 		return ctrl.Result{}, err
+	}
+
+	// Handle finalizer for cleanup on deletion
+	if kredis.ObjectMeta.DeletionTimestamp.IsZero() {
+		// Resource is not being deleted - ensure finalizer is present
+		if !controllerutil.ContainsFinalizer(kredis, kredisFinalizer) {
+			controllerutil.AddFinalizer(kredis, kredisFinalizer)
+			if err := r.Update(ctx, kredis); err != nil {
+				logger.Error(err, "Failed to add finalizer")
+				return ctrl.Result{}, err
+			}
+			logger.Info("Added finalizer to Kredis resource")
+		}
+	} else {
+		// Resource is being deleted - run cleanup
+		if controllerutil.ContainsFinalizer(kredis, kredisFinalizer) {
+			logger.Info("Kredis resource is being deleted, running cleanup")
+
+			// Cleanup: Delete all Jobs associated with this Kredis instance
+			if err := r.cleanupKredisResources(ctx, kredis); err != nil {
+				logger.Error(err, "Failed to cleanup Kredis resources")
+				// Don't block deletion, just log the error
+			}
+
+			// Remove finalizer to allow deletion
+			controllerutil.RemoveFinalizer(kredis, kredisFinalizer)
+			if err := r.Update(ctx, kredis); err != nil {
+				logger.Error(err, "Failed to remove finalizer")
+				return ctrl.Result{}, err
+			}
+			logger.Info("Removed finalizer, Kredis resource will be deleted")
+		}
+		return ctrl.Result{}, nil
 	}
 
 	logger.Info("Reconciling Kredis",
@@ -266,6 +306,20 @@ func (r *KredisReconciler) calculateStatus(kredis *cachev1alpha1.Kredis, sts *ap
 		newStatus.Phase = "Creating"
 	}
 
+	// Update ClusterState if not already set by delta or if in a terminal state
+	// This ensures kubectl get kredis shows meaningful state
+	if newStatus.ClusterState == "" {
+		// Initial state - no cluster operations have run yet
+		if sts.Status.ReadyReplicas < expectedReplicas {
+			newStatus.ClusterState = string(cachev1alpha1.ClusterStateCreating)
+		}
+	} else if strings.Contains(kredis.Status.LastClusterOperation, "-success") {
+		// If last operation was successful and we're stable, show Running
+		if sts.Status.ReadyReplicas == expectedReplicas {
+			newStatus.ClusterState = string(cachev1alpha1.ClusterStateRunning)
+		}
+	}
+
 	// Update condition
 	condition := metav1.Condition{
 		Type:               "Ready",
@@ -303,6 +357,45 @@ func mergeUnique(base []string, add []string) []string {
 		}
 	}
 	return out
+}
+
+// cleanupKredisResources cleans up all resources associated with a Kredis instance during deletion.
+// This includes Jobs, and any other resources that might be orphaned.
+func (r *KredisReconciler) cleanupKredisResources(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
+	logger := log.FromContext(ctx)
+
+	// Cleanup Jobs
+	if err := r.ClusterManager.JobManager.CleanupCompletedJobs(ctx, kredis); err != nil {
+		logger.Error(err, "Failed to cleanup Jobs during deletion")
+		// Continue with other cleanup
+	}
+
+	// Delete all Jobs (including running ones) for this Kredis instance
+	jobList := &batchv1.JobList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(kredis.Namespace),
+		client.MatchingLabels{
+			resource.LabelKredisName: kredis.Name,
+		},
+	}
+
+	if err := r.List(ctx, jobList, listOpts...); err != nil {
+		logger.Error(err, "Failed to list Jobs for cleanup")
+	} else {
+		for _, job := range jobList.Items {
+			deletePolicy := metav1.DeletePropagationBackground
+			if err := r.Delete(ctx, &job, &client.DeleteOptions{
+				PropagationPolicy: &deletePolicy,
+			}); err != nil && !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to delete Job", "job", job.Name)
+			} else {
+				logger.Info("Deleted Job during cleanup", "job", job.Name)
+			}
+		}
+	}
+
+	logger.Info("Kredis resource cleanup completed")
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

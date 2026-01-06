@@ -56,7 +56,24 @@ func (cm *ClusterManager) executeRebalancePhase(ctx context.Context, kredis *cac
 
 	switch jobResult.Status {
 	case JobStatusNotFound:
-		// No rebalance Job - create one
+		// No rebalance Job found - but this could mean:
+		// 1. First time entering rebalance phase - need to create job
+		// 2. Job completed and was cleaned up - check cluster state to verify
+		// 3. Job was externally deleted - need to recover
+
+		// First, check if cluster is already balanced (job might have completed)
+		isHealthy, _ := cm.PodExecutor.IsClusterHealthy(ctx, *masterPod, kredis.Spec.BasePort)
+		allMastersHaveSlots, _ := cm.checkAllMastersHaveSlots(ctx, *masterPod, kredis.Spec.BasePort)
+
+		if isHealthy && allMastersHaveSlots {
+			// Cluster is healthy and all masters have slots - rebalance must have succeeded
+			logger.Info("No rebalance Job found but cluster is healthy with all masters having slots - marking as success")
+			delta.LastClusterOperation = fmt.Sprintf("rebalance-success:%d", time.Now().Unix())
+			delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
+			return nil
+		}
+
+		// Cluster not balanced yet - need to create/re-create the job
 		logger.Info("Creating rebalance Job for even slot distribution")
 		clusterAddr := fmt.Sprintf("%s:%d", masterPod.Status.PodIP, kredis.Spec.BasePort)
 

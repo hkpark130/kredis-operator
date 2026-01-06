@@ -34,14 +34,20 @@ func (cm *ClusterManager) createCluster(ctx context.Context, kredis *cachev1alph
 		return cm.createClusterJob(ctx, kredis, pods, delta)
 	}
 
-	logger.Info("Resetting all nodes before cluster creation to ensure a clean state.", "podCount", len(pods))
-	for _, pod := range pods {
-		logger.V(1).Info("Executing FLUSHALL on pod", "pod", pod.Name)
-		if _, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, kredis.Spec.BasePort, "FLUSHALL"); err != nil {
-			logger.Error(err, "Failed to flush node, but proceeding", "pod", pod.Name)
-		}
-		logger.V(1).Info("Executing CLUSTER RESET on pod", "pod", pod.Name)
-		if _, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, kredis.Spec.BasePort, "CLUSTER", "RESET"); err != nil {
+	// Check which pods actually need reset (optimization: skip already clean nodes)
+	podsNeedingReset := cm.findPodsNeedingReset(ctx, pods, kredis.Spec.BasePort)
+	if len(podsNeedingReset) == 0 {
+		logger.Info("All nodes are already clean, skipping reset phase")
+		// All nodes are clean, proceed directly to cluster creation
+		return cm.createClusterJob(ctx, kredis, pods, delta)
+	}
+
+	logger.Info("Resetting nodes that need cleanup before cluster creation",
+		"totalPods", len(pods),
+		"podsNeedingReset", len(podsNeedingReset))
+
+	for _, pod := range podsNeedingReset {
+		if _, err := cm.resetNodeIfNeeded(ctx, pod, kredis.Spec.BasePort); err != nil {
 			return fmt.Errorf("failed to reset node %s: %w", pod.Name, err)
 		}
 	}
@@ -175,8 +181,8 @@ func (cm *ClusterManager) verifyClusterCreation(ctx context.Context, kredis *cac
 		known := len(pods)
 		delta.KnownClusterNodes = &known
 	} else {
-    	// 비정상 케이스: 이미 JoinedPods가 설정되어 있음
-		logger.Warn("JoinedPods already set during cluster creation !!",
+		// 비정상 케이스: 이미 JoinedPods가 설정되어 있음
+		logger.Info("WARNING: JoinedPods already set during cluster creation !!",
 			"existingJoinedPods", delta.JoinedPods)
 	}
 
@@ -186,44 +192,4 @@ func (cm *ClusterManager) verifyClusterCreation(ctx context.Context, kredis *cac
 	return nil
 }
 
-// areAllNodesReset checks if all nodes have completed FLUSHALL + CLUSTER RESET.
-// Checks both:
-// - DBSIZE == 0 (FLUSHALL complete)
-// - cluster_known_nodes == 1 (CLUSTER RESET complete)
-func (cm *ClusterManager) areAllNodesReset(ctx context.Context, pods []corev1.Pod, port int32) bool {
-	logger := log.FromContext(ctx)
-
-	for _, pod := range pods {
-		if !cm.isPodReady(pod) {
-			logger.V(1).Info("Pod not ready yet", "pod", pod.Name)
-			return false
-		}
-
-		// Check DBSIZE - must be 0 after FLUSHALL
-		dbsizeResult, err := cm.PodExecutor.ExecuteRedisCommand(ctx, pod, port, "DBSIZE")
-		if err != nil {
-			logger.V(1).Info("Failed to get DBSIZE", "pod", pod.Name, "error", err)
-			return false
-		}
-		// DBSIZE returns "(integer) 0" or similar format
-		if !strings.Contains(dbsizeResult.Stdout, "0") {
-			logger.V(1).Info("Node still has data (FLUSHALL not complete)", "pod", pod.Name, "dbsize", dbsizeResult.Stdout)
-			return false
-		}
-
-		// Check CLUSTER INFO - cluster_known_nodes must be 1 after CLUSTER RESET
-		info, err := cm.PodExecutor.CheckRedisClusterInfo(ctx, pod, port)
-		if err != nil {
-			logger.V(1).Info("Failed to get cluster info", "pod", pod.Name, "error", err)
-			return false
-		}
-		knownNodes := info["cluster_known_nodes"]
-		if knownNodes != "1" {
-			logger.V(1).Info("Node not yet reset (still knows other nodes)", "pod", pod.Name, "knownNodes", knownNodes)
-			return false
-		}
-	}
-
-	logger.Info("All nodes have been reset (DBSIZE=0, cluster_known_nodes=1)")
-	return true
-}
+// areAllNodesReset is now in utils.go as a common function

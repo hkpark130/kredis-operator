@@ -135,6 +135,10 @@ spec:
                     role:
                       description: Role is either "master" or "slave"
                       type: string
+                    slotCount:
+                      description: SlotCount is the number of slots assigned to this
+                        node (masters only)
+                      type: integer
                     status:
                       description: Status is the node status (e.g., "ready", "failed",
                         "pending")

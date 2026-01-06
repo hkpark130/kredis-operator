@@ -307,13 +307,14 @@ func (pe *PodExecutor) RepairCluster(ctx context.Context, pod corev1.Pod, port i
 
 // RedisNodeInfo represents a Redis cluster node
 type RedisNodeInfo struct {
-	NodeID   string
-	IP       string
-	Port     int32
-	Flags    []string
-	MasterID string
-	Role     string
-	Status   string
+	NodeID    string
+	IP        string
+	Port      int32
+	Flags     []string
+	MasterID  string
+	Role      string
+	Status    string
+	SlotCount int // Number of slots assigned to this node
 }
 
 // parseRedisNodeInfo parses a line from "cluster nodes" output
@@ -363,5 +364,42 @@ func parseRedisNodeInfo(line string) (RedisNodeInfo, error) {
 		node.Status = "ready"
 	}
 
+	// Count slots for masters (slot ranges appear from index 8 onwards)
+	// Format: "0-5460" or "0-100 200-300" etc.
+	if node.Role == "master" && len(parts) > 8 {
+		slotCount := 0
+		for i := 8; i < len(parts); i++ {
+			slotPart := parts[i]
+			// Skip import/export markers like "[123-<-nodeID]"
+			if strings.HasPrefix(slotPart, "[") {
+				continue
+			}
+			if strings.Contains(slotPart, "-") {
+				// Range: "0-5460"
+				rangeParts := strings.Split(slotPart, "-")
+				if len(rangeParts) == 2 {
+					start, err1 := parseSlotNumber(rangeParts[0])
+					end, err2 := parseSlotNumber(rangeParts[1])
+					if err1 == nil && err2 == nil {
+						slotCount += end - start + 1
+					}
+				}
+			} else {
+				// Single slot
+				if _, err := parseSlotNumber(slotPart); err == nil {
+					slotCount++
+				}
+			}
+		}
+		node.SlotCount = slotCount
+	}
+
 	return node, nil
+}
+
+// parseSlotNumber parses a slot number string
+func parseSlotNumber(s string) (int, error) {
+	var num int
+	_, err := fmt.Sscanf(s, "%d", &num)
+	return num, err
 }

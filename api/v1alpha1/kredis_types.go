@@ -128,6 +128,9 @@ type ClusterNode struct {
 	// MasterID is the master node ID if this is a slave
 	MasterID string `json:"masterId,omitempty"`
 
+	// SlotCount is the number of slots assigned to this node (masters only)
+	SlotCount int `json:"slotCount,omitempty"`
+
 	// Status is the node status (e.g., "ready", "failed", "pending")
 	Status string `json:"status"`
 }

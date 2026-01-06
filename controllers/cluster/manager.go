@@ -73,7 +73,15 @@ func (cm *ClusterManager) ReconcileCluster(ctx context.Context, kredis *cachev1a
 	clusterState, _ := cm.discoverClusterState(ctx, kredis, pods)
 	// 4. Provide discovered nodes via delta
 	delta.ClusterNodes = clusterState
-	// 4.1 Sync pod role labels based on discovered cluster state (dynamic update)
+
+	// 4.1 Cleanup stale JoinedPods (pods that no longer exist or left the cluster)
+	cleanedJoinedPods := cm.CleanupStaleJoinedPods(ctx, kredis, pods, clusterState)
+	if cleanedJoinedPods != nil && len(cleanedJoinedPods) != len(kredis.Status.JoinedPods) {
+		// JoinedPods changed, update via delta
+		delta.JoinedPods = cleanedJoinedPods
+	}
+
+	// 4.2 Sync pod role labels based on discovered cluster state (dynamic update)
 	cm.SyncPodRoleLabels(ctx, kredis, clusterState)
 
 	// 5. Determine what operation is needed based on the discovered state
@@ -240,15 +248,29 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 	// Scale-up condition:
 	// 1. The number of nodes currently in the cluster is less than what is expected.
 	// 2. There are unassigned (new) pods ready to be added to the cluster.
+	// NOTE: This condition only handles scale-up. Scale-down requires different handling:
+	// - Need to reshard slots away from nodes being removed
+	// - Need to gracefully remove nodes from cluster before pod deletion
+	// - Current StatefulSet-based approach doesn't support this well
 	if currentJoinedNodes < int(expectedTotalNodes) && unassignedPodCount > 0 {
 		logger.Info("Cluster needs scaling. More nodes need to be joined.", "action", "OperationScale")
 		return OperationScale
 	}
 
-	// Scale-down condition (not fully implemented, but logic placeholder)
+	// Scale-down condition (NOT YET IMPLEMENTED - critical limitations exist)
+	// WARNING: Scale-down is complex and requires:
+	// 1. Resharding slots from nodes to be removed to remaining nodes
+	// 2. Removing nodes from cluster using CLUSTER FORGET
+	// 3. Waiting for cluster to stabilize before deleting pods
+	// 4. Handling replicas of removed masters
+	// Current implementation does NOT support scale-down safely!
 	if currentJoinedNodes > int(expectedTotalNodes) {
-		logger.Info("Node count higher than expected - scale down not implemented yet")
-		// return OperationScaleDown // Future implementation
+		logger.Info("WARNING: Node count higher than expected - scale down NOT IMPLEMENTED",
+			"currentJoined", currentJoinedNodes,
+			"expected", expectedTotalNodes,
+			"action", "manual intervention required")
+		// TODO: Implement OperationScaleDown
+		// For now, we do NOT return OperationScale as that would try to add more nodes
 	}
 
 	// Heal condition: Check for failed nodes in the cluster state
@@ -412,6 +434,7 @@ func (cm *ClusterManager) discoverClusterState(ctx context.Context, kredis *cach
 			node.NodeID = redisNode.NodeID
 			node.Role = redisNode.Role
 			node.MasterID = redisNode.MasterID
+			node.SlotCount = redisNode.SlotCount
 			node.Status = redisNode.Status
 		}
 		clusterNodes = append(clusterNodes, node)
@@ -492,24 +515,39 @@ func (cm *ClusterManager) areAllNodesKnown(ctx context.Context, commandPod corev
 	return knownNodes == expectedCount
 }
 
-// findMasterPod returns a ready master pod if possible, otherwise any ready pod.
+// findMasterPod returns a ready master pod from JoinedPods if possible, otherwise any ready pod.
+// Priority: JoinedPods masters > JoinedPods members > any ready pod
+// This ensures we use known cluster members for commands rather than new unjoined pods.
 func (cm *ClusterManager) findMasterPod(pods []corev1.Pod, kredis *cachev1alpha1.Kredis, clusterState []cachev1alpha1.ClusterNode) *corev1.Pod {
+	joinedPodsSet := buildJoinedPodsSet(kredis.Status.JoinedPods)
 	podMap := make(map[string]corev1.Pod)
 	for _, p := range pods {
 		podMap[p.Name] = p
 	}
+
+	// 1st priority: JoinedPods masters
 	for _, node := range clusterState {
-		if node.Role == "master" {
+		if _, isJoined := joinedPodsSet[node.PodName]; isJoined && node.Role == "master" {
 			if pod, ok := podMap[node.PodName]; ok && cm.isPodReady(pod) {
 				return &pod
 			}
 		}
 	}
+
+	// 2nd priority: any JoinedPods member that is ready
+	for _, podName := range kredis.Status.JoinedPods {
+		if pod, ok := podMap[podName]; ok && cm.isPodReady(pod) {
+			return &pod
+		}
+	}
+
+	// 3rd priority: fallback to any ready pod (for initial cluster creation)
 	for i := range pods {
 		if cm.isPodReady(pods[i]) {
 			return &pods[i]
 		}
 	}
+
 	return nil
 }
 
