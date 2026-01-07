@@ -59,6 +59,79 @@ spec:
           spec:
             description: KredisSpec defines the desired state of Kredis
             properties:
+              autoscaling:
+                description: Autoscaling configuration for the Redis cluster
+                properties:
+                  cpuScaleDownThreshold:
+                    description: |-
+                      CPUScaleDownThreshold is the CPU usage percentage to trigger replica scale down (0-100)
+                      When CPU usage falls below this threshold, replicas may be scaled down
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  cpuScaleUpThreshold:
+                    description: |-
+                      CPUScaleUpThreshold is the CPU usage percentage to trigger replica scale up (0-100)
+                      When CPU usage exceeds this threshold, replicas are scaled up
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  enabled:
+                    description: Enabled enables autoscaling
+                    type: boolean
+                  maxMasters:
+                    description: MaxMasters is the maximum number of master nodes
+                    format: int32
+                    minimum: 3
+                    type: integer
+                  maxReplicasPerMaster:
+                    description: MaxReplicasPerMaster is the maximum number of replicas
+                      per master
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  memoryScaleDownThreshold:
+                    description: |-
+                      MemoryScaleDownThreshold is the memory usage percentage to trigger master scale down (0-100)
+                      When memory usage falls below this threshold, masters may be scaled down
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  memoryScaleUpThreshold:
+                    description: |-
+                      MemoryScaleUpThreshold is the memory usage percentage to trigger master scale up (0-100)
+                      When memory usage exceeds this threshold, masters are scaled up
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  minMasters:
+                    description: MinMasters is the minimum number of master nodes
+                    format: int32
+                    minimum: 3
+                    type: integer
+                  minReplicasPerMaster:
+                    description: MinReplicasPerMaster is the minimum number of replicas
+                      per master
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  scaleDownStabilizationWindowSeconds:
+                    default: 300
+                    description: ScaleDownStabilizationWindowSeconds is the time window
+                      to wait before scaling down
+                    format: int32
+                    type: integer
+                  scaleUpStabilizationWindowSeconds:
+                    default: 60
+                    description: ScaleUpStabilizationWindowSeconds is the time window
+                      to wait before scaling up
+                    format: int32
+                    type: integer
+                type: object
               basePort:
                 description: Base Port for Redis
                 format: int32
@@ -212,6 +285,16 @@ spec:
                   - type
                   type: object
                 type: array
+              currentCpuUsagePercent:
+                description: CurrentCPUUsagePercent is the current average CPU usage
+                  percentage across all nodes
+                format: int32
+                type: integer
+              currentMemoryUsagePercent:
+                description: CurrentMemoryUsagePercent is the current average memory
+                  usage percentage across masters
+                format: int32
+                type: integer
               joinedPods:
                 description: JoinedPods contains the list of pod names that have joined
                   the cluster
@@ -225,6 +308,14 @@ spec:
               lastClusterOperation:
                 description: LastClusterOperation tracks the last cluster operation
                   performed
+                type: string
+              lastScaleTime:
+                description: LastScaleTime is the last time the cluster was scaled
+                format: date-time
+                type: string
+              lastScaleType:
+                description: LastScaleType indicates the last scale operation type
+                  (masters-up, masters-down, replicas-up, replicas-down)
                 type: string
               phase:
                 description: Phase represents the current state of the Kredis deployment

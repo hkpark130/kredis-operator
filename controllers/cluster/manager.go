@@ -443,28 +443,6 @@ func (cm *ClusterManager) discoverClusterState(ctx context.Context, kredis *cach
 	return clusterNodes, nil
 }
 
-// queryRedisNodeInfo queries a Redis pod for its cluster information
-func (cm *ClusterManager) queryRedisNodeInfo(ctx context.Context, pod corev1.Pod, port int32) (cachev1alpha1.ClusterNode, error) {
-	node := cachev1alpha1.ClusterNode{PodName: pod.Name, IP: pod.Status.PodIP, Port: port, Status: "pending"}
-	if !cm.PodExecutor.IsRedisReady(ctx, pod, port) {
-		return node, fmt.Errorf("redis not ready")
-	}
-	redisNodes, err := cm.PodExecutor.GetRedisClusterNodes(ctx, pod, port)
-	if err != nil {
-		return node, err
-	}
-	for _, redisNode := range redisNodes {
-		if redisNode.IP == pod.Status.PodIP {
-			node.NodeID = redisNode.NodeID
-			node.Role = redisNode.Role
-			node.MasterID = redisNode.MasterID
-			node.Status = redisNode.Status
-			break
-		}
-	}
-	return node, nil
-}
-
 // areAllPodsReady checks if all expected pods are ready
 func (cm *ClusterManager) areAllPodsReady(pods []corev1.Pod, kredis *cachev1alpha1.Kredis) bool {
 	expectedCount := cm.getExpectedPodCount(kredis)
@@ -634,11 +612,15 @@ func (cm *ClusterManager) checkAllMastersHaveSlots(ctx context.Context, commandP
 // filterNewPods returns pods that are NOT yet part of the Redis cluster.
 // Uses clusterState (actual Redis cluster state) for accurate detection,
 // preventing duplicate add-node attempts when multiple reconciles run concurrently.
+// A node is considered "in cluster" only if it has a valid NodeID and a known role
+// (not "unknown" or empty). This prevents pods that exist but haven't actually
+// joined the cluster from being incorrectly filtered out.
 func filterNewPods(pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) []corev1.Pod {
-	// Build a set of pod names that are already in the cluster
+	// Build a set of pod names that are ACTUALLY in the cluster
+	// A node is "in cluster" if it has a valid NodeID and a known role
 	clusterPodSet := make(map[string]struct{})
 	for _, node := range clusterState {
-		if node.PodName != "" {
+		if node.PodName != "" && node.NodeID != "" && node.Role != "unknown" && node.Role != "" {
 			clusterPodSet[node.PodName] = struct{}{}
 		}
 	}

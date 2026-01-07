@@ -52,6 +52,7 @@ type KredisReconciler struct {
 	client.Client
 	Scheme         *runtime.Scheme
 	ClusterManager *cluster.ClusterManager
+	Autoscaler     *cluster.Autoscaler
 }
 
 //+kubebuilder:rbac:groups=cache.docker.direa.synology.me,resources=kredis,verbs=get;list;watch;create;update;patch;delete
@@ -64,6 +65,7 @@ type KredisReconciler struct {
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=pods/exec,verbs=create
 //+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop
 func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -145,7 +147,38 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: time.Minute}, err // 클러스터 조정 실패 시 1분 후 재시도
 	}
 
-	// 4. Update status
+	// 4. Evaluate autoscaling if cluster is stable
+	if clusterReady && r.Autoscaler != nil && kredis.Spec.Autoscaling.Enabled {
+		pods, err := r.getKredisPods(ctx, kredis)
+		if err == nil {
+			result, err := r.Autoscaler.EvaluateAutoscaling(ctx, kredis, pods)
+			if err != nil {
+				logger.Error(err, "Failed to evaluate autoscaling")
+			} else {
+				// Update metrics in status
+				if delta == nil {
+					delta = &cluster.ClusterStatusDelta{}
+				}
+				// Store current metrics in delta for status update
+				kredis.Status.CurrentMemoryUsagePercent = result.MemoryUsagePercent
+				kredis.Status.CurrentCPUUsagePercent = result.CPUUsagePercent
+
+				if result.Decision.ShouldScale {
+					logger.Info("Autoscaling triggered",
+						"scaleType", result.Decision.ScaleType,
+						"reason", result.Decision.Reason)
+					if err := r.Autoscaler.ApplyAutoscaling(ctx, kredis, result.Decision); err != nil {
+						logger.Error(err, "Failed to apply autoscaling")
+					} else {
+						// Re-fetch kredis after spec change to avoid conflicts
+						return ctrl.Result{RequeueAfter: time.Second * 5}, nil
+					}
+				}
+			}
+		}
+	}
+
+	// 5. Update status
 	if err := r.updateStatus(ctx, kredis, delta); err != nil {
 		logger.Error(err, "Failed to update status")
 		return ctrl.Result{RequeueAfter: time.Second * 10}, err
@@ -306,16 +339,31 @@ func (r *KredisReconciler) calculateStatus(kredis *cachev1alpha1.Kredis, sts *ap
 		newStatus.Phase = "Creating"
 	}
 
-	// Update ClusterState if not already set by delta or if in a terminal state
-	// This ensures kubectl get kredis shows meaningful state
+	// Determine ClusterState based on current situation
+	// Priority: Scaling detection > delta state > success state
+
+	// 1. Check if scaling is in progress (StatefulSet replicas != expected)
+	// This catches the case where Spec changed but pods aren't ready yet
+	isScaling := sts.Status.Replicas != expectedReplicas || sts.Status.ReadyReplicas != expectedReplicas
+
+	// 2. Check if cluster operations are in progress
+	isOperationInProgress := strings.Contains(kredis.Status.LastClusterOperation, "-in-progress") ||
+		strings.Contains(kredis.Status.LastClusterOperation, "-pending") ||
+		strings.Contains(kredis.Status.LastClusterOperation, "-needed")
+
+	// 3. Determine ClusterState
 	if newStatus.ClusterState == "" {
 		// Initial state - no cluster operations have run yet
-		if sts.Status.ReadyReplicas < expectedReplicas {
-			newStatus.ClusterState = string(cachev1alpha1.ClusterStateCreating)
-		}
+		newStatus.ClusterState = string(cachev1alpha1.ClusterStateCreating)
+	} else if isScaling && newStatus.ClusterState == string(cachev1alpha1.ClusterStateRunning) {
+		// Was Running but now scaling (spec changed, waiting for pods)
+		newStatus.ClusterState = string(cachev1alpha1.ClusterStateScaling)
+	} else if isOperationInProgress {
+		// Keep the current state if an operation is in progress
+		// (delta should have set this, don't override)
 	} else if strings.Contains(kredis.Status.LastClusterOperation, "-success") {
-		// If last operation was successful and we're stable, show Running
-		if sts.Status.ReadyReplicas == expectedReplicas {
+		// If last operation was successful and all pods are ready, show Running
+		if sts.Status.ReadyReplicas == expectedReplicas && !isScaling {
 			newStatus.ClusterState = string(cachev1alpha1.ClusterStateRunning)
 		}
 	}
@@ -357,6 +405,22 @@ func mergeUnique(base []string, add []string) []string {
 		}
 	}
 	return out
+}
+
+// getKredisPods returns all pods belonging to this Kredis instance
+func (r *KredisReconciler) getKredisPods(ctx context.Context, kredis *cachev1alpha1.Kredis) ([]corev1.Pod, error) {
+	podList := &corev1.PodList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(kredis.Namespace),
+		client.MatchingLabels{
+			"app":                        "kredis",
+			"app.kubernetes.io/instance": kredis.Name,
+		},
+	}
+	if err := r.List(ctx, podList, listOpts...); err != nil {
+		return nil, err
+	}
+	return podList.Items, nil
 }
 
 // cleanupKredisResources cleans up all resources associated with a Kredis instance during deletion.

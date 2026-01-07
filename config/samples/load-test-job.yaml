@@ -1,0 +1,76 @@
+---
+# Memory Load Test - 대량의 데이터를 삽입하여 Memory 부하 생성
+# 사용법: kubectl apply -f config/samples/load-test-job.yaml
+# 삭제: kubectl delete -f config/samples/load-test-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-memory-load-test
+  namespace: kredis-operator-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: load-test
+        image: redis:7.0
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "Starting memory load test..."
+          # 헤드리스 서비스 사용 (외부 서비스에서 접근하는 것과 동일한 방식)
+          REDIS_HOST="kredis-sample-master.kredis-operator-system.svc.cluster.local"
+          
+          # 100KB 크기의 값을 20000개 삽입 (약 2GB, 클러스터에 분산됨)
+          # 512Mi * 70% = 358MB per node, 3 masters = 약 1GB 이상 필요
+          for i in $(seq 1 200000); do
+            VALUE=$(head -c 1024000 /dev/urandom | base64 | head -c 1024000)
+            redis-cli -c -h $REDIS_HOST -p 6379 SET "loadtest:key:$i" "$VALUE" > /dev/null 2>&1
+            if [ $((i % 2000)) -eq 0 ]; then
+              echo "Inserted $i keys..."
+              # 현재 메모리 사용량 확인
+              redis-cli -c -h $REDIS_HOST -p 6379 INFO memory | grep used_memory_human
+            fi
+          done
+          
+          echo "Memory load test completed. Data will be kept for 10 minutes..."
+          sleep 600
+      restartPolicy: Never
+  backoffLimit: 1
+---
+# CPU Load Test - 대량의 GET/SET 요청으로 CPU 부하 생성
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-cpu-load-test
+  namespace: kredis-operator-system
+spec:
+  parallelism: 3  # 3개의 파드가 동시에 부하 생성
+  template:
+    spec:
+      containers:
+      - name: load-test
+        image: redis:7.0
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "Starting CPU load test with redis-benchmark..."
+          # 헤드리스 서비스 사용 (외부 서비스에서 접근하는 것과 동일한 방식)
+          REDIS_HOST="kredis-sample-master.kredis-operator-system.svc.cluster.local"
+          
+          # 먼저 클러스터 정보 확인
+          echo "Cluster nodes:"
+          redis-cli -c -h $REDIS_HOST -p 6379 CLUSTER NODES | head -5
+          
+          # 100개 연결, 50만 요청 (클러스터 모드)
+          redis-benchmark -h $REDIS_HOST -p 6379 \
+            -c 100 -n 500000 \
+            -t get,set \
+            -d 256 \
+            --cluster
+          
+          echo "CPU load test completed"
+      restartPolicy: Never
+  backoffLimit: 1
+

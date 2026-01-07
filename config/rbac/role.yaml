@@ -75,3 +75,11 @@ rules:
   - pods/exec
   verbs:
   - create
+- apiGroups:
+  - metrics.k8s.io
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch

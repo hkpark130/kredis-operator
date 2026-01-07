@@ -56,6 +56,71 @@ type ResourceRequirements struct {
 	Requests corev1.ResourceList `json:"requests,omitempty"`
 }
 
+// AutoscalingSpec defines autoscaling configuration for Kredis cluster
+type AutoscalingSpec struct {
+	// Enabled enables autoscaling
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// MinMasters is the minimum number of master nodes
+	// +kubebuilder:validation:Minimum=3
+	// +optional
+	MinMasters int32 `json:"minMasters,omitempty"`
+
+	// MaxMasters is the maximum number of master nodes
+	// +kubebuilder:validation:Minimum=3
+	// +optional
+	MaxMasters int32 `json:"maxMasters,omitempty"`
+
+	// MinReplicasPerMaster is the minimum number of replicas per master
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	MinReplicasPerMaster int32 `json:"minReplicasPerMaster,omitempty"`
+
+	// MaxReplicasPerMaster is the maximum number of replicas per master
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	MaxReplicasPerMaster int32 `json:"maxReplicasPerMaster,omitempty"`
+
+	// MemoryScaleUpThreshold is the memory usage percentage to trigger master scale up (0-100)
+	// When memory usage exceeds this threshold, masters are scaled up
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	MemoryScaleUpThreshold int32 `json:"memoryScaleUpThreshold,omitempty"`
+
+	// MemoryScaleDownThreshold is the memory usage percentage to trigger master scale down (0-100)
+	// When memory usage falls below this threshold, masters may be scaled down
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	MemoryScaleDownThreshold int32 `json:"memoryScaleDownThreshold,omitempty"`
+
+	// CPUScaleUpThreshold is the CPU usage percentage to trigger replica scale up (0-100)
+	// When CPU usage exceeds this threshold, replicas are scaled up
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	CPUScaleUpThreshold int32 `json:"cpuScaleUpThreshold,omitempty"`
+
+	// CPUScaleDownThreshold is the CPU usage percentage to trigger replica scale down (0-100)
+	// When CPU usage falls below this threshold, replicas may be scaled down
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	CPUScaleDownThreshold int32 `json:"cpuScaleDownThreshold,omitempty"`
+
+	// ScaleUpStabilizationWindowSeconds is the time window to wait before scaling up
+	// +kubebuilder:default=60
+	// +optional
+	ScaleUpStabilizationWindowSeconds int32 `json:"scaleUpStabilizationWindowSeconds,omitempty"`
+
+	// ScaleDownStabilizationWindowSeconds is the time window to wait before scaling down
+	// +kubebuilder:default=300
+	// +optional
+	ScaleDownStabilizationWindowSeconds int32 `json:"scaleDownStabilizationWindowSeconds,omitempty"`
+}
+
 // KredisSpec defines the desired state of Kredis
 type KredisSpec struct {
 	// Redis Master Node count
@@ -76,6 +141,10 @@ type KredisSpec struct {
 	// Resource requirements
 	// +optional
 	Resources ResourceRequirements `json:"resources,omitempty"`
+
+	// Autoscaling configuration for the Redis cluster
+	// +optional
+	Autoscaling AutoscalingSpec `json:"autoscaling,omitempty"`
 }
 
 // KredisStatus defines the observed state of Kredis
@@ -106,6 +175,18 @@ type KredisStatus struct {
 
 	// JoinedPods contains the list of pod names that have joined the cluster
 	JoinedPods []string `json:"joinedPods,omitempty"`
+
+	// CurrentMemoryUsagePercent is the current average memory usage percentage across masters
+	CurrentMemoryUsagePercent int32 `json:"currentMemoryUsagePercent,omitempty"`
+
+	// CurrentCPUUsagePercent is the current average CPU usage percentage across all nodes
+	CurrentCPUUsagePercent int32 `json:"currentCpuUsagePercent,omitempty"`
+
+	// LastScaleTime is the last time the cluster was scaled
+	LastScaleTime *metav1.Time `json:"lastScaleTime,omitempty"`
+
+	// LastScaleType indicates the last scale operation type (masters-up, masters-down, replicas-up, replicas-down)
+	LastScaleType string `json:"lastScaleType,omitempty"`
 }
 
 // ClusterNode represents a Redis node in the cluster
