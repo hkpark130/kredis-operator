@@ -36,7 +36,14 @@ func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha
 	}
 	logger.Info("Using pod for scaling command", "pod", commandPod.Name)
 
-	newPods := filterNewPods(pods, kredis.Status.JoinedPods)
+	// 리밸런싱 진행 중이면 스케일 작업 대기 (마스터 추가는 허용, 슬레이브만 대기)
+	isRebalancing := strings.Contains(lastOp, "rebalance-in-progress") ||
+		strings.Contains(lastOp, "reshard-in-progress")
+
+	// clusterState 기반으로 새 파드 필터링 (실제 Redis 클러스터 상태 사용)
+	// 이렇게 하면 여러 reconcile이 동시에 실행되어도 이미 클러스터에 조인된
+	// 노드를 중복으로 추가하려는 시도를 방지할 수 있음
+	newPods := filterNewPods(pods, clusterState)
 	if len(newPods) == 0 {
 		// 새 파드가 없으면 스케일 완료 확인
 		logger.Info("No new pods to add; checking scale completion")
@@ -58,6 +65,7 @@ func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha
 
 	if mastersNeeded > 0 {
 		// Phase 1: 마스터가 부족하면 마스터부터 추가
+		// 리밸런싱 중이어도 마스터 추가는 진행 (마스터가 모두 추가되어야 리밸런싱 가능)
 		targetPod = newPods[0]
 		isMaster = true
 		logger.Info("Phase 1: Adding master node", "pod", targetPod.Name, "mastersNeeded", mastersNeeded)
@@ -73,7 +81,15 @@ func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha
 			return nil
 		}
 
-		// Phase 3: 모든 마스터가 슬롯을 가지고 있으면 Slave 추가
+		// Phase 3: 슬레이브 추가 전 리밸런싱 완료 여부 확인
+		// 리밸런싱이 진행 중이면 슬레이브 추가를 대기
+		if isRebalancing {
+			logger.Info("Rebalancing in progress, waiting before adding slaves",
+				"lastOp", lastOp, "pendingSlaves", len(newPods))
+			return nil
+		}
+
+		// Phase 3: 모든 마스터가 슬롯을 가지고 있고 리밸런싱 완료됨 -> Slave 추가
 		targetPod = newPods[0]
 		isMaster = false
 		logger.Info("Phase 3: Adding slave node", "pod", targetPod.Name)
@@ -89,21 +105,33 @@ func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha
 		return cm.handleExistingNode(ctx, kredis, targetPod, commandPod, existingNode, isMaster, clusterState, delta)
 	}
 
-	// 5. 노드 리셋 필요 여부 체크 후 리셋 (최적화: 이미 깨끗한 노드는 스킵)
+	// 5. 노드 리셋 필요 여부 체크
+	// 중요: 파드가 ready가 아니면 리셋을 시도하지 않고 다음 reconcile에서 다시 확인
+	if !cm.isPodReady(targetPod) {
+		logger.Info("Pod not ready yet, waiting before checking reset status", "pod", targetPod.Name)
+		return nil
+	}
+
+	// 중요: 리셋 명령 실행 전에 상태를 먼저 저장하여 다음 reconcile에서 중복 리셋 방지
 	needsReset := cm.isNodeResetNeeded(ctx, targetPod, kredis.Spec.BasePort)
 	if needsReset {
+		// 리셋 전에 pending 상태를 먼저 설정하여 다음 reconcile에서 중복 리셋 방지
+		delta.LastClusterOperation = fmt.Sprintf("scale-reset-pending:%s:%v:%d", targetPod.Name, isMaster, time.Now().Unix())
+
 		if err := cm.resetNode(ctx, targetPod, kredis.Spec.BasePort); err != nil {
 			return err
 		}
+
+		// 리셋 명령 후 바로 완료 여부 확인
+		if !cm.isNodeReset(ctx, targetPod, kredis.Spec.BasePort) {
+			logger.Info("Node reset initiated, waiting for completion", "pod", targetPod.Name)
+			return nil
+		}
+		// 리셋이 즉시 완료된 경우 계속 진행
+		logger.Info("Node reset completed immediately", "pod", targetPod.Name)
 	}
 
-	// 6. Verify node is reset before adding to cluster
-	if !cm.isNodeReset(ctx, targetPod, kredis.Spec.BasePort) {
-		logger.Info("Node not yet reset, waiting for next reconcile", "pod", targetPod.Name)
-		// Store target pod info for next reconcile
-		delta.LastClusterOperation = fmt.Sprintf("scale-reset-pending:%s:%v:%d", targetPod.Name, isMaster, time.Now().Unix())
-		return nil
-	}
+	// 6. 리셋이 필요 없었거나 즉시 완료된 경우, 노드 추가 진행
 
 	// 7. 노드 추가
 	return cm.addNodeToCluster(ctx, kredis, targetPod, commandPod, isMaster, clusterState, delta)

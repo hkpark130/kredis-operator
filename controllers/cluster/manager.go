@@ -534,20 +534,6 @@ func (cm *ClusterManager) findMasterPod(pods []corev1.Pod, kredis *cachev1alpha1
 		}
 	}
 
-	// 2nd priority: any JoinedPods member that is ready
-	for _, podName := range kredis.Status.JoinedPods {
-		if pod, ok := podMap[podName]; ok && cm.isPodReady(pod) {
-			return &pod
-		}
-	}
-
-	// 3rd priority: fallback to any ready pod (for initial cluster creation)
-	for i := range pods {
-		if cm.isPodReady(pods[i]) {
-			return &pods[i]
-		}
-	}
-
 	return nil
 }
 
@@ -645,14 +631,20 @@ func (cm *ClusterManager) checkAllMastersHaveSlots(ctx context.Context, commandP
 	return masterCount == mastersWithSlots, nil
 }
 
-func filterNewPods(pods []corev1.Pod, joinedPods []string) []corev1.Pod {
-	joinedPodsSet := make(map[string]struct{})
-	for _, podName := range joinedPods {
-		joinedPodsSet[podName] = struct{}{}
+// filterNewPods returns pods that are NOT yet part of the Redis cluster.
+// Uses clusterState (actual Redis cluster state) for accurate detection,
+// preventing duplicate add-node attempts when multiple reconciles run concurrently.
+func filterNewPods(pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) []corev1.Pod {
+	// Build a set of pod names that are already in the cluster
+	clusterPodSet := make(map[string]struct{})
+	for _, node := range clusterState {
+		if node.PodName != "" {
+			clusterPodSet[node.PodName] = struct{}{}
+		}
 	}
 	var newPods []corev1.Pod
 	for _, pod := range pods {
-		if _, ok := joinedPodsSet[pod.Name]; !ok {
+		if _, ok := clusterPodSet[pod.Name]; !ok {
 			newPods = append(newPods, pod)
 		}
 	}

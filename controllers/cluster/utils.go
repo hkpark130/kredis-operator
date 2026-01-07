@@ -151,20 +151,6 @@ func (cm *ClusterManager) findMasterPodFromJoined(pods []corev1.Pod, kredis *cac
 		}
 	}
 
-	// 2nd priority: any JoinedPods member that is ready
-	for _, podName := range kredis.Status.JoinedPods {
-		if pod, ok := podMap[podName]; ok && cm.isPodReady(pod) {
-			return &pod
-		}
-	}
-
-	// 3rd priority: fallback to any ready pod (for initial cluster creation)
-	for i := range pods {
-		if cm.isPodReady(pods[i]) {
-			return &pods[i]
-		}
-	}
-
 	return nil
 }
 
