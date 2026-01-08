@@ -20,7 +20,7 @@ func (cm *ClusterManager) rebalanceCluster(ctx context.Context, kredis *cachev1a
 	logger := log.FromContext(ctx)
 	lastOp := kredis.Status.LastClusterOperation
 
-	masterPod := cm.findMasterPod(pods, kredis, clusterState)
+	masterPod := cm.findMasterPod(pods, clusterState)
 	if masterPod == nil {
 		return fmt.Errorf("no master pod found for rebalancing")
 	}

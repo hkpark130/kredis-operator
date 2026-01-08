@@ -21,19 +21,43 @@ spec:
           # 헤드리스 서비스 사용 (외부 서비스에서 접근하는 것과 동일한 방식)
           REDIS_HOST="kredis-sample-master.kredis-operator-system.svc.cluster.local"
           
-          # 100KB 크기의 값을 20000개 삽입 (약 2GB, 클러스터에 분산됨)
-          # 512Mi * 70% = 358MB per node, 3 masters = 약 1GB 이상 필요
-          for i in $(seq 1 200000); do
-            VALUE=$(head -c 1024000 /dev/urandom | base64 | head -c 1024000)
-            redis-cli -c -h $REDIS_HOST -p 6379 SET "loadtest:key:$i" "$VALUE" > /dev/null 2>&1
-            if [ $((i % 2000)) -eq 0 ]; then
+          # 먼저 연결 테스트
+          echo "Testing connection..."
+          redis-cli -c -h $REDIS_HOST -p 6379 PING
+          if [ $? -ne 0 ]; then
+            echo "Failed to connect to Redis!"
+            exit 1
+          fi
+          
+          echo "Cluster info:"
+          redis-cli -c -h $REDIS_HOST -p 6379 CLUSTER INFO | head -5
+          
+          # 10KB 크기의 값을 50000개 삽입 (약 500MB, 클러스터에 분산됨)
+          # maxmemory 700Mi의 20% = 140MB per node, 3 masters = 420MB 필요
+          VALUE_SIZE=10240  # 10KB
+          echo "Generating ${VALUE_SIZE} byte value..."
+          VALUE=$(head -c $VALUE_SIZE /dev/urandom | base64 | head -c $VALUE_SIZE)
+          
+          echo "Starting data insertion..."
+          for i in $(seq 1 50000); do
+            RESULT=$(redis-cli -c -h $REDIS_HOST -p 6379 SET "loadtest:key:$i" "$VALUE" 2>&1)
+            if [ "$RESULT" != "OK" ]; then
+              echo "Error on key $i: $RESULT"
+            fi
+            if [ $((i % 1000)) -eq 0 ]; then
               echo "Inserted $i keys..."
-              # 현재 메모리 사용량 확인
               redis-cli -c -h $REDIS_HOST -p 6379 INFO memory | grep used_memory_human
+              redis-cli -c -h $REDIS_HOST -p 6379 DBSIZE
             fi
           done
           
-          echo "Memory load test completed. Data will be kept for 10 minutes..."
+          echo "Memory load test completed!"
+          echo "Final memory usage:"
+          redis-cli -c -h $REDIS_HOST -p 6379 INFO memory | grep used_memory
+          echo "Total keys:"
+          redis-cli -c -h $REDIS_HOST -p 6379 DBSIZE
+          
+          echo "Data will be kept for 10 minutes..."
           sleep 600
       restartPolicy: Never
   backoffLimit: 1

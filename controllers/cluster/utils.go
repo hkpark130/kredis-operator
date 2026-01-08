@@ -132,28 +132,6 @@ func (cm *ClusterManager) resetNodeIfNeeded(ctx context.Context, pod corev1.Pod,
 	return true, nil
 }
 
-// findMasterPod returns a ready master pod from JoinedPods if possible, otherwise any ready pod.
-// Priority: JoinedPods masters > JoinedPods non-masters > any ready pod
-// This ensures we use known cluster members for commands rather than new unjoined pods.
-func (cm *ClusterManager) findMasterPodFromJoined(pods []corev1.Pod, kredis *cachev1alpha1.Kredis, clusterState []cachev1alpha1.ClusterNode) *corev1.Pod {
-	joinedPodsSet := buildJoinedPodsSet(kredis.Status.JoinedPods)
-	podMap := make(map[string]corev1.Pod)
-	for _, p := range pods {
-		podMap[p.Name] = p
-	}
-
-	// 1st priority: JoinedPods masters
-	for _, node := range clusterState {
-		if _, isJoined := joinedPodsSet[node.PodName]; isJoined && node.Role == "master" {
-			if pod, ok := podMap[node.PodName]; ok && cm.isPodReady(pod) {
-				return &pod
-			}
-		}
-	}
-
-	return nil
-}
-
 // areAllNodesReset checks if all nodes have completed FLUSHALL + CLUSTER RESET.
 // This is used during cluster creation to verify all nodes are clean before proceeding.
 func (cm *ClusterManager) areAllNodesReset(ctx context.Context, pods []corev1.Pod, port int32) bool {
@@ -222,72 +200,4 @@ func findNodeByID(nodeID string, clusterState []cachev1alpha1.ClusterNode) *cach
 		}
 	}
 	return nil
-}
-
-// ========================================
-// JoinedPods cleanup functions
-// ========================================
-
-// CleanupStaleJoinedPods removes pod names from JoinedPods that:
-// 1. No longer exist as actual pods
-// 2. Are no longer part of the Redis cluster (based on clusterState)
-// Returns the cleaned list of JoinedPods.
-func (cm *ClusterManager) CleanupStaleJoinedPods(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) []string {
-	logger := log.FromContext(ctx)
-
-	if len(kredis.Status.JoinedPods) == 0 {
-		return nil
-	}
-
-	// Build sets for quick lookup
-	existingPodNames := make(map[string]struct{})
-	for _, pod := range pods {
-		existingPodNames[pod.Name] = struct{}{}
-	}
-
-	// Build set of pods that are actually in the cluster (have a NodeID)
-	clusterMemberPods := make(map[string]struct{})
-	for _, node := range clusterState {
-		if node.NodeID != "" && node.Status == "connected" {
-			clusterMemberPods[node.PodName] = struct{}{}
-		}
-	}
-
-	// Filter JoinedPods
-	var cleanedJoinedPods []string
-	var removedPods []string
-
-	for _, podName := range kredis.Status.JoinedPods {
-		// Check 1: Pod still exists?
-		if _, exists := existingPodNames[podName]; !exists {
-			removedPods = append(removedPods, podName+" (pod deleted)")
-			continue
-		}
-
-		// Check 2: Pod is still in cluster? (has NodeID and is connected)
-		// Note: If clusterState is empty/incomplete, we keep the pod to be safe
-		if len(clusterState) > 0 {
-			if _, inCluster := clusterMemberPods[podName]; !inCluster {
-				// Double check - if the pod exists but has no NodeID, it might be a new pod
-				// that's being added. Only remove if it was previously in cluster but now isn't.
-				// For safety, only remove if pod exists but is not in cluster AND cluster has members
-				if len(clusterMemberPods) > 0 {
-					removedPods = append(removedPods, podName+" (not in cluster)")
-					continue
-				}
-			}
-		}
-
-		// Pod is valid, keep it
-		cleanedJoinedPods = append(cleanedJoinedPods, podName)
-	}
-
-	if len(removedPods) > 0 {
-		logger.Info("Cleaned up stale JoinedPods",
-			"removed", removedPods,
-			"remaining", len(cleanedJoinedPods),
-			"original", len(kredis.Status.JoinedPods))
-	}
-
-	return cleanedJoinedPods
 }

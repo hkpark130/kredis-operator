@@ -300,9 +300,6 @@ func (r *KredisReconciler) updateStatus(ctx context.Context, kredis *cachev1alph
 			if delta.KnownClusterNodes != nil {
 				currentKredis.Status.KnownClusterNodes = *delta.KnownClusterNodes
 			}
-			if len(delta.JoinedPods) > 0 {
-				currentKredis.Status.JoinedPods = mergeUnique(currentKredis.Status.JoinedPods, delta.JoinedPods)
-			}
 			if len(delta.ClusterNodes) > 0 {
 				currentKredis.Status.ClusterNodes = delta.ClusterNodes
 			}
@@ -386,25 +383,6 @@ func (r *KredisReconciler) calculateStatus(kredis *cachev1alpha1.Kredis, sts *ap
 	newStatus.Conditions = []metav1.Condition{condition}
 
 	return *newStatus
-}
-
-// mergeUnique returns a union of two string slices, preserving existing order where possible.
-func mergeUnique(base []string, add []string) []string {
-	set := map[string]struct{}{}
-	out := make([]string, 0, len(base)+len(add))
-	for _, v := range base {
-		if _, ok := set[v]; !ok {
-			set[v] = struct{}{}
-			out = append(out, v)
-		}
-	}
-	for _, v := range add {
-		if _, ok := set[v]; !ok {
-			set[v] = struct{}{}
-			out = append(out, v)
-		}
-	}
-	return out
 }
 
 // getKredisPods returns all pods belonging to this Kredis instance

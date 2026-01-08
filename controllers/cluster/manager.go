@@ -44,7 +44,6 @@ const (
 type ClusterStatusDelta struct {
 	LastClusterOperation string
 	KnownClusterNodes    *int
-	JoinedPods           []string
 	ClusterNodes         []cachev1alpha1.ClusterNode
 	ClusterState         string
 }
@@ -74,14 +73,7 @@ func (cm *ClusterManager) ReconcileCluster(ctx context.Context, kredis *cachev1a
 	// 4. Provide discovered nodes via delta
 	delta.ClusterNodes = clusterState
 
-	// 4.1 Cleanup stale JoinedPods (pods that no longer exist or left the cluster)
-	cleanedJoinedPods := cm.CleanupStaleJoinedPods(ctx, kredis, pods, clusterState)
-	if cleanedJoinedPods != nil && len(cleanedJoinedPods) != len(kredis.Status.JoinedPods) {
-		// JoinedPods changed, update via delta
-		delta.JoinedPods = cleanedJoinedPods
-	}
-
-	// 4.2 Sync pod role labels based on discovered cluster state (dynamic update)
+	// 4.1 Sync pod role labels based on discovered cluster state (dynamic update)
 	cm.SyncPodRoleLabels(ctx, kredis, clusterState)
 
 	// 5. Determine what operation is needed based on the discovered state
@@ -177,20 +169,23 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 	}
 
 	// --- Analyze the discovered state to distinguish between new pods and cluster members ---
+	// Use clusterState directly (real-time Redis cluster state) instead of JoinedPods
+	// This prevents race conditions in concurrent reconciles
 	var masterNodes []cachev1alpha1.ClusterNode
 	var clusterMembers []cachev1alpha1.ClusterNode
 	podMap := make(map[string]corev1.Pod)
+	ourPodsSet := make(map[string]struct{})
 	for _, pod := range pods {
 		podMap[pod.Name] = pod
+		ourPodsSet[pod.Name] = struct{}{}
 	}
 
-	// kredis.Status.JoinedPods를 사용하여 클러스터 멤버를 식별합니다.
-	// Use helper function to avoid duplicating slice-to-set conversion.
-	joinedPodsSet := buildJoinedPodsSet(kredis.Status.JoinedPods)
-
 	for _, node := range clusterState {
-		// A node is considered a member only if its name is in JoinedPods.
-		if _, isJoined := joinedPodsSet[node.PodName]; isJoined {
+		// A node is considered a cluster member if:
+		// 1. It's one of our pods (in the current pod list)
+		// 2. It has a valid NodeID (actually joined the cluster)
+		// 3. It has a known role (master/slave, not "unknown")
+		if _, isOurs := ourPodsSet[node.PodName]; isOurs && node.NodeID != "" && node.Role != "unknown" && node.Role != "" {
 			clusterMembers = append(clusterMembers, node)
 			if node.Role == "master" {
 				masterNodes = append(masterNodes, node)
@@ -314,9 +309,9 @@ func (cm *ClusterManager) isClusterAlreadyExists(ctx context.Context, kredis *ca
 	port := kredis.Spec.BasePort
 
 	// Find a ready pod to query for cluster info.
-	// Priority: JoinedPods first (known cluster members), then any ready pod.
+	// Priority: cluster members first (from clusterState), then any ready pod.
 	// This prevents new unjoined pods (e.g., pod-0) from being selected over existing cluster members.
-	queryPod := cm.findQueryPod(pods, kredis.Status.JoinedPods, port)
+	queryPod := cm.findQueryPod(pods, clusterState, port)
 	if queryPod == nil {
 		// Not an error, just means we can't check yet.
 		logger.Info("No ready pods available to check cluster existence")
@@ -377,9 +372,9 @@ func (cm *ClusterManager) discoverClusterState(ctx context.Context, kredis *cach
 	port := kredis.Spec.BasePort
 
 	// Find a single ready pod to query cluster state.
-	// Priority: JoinedPods first (known cluster members), then any ready pod.
-	// This prevents new unjoined pods from returning incomplete cluster info.
-	queryPod := cm.findQueryPod(pods, kredis.Status.JoinedPods, port)
+	// For initial discovery, we don't have clusterState yet, so pass nil.
+	// findQueryPod will fall back to any ready pod.
+	queryPod := cm.findQueryPod(pods, nil, port)
 
 	// If no ready pod found, return all pods as pending
 	if queryPod == nil {
@@ -493,19 +488,27 @@ func (cm *ClusterManager) areAllNodesKnown(ctx context.Context, commandPod corev
 	return knownNodes == expectedCount
 }
 
-// findMasterPod returns a ready master pod from JoinedPods if possible, otherwise any ready pod.
-// Priority: JoinedPods masters > JoinedPods members > any ready pod
-// This ensures we use known cluster members for commands rather than new unjoined pods.
-func (cm *ClusterManager) findMasterPod(pods []corev1.Pod, kredis *cachev1alpha1.Kredis, clusterState []cachev1alpha1.ClusterNode) *corev1.Pod {
-	joinedPodsSet := buildJoinedPodsSet(kredis.Status.JoinedPods)
+// findMasterPod returns a ready master pod from the cluster.
+// Priority: cluster masters with slots > cluster masters > any cluster member
+// Uses clusterState (real-time Redis state) to ensure we select actual cluster members.
+func (cm *ClusterManager) findMasterPod(pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) *corev1.Pod {
 	podMap := make(map[string]corev1.Pod)
 	for _, p := range pods {
 		podMap[p.Name] = p
 	}
 
-	// 1st priority: JoinedPods masters
+	// 1st priority: Masters with slots (most reliable for commands)
 	for _, node := range clusterState {
-		if _, isJoined := joinedPodsSet[node.PodName]; isJoined && node.Role == "master" {
+		if node.Role == "master" && node.NodeID != "" && node.SlotCount > 0 {
+			if pod, ok := podMap[node.PodName]; ok && cm.isPodReady(pod) {
+				return &pod
+			}
+		}
+	}
+
+	// 2nd priority: Any master in the cluster
+	for _, node := range clusterState {
+		if node.Role == "master" && node.NodeID != "" {
 			if pod, ok := podMap[node.PodName]; ok && cm.isPodReady(pod) {
 				return &pod
 			}
@@ -516,29 +519,48 @@ func (cm *ClusterManager) findMasterPod(pods []corev1.Pod, kredis *cachev1alpha1
 }
 
 // findQueryPod selects the best pod to query for cluster state.
-// Priority: JoinedPods (known cluster members) first, then any ready pod.
+// Priority: cluster members (from clusterState) first, then any ready pod.
 // This prevents newly created pods (not yet joined) from being selected,
 // which would return incomplete cluster info (e.g., cluster_state:fail).
-func (cm *ClusterManager) findQueryPod(pods []corev1.Pod, joinedPods []string, port int32) *corev1.Pod {
-	joinedPodsSet := buildJoinedPodsSet(joinedPods)
+func (cm *ClusterManager) findQueryPod(pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode, port int32) *corev1.Pod {
 	podMap := make(map[string]corev1.Pod)
 	for _, p := range pods {
 		podMap[p.Name] = p
 	}
 
-	// First priority: Select from JoinedPods (known cluster members)
-	for _, podName := range joinedPods {
-		if pod, ok := podMap[podName]; ok {
-			if cm.isPodReady(pod) && cm.PodExecutor.IsRedisReady(context.Background(), pod, port) {
-				return &pod
+	// Build set of pods that are actually in the cluster (have NodeID)
+	clusterMemberSet := make(map[string]struct{})
+	for _, node := range clusterState {
+		if node.NodeID != "" && node.Role != "unknown" && node.Role != "" {
+			clusterMemberSet[node.PodName] = struct{}{}
+		}
+	}
+
+	// First priority: Select from cluster members (masters first)
+	for _, node := range clusterState {
+		if node.Role == "master" && node.NodeID != "" {
+			if pod, ok := podMap[node.PodName]; ok {
+				if cm.isPodReady(pod) && cm.PodExecutor.IsRedisReady(context.Background(), pod, port) {
+					return &pod
+				}
 			}
 		}
 	}
 
-	// Second priority: Any ready pod (fallback for initial cluster creation)
+	// Second priority: Any cluster member
+	for _, node := range clusterState {
+		if node.NodeID != "" {
+			if pod, ok := podMap[node.PodName]; ok {
+				if cm.isPodReady(pod) && cm.PodExecutor.IsRedisReady(context.Background(), pod, port) {
+					return &pod
+				}
+			}
+		}
+	}
+
+	// Third priority: Any ready pod (fallback for initial cluster creation)
 	for i := range pods {
-		if _, isJoined := joinedPodsSet[pods[i].Name]; !isJoined {
-			// Skip joined pods (already checked above)
+		if _, isMember := clusterMemberSet[pods[i].Name]; !isMember {
 			if cm.isPodReady(pods[i]) && cm.PodExecutor.IsRedisReady(context.Background(), pods[i], port) {
 				return &pods[i]
 			}
@@ -546,16 +568,6 @@ func (cm *ClusterManager) findQueryPod(pods []corev1.Pod, joinedPods []string, p
 	}
 
 	return nil
-}
-
-// buildJoinedPodsSet creates a set from JoinedPods slice for O(1) lookup.
-// Use this helper to avoid duplicating slice-to-set conversion logic.
-func buildJoinedPodsSet(joinedPods []string) map[string]struct{} {
-	set := make(map[string]struct{}, len(joinedPods))
-	for _, podName := range joinedPods {
-		set[podName] = struct{}{}
-	}
-	return set
 }
 
 func (cm *ClusterManager) getActualMasterCount(ctx context.Context, pods []corev1.Pod, port int32) (int, error) {
@@ -631,15 +643,6 @@ func filterNewPods(pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) 
 		}
 	}
 	return newPods
-}
-
-func containsString(slice []string, s string) bool {
-	for _, v := range slice {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }
 
 // SyncPodRoleLabels: discovered cluster state 를 바탕으로 각 파드의 role 라벨(master/replica/unknown)을 동기화

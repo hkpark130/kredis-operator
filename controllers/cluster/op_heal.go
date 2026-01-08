@@ -17,7 +17,7 @@ func (cm *ClusterManager) healCluster(ctx context.Context, kredis *cachev1alpha1
 	delta.LastClusterOperation = fmt.Sprintf("heal-in-progress:%d", time.Now().Unix())
 	delta.ClusterState = string(cachev1alpha1.ClusterStateHealing)
 
-	masterPod := cm.findMasterPod(pods, kredis, clusterState)
+	masterPod := cm.findMasterPod(pods, clusterState)
 	if masterPod == nil {
 		return fmt.Errorf("failed to find a master pod for heal")
 	}

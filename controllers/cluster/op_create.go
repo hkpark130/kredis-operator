@@ -81,8 +81,6 @@ func (cm *ClusterManager) createClusterJob(ctx context.Context, kredis *cachev1a
 	logger.Info("Node list for cluster creation", "nodeAddrs", strings.Join(nodeAddrs, " "), "nodeCount", len(nodeAddrs))
 
 	// Create the cluster creation Job
-	// Note: JoinedPods is NOT set here - it will be set after cluster creation succeeds
-	// because JoinedPods represents pods that have actually joined the cluster
 	if err := cm.JobManager.CreateClusterJob(ctx, kredis, nodeAddrs, int(kredis.Spec.Replicas)); err != nil {
 		return fmt.Errorf("failed to create cluster job: %w", err)
 	}
@@ -97,9 +95,6 @@ func (cm *ClusterManager) createClusterJob(ctx context.Context, kredis *cachev1a
 // checkCreateJobAndFinalize checks the cluster creation Job status and finalizes if complete.
 func (cm *ClusterManager) checkCreateJobAndFinalize(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, delta *ClusterStatusDelta) error {
 	logger := log.FromContext(ctx)
-
-	// Note: JoinedPods is intentionally NOT set here during in-progress state
-	// It will only be set after cluster creation succeeds in verifyClusterCreation()
 
 	// Check Job status
 	jobResult, err := cm.JobManager.GetJobStatus(ctx, kredis, JobTypeCreate)
@@ -169,22 +164,9 @@ func (cm *ClusterManager) verifyClusterCreation(ctx context.Context, kredis *cac
 	delta.LastClusterOperation = fmt.Sprintf("create-success:%d", time.Now().Unix())
 	delta.ClusterState = string(cachev1alpha1.ClusterStateInitialized)
 
-	// Ensure JoinedPods is set
-	if len(delta.JoinedPods) == 0 {
-		var joinedPodNames []string
-		for _, pod := range pods {
-			if pod.Status.PodIP != "" {
-				joinedPodNames = append(joinedPodNames, pod.Name)
-			}
-		}
-		delta.JoinedPods = joinedPodNames
-		known := len(pods)
-		delta.KnownClusterNodes = &known
-	} else {
-		// 비정상 케이스: 이미 JoinedPods가 설정되어 있음
-		logger.Info("WARNING: JoinedPods already set during cluster creation !!",
-			"existingJoinedPods", delta.JoinedPods)
-	}
+	// Set known cluster nodes count
+	known := len(pods)
+	delta.KnownClusterNodes = &known
 
 	// Cleanup completed jobs
 	_ = cm.JobManager.CleanupCompletedJobs(ctx, kredis)
