@@ -36,6 +36,7 @@ type ClusterOperation string
 const (
 	OperationCreate    ClusterOperation = "create"
 	OperationScale     ClusterOperation = "scale"
+	OperationScaleDown ClusterOperation = "scaledown"
 	OperationRebalance ClusterOperation = "rebalance"
 	OperationHeal      ClusterOperation = "heal"
 )
@@ -46,6 +47,10 @@ type ClusterStatusDelta struct {
 	KnownClusterNodes    *int
 	ClusterNodes         []cachev1alpha1.ClusterNode
 	ClusterState         string
+	// Scale-down related fields
+	PendingScaleDown           []cachev1alpha1.ScaleDownNode
+	ScaleDownReady             *bool
+	DesiredStatefulSetReplicas *int32
 }
 
 // ReconcileCluster manages the Redis cluster state and returns whether cluster is ready
@@ -161,6 +166,16 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 			"currentTime", time.Now().Unix())
 		return OperationHeal
 	}
+	if strings.Contains(lastOp, "scaledown-migrate-in-progress") ||
+		strings.Contains(lastOp, "scaledown-forget-in-progress") ||
+		strings.Contains(lastOp, "scaledown-in-progress") ||
+		strings.Contains(lastOp, "scaledown-migrate-retry") {
+		// 스케일다운 작업 진행 중
+		logger.Info("Scale-down in progress - will continue",
+			"lastOperation", lastOp,
+			"currentTime", time.Now().Unix())
+		return OperationScaleDown
+	}
 	if cm.isOperationInProgress(ctx, kredis, pods) {
 		logger.Info("Operation already in progress - skipping new operation",
 			"lastOperation", lastOp,
@@ -239,20 +254,36 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 		return OperationScale
 	}
 
-	// Scale-down condition (NOT YET IMPLEMENTED - critical limitations exist)
-	// WARNING: Scale-down is complex and requires:
-	// 1. Resharding slots from nodes to be removed to remaining nodes
-	// 2. Removing nodes from cluster using CLUSTER FORGET
-	// 3. Waiting for cluster to stabilize before deleting pods
-	// 4. Handling replicas of removed masters
-	// Current implementation does NOT support scale-down safely!
+	// Scale-down condition: More nodes in cluster than expected
+	// This is detected when:
+	// 1. currentJoinedNodes > expectedTotalNodes (spec changed to reduce nodes)
+	// 2. OR len(pods) > expectedTotalNodes (pods exist but need to be removed)
+	// Scale-down process:
+	// 1. Migrate slots from masters being removed (reshard with weight=0)
+	// 2. Execute CLUSTER FORGET on all remaining nodes
+	// 3. Set ScaleDownReady=true in status
+	// 4. Controller then shrinks StatefulSet
 	if currentJoinedNodes > int(expectedTotalNodes) {
-		logger.Info("WARNING: Node count higher than expected - scale down NOT IMPLEMENTED",
+		logger.Info("Cluster has more nodes than expected - initiating scale-down",
 			"currentJoined", currentJoinedNodes,
 			"expected", expectedTotalNodes,
-			"action", "manual intervention required")
-		// TODO: Implement OperationScaleDown
-		// For now, we do NOT return OperationScale as that would try to add more nodes
+			"action", "OperationScaleDown")
+		return OperationScaleDown
+	}
+
+	// Also check if there are pending scale-down nodes that need to be processed
+	if len(kredis.Status.PendingScaleDown) > 0 {
+		allCompleted := true
+		for _, node := range kredis.Status.PendingScaleDown {
+			if node.Phase != "completed" {
+				allCompleted = false
+				break
+			}
+		}
+		if !allCompleted {
+			logger.Info("Pending scale-down nodes exist - continuing scale-down")
+			return OperationScaleDown
+		}
 	}
 
 	// Heal condition: Check for failed nodes in the cluster state
@@ -279,6 +310,9 @@ func (cm *ClusterManager) executeClusterOperation(ctx context.Context, kredis *c
 	case OperationScale:
 		// Pass the already discovered state to the scale function
 		return cm.scaleCluster(ctx, kredis, pods, clusterState, delta)
+	case OperationScaleDown:
+		// Scale-down: safely remove nodes from cluster before pod deletion
+		return cm.scaleDownCluster(ctx, kredis, pods, clusterState, delta)
 	case OperationRebalance:
 		// Pass the already discovered state to the rebalance function
 		return cm.rebalanceCluster(ctx, kredis, pods, clusterState, delta)

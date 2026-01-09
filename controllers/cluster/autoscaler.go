@@ -302,9 +302,25 @@ func (a *Autoscaler) evaluateScalingDecision(kredis *cachev1alpha1.Kredis, memor
 		}
 	}
 
-	// NOTE: Scale-down masters is NOT supported yet
-	// Requires: reshard slots away → CLUSTER FORGET → delete pod
-	// Skipping scale-down decision to avoid noisy logs
+	// Priority 1.5: Memory-based master scale-down (when memory usage is low)
+	// Scale down masters when memory is consistently low
+	memScaleDown := spec.MemoryScaleDownThreshold
+	if memScaleDown == 0 {
+		memScaleDown = 30 // Default 30%
+	}
+	minMasters := spec.MinMasters
+	if minMasters == 0 {
+		minMasters = 3 // Minimum 3 masters for Redis Cluster
+	}
+	if memoryPercent <= memScaleDown && currentMasters > minMasters {
+		newMasters := currentMasters - 1
+		return AutoscaleDecision{
+			ShouldScale: true,
+			ScaleType:   "masters-down",
+			NewMasters:  newMasters,
+			Reason:      fmt.Sprintf("Memory usage %d%% <= threshold %d%%, scaling masters %d -> %d", memoryPercent, memScaleDown, currentMasters, newMasters),
+		}
+	}
 
 	// Priority 2: CPU-based replica scaling (for read capacity)
 	// Scale up replicas when CPU is high
@@ -318,9 +334,22 @@ func (a *Autoscaler) evaluateScalingDecision(kredis *cachev1alpha1.Kredis, memor
 		}
 	}
 
-	// NOTE: Scale-down replicas is NOT supported yet
-	// Requires: CLUSTER FORGET → delete pod
-	// Skipping scale-down decision to avoid noisy logs
+	// Priority 2.5: CPU-based replica scale-down (when CPU usage is low)
+	cpuScaleDown := spec.CPUScaleDownThreshold
+	if cpuScaleDown == 0 {
+		cpuScaleDown = 30 // Default 30%
+	}
+	minReplicas := spec.MinReplicasPerMaster
+	// minReplicas can be 0 (no replicas), so no default needed
+	if cpuPercent <= cpuScaleDown && currentReplicas > minReplicas {
+		newReplicas := currentReplicas - 1
+		return AutoscaleDecision{
+			ShouldScale: true,
+			ScaleType:   "replicas-down",
+			NewReplicas: newReplicas,
+			Reason:      fmt.Sprintf("CPU usage %d%% <= threshold %d%%, scaling replicas %d -> %d", cpuPercent, cpuScaleDown, currentReplicas, newReplicas),
+		}
+	}
 
 	return AutoscaleDecision{
 		ShouldScale: false,
@@ -344,9 +373,15 @@ func (a *Autoscaler) ApplyAutoscaling(ctx context.Context, kredis *cachev1alpha1
 	case "masters-up":
 		kredis.Spec.Masters = decision.NewMasters
 		logger.Info("Applying master scale-up", "newMasters", decision.NewMasters, "reason", decision.Reason)
+	case "masters-down":
+		kredis.Spec.Masters = decision.NewMasters
+		logger.Info("Applying master scale-down", "newMasters", decision.NewMasters, "reason", decision.Reason)
 	case "replicas-up":
 		kredis.Spec.Replicas = decision.NewReplicas
 		logger.Info("Applying replica scale-up", "newReplicas", decision.NewReplicas, "reason", decision.Reason)
+	case "replicas-down":
+		kredis.Spec.Replicas = decision.NewReplicas
+		logger.Info("Applying replica scale-down", "newReplicas", decision.NewReplicas, "reason", decision.Reason)
 	default:
 		// Unsupported scale type - should not happen
 		logger.Info("Unsupported scale type", "scaleType", decision.ScaleType)

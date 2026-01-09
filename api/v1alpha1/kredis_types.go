@@ -31,8 +31,10 @@ const (
 	ClusterStateInitialized ClusterState = "Initialized"
 	// ClusterStateRunning - 정상 동작 중
 	ClusterStateRunning ClusterState = "Running"
-	// ClusterStateScaling - 스케일링 중
+	// ClusterStateScaling - 스케일링 중 (스케일업)
 	ClusterStateScaling ClusterState = "Scaling"
+	// ClusterStateScalingDown - 스케일다운 중 (노드 제거)
+	ClusterStateScalingDown ClusterState = "ScalingDown"
 	// ClusterStateRebalancing - 리밸런싱 중
 	ClusterStateRebalancing ClusterState = "Rebalancing"
 	// ClusterStateHealing - 복구 중
@@ -187,6 +189,41 @@ type KredisStatus struct {
 
 	// LastScaleType indicates the last scale operation type (masters-up, masters-down, replicas-up, replicas-down)
 	LastScaleType string `json:"lastScaleType,omitempty"`
+
+	// PendingScaleDown contains nodes waiting to be removed from the cluster.
+	// These nodes must complete data migration (reshard) and cluster forget before pod deletion.
+	// Format: list of node IDs that are being removed
+	// +optional
+	PendingScaleDown []ScaleDownNode `json:"pendingScaleDown,omitempty"`
+
+	// ScaleDownReady indicates that all scale-down operations are complete and StatefulSet can be shrunk.
+	// This is set to true when all nodes in PendingScaleDown have been safely removed from the cluster.
+	// +optional
+	ScaleDownReady bool `json:"scaleDownReady,omitempty"`
+
+	// DesiredStatefulSetReplicas stores the target replica count after scale-down is complete.
+	// This is used to prevent premature StatefulSet updates during scale-down.
+	// +optional
+	DesiredStatefulSetReplicas *int32 `json:"desiredStatefulSetReplicas,omitempty"`
+}
+
+// ScaleDownNode represents a node being removed during scale-down
+type ScaleDownNode struct {
+	// NodeID is the Redis cluster node ID to be removed
+	NodeID string `json:"nodeId"`
+
+	// PodName is the name of the pod to be deleted
+	PodName string `json:"podName"`
+
+	// Role is the role of the node (master/slave)
+	Role string `json:"role"`
+
+	// Phase indicates the current phase of scale-down for this node
+	// Values: pending, resharding, forgetting, completed
+	Phase string `json:"phase"`
+
+	// SlotsMigrated indicates how many slots have been migrated (for masters)
+	SlotsMigrated int `json:"slotsMigrated,omitempty"`
 }
 
 // ClusterNode represents a Redis node in the cluster

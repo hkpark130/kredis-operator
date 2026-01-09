@@ -21,10 +21,12 @@ import (
 type JobType string
 
 const (
-	JobTypeCreate    JobType = "create"
-	JobTypeReshard   JobType = "reshard"
-	JobTypeRebalance JobType = "rebalance"
-	JobTypeAddNode   JobType = "add-node"
+	JobTypeCreate          JobType = "create"
+	JobTypeReshard         JobType = "reshard"
+	JobTypeRebalance       JobType = "rebalance"
+	JobTypeAddNode         JobType = "add-node"
+	JobTypeScaleDownMigrate JobType = "scaledown-migrate" // Migrate slots from master to be removed
+	JobTypeScaleDownForget  JobType = "scaledown-forget"  // Remove node from cluster
 )
 
 // JobManager handles creation and monitoring of cluster operation jobs
@@ -279,6 +281,137 @@ func (jm *JobManager) CreateAddNodeJob(ctx context.Context, kredis *cachev1alpha
 
 	logger.Info("Created add-node job", "job", jobName, "newPod", newPodAddr, "isSlave", masterID != "")
 	return nil
+}
+
+// CreateScaleDownMigrateJob creates a Job to migrate all slots from a master node to other masters.
+// This is used during scale-down to safely evacuate data from a master before removal.
+// The --cluster-slots parameter uses the total slots held by the source node.
+func (jm *JobManager) CreateScaleDownMigrateJob(ctx context.Context, kredis *cachev1alpha1.Kredis, sourceNodeID string, sourceAddr string, clusterAddr string, slotsToMigrate int) error {
+	logger := log.FromContext(ctx)
+
+	jobName := jm.generateJobName(kredis, JobTypeScaleDownMigrate, sourceNodeID)
+
+	// Check if job already exists
+	existingJob := &batchv1.Job{}
+	if err := jm.Get(ctx, client.ObjectKey{Namespace: kredis.Namespace, Name: jobName}, existingJob); err == nil {
+		logger.Info("Scale-down migrate job already exists", "job", jobName)
+		return nil
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to check existing job: %w", err)
+	}
+
+	// Build reshard command to migrate ALL slots from the source node to other masters
+	// This will distribute the slots evenly across remaining masters
+	// We use --cluster-from <sourceNodeID> and --cluster-to <any-remaining-master>
+	// But for scale-down, we need to migrate TO multiple targets, so we use a different approach:
+	// redis-cli --cluster reshard <cluster-addr> --cluster-from <source> --cluster-to <target> --cluster-slots <slots> --cluster-yes
+	// Since we want to evacuate ALL slots from source, we iterate or use rebalance with weights
+	// For simplicity, we use reshard with "all" remaining masters by running rebalance with --cluster-weight <source>=0
+
+	// Actually, the best approach for scale-down is to use:
+	// redis-cli --cluster rebalance <addr> --cluster-weight <sourceNodeID>=0 --cluster-use-empty-masters
+	// This will move all slots away from the source node
+
+	command := []string{
+		"redis-cli",
+		"--cluster", "rebalance", clusterAddr,
+		"--cluster-weight", fmt.Sprintf("%s=0", sourceNodeID),
+		"--cluster-use-empty-masters",
+		"--cluster-pipeline", "100",
+		"--cluster-yes",
+	}
+
+	job := resource.BuildClusterOperationJob(kredis, jobName, string(JobTypeScaleDownMigrate), sourceNodeID, command)
+
+	if err := jm.Create(ctx, job); err != nil {
+		return fmt.Errorf("failed to create scale-down migrate job: %w", err)
+	}
+
+	logger.Info("Created scale-down migrate job", "job", jobName, "sourceNode", sourceNodeID, "slots", slotsToMigrate)
+	return nil
+}
+
+// CreateScaleDownForgetJob creates a Job to remove a node from the cluster using CLUSTER FORGET.
+// This must be executed on every remaining node in the cluster.
+// The job runs a script that iterates over all cluster nodes and executes CLUSTER FORGET.
+func (jm *JobManager) CreateScaleDownForgetJob(ctx context.Context, kredis *cachev1alpha1.Kredis, nodeIDToForget string, clusterAddr string) error {
+	logger := log.FromContext(ctx)
+
+	jobName := jm.generateJobName(kredis, JobTypeScaleDownForget, nodeIDToForget)
+
+	// Check if job already exists
+	existingJob := &batchv1.Job{}
+	if err := jm.Get(ctx, client.ObjectKey{Namespace: kredis.Namespace, Name: jobName}, existingJob); err == nil {
+		logger.Info("Scale-down forget job already exists", "job", jobName)
+		return nil
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to check existing job: %w", err)
+	}
+
+	// Build forget command
+	// CLUSTER FORGET must be executed from every remaining node in the cluster
+	// We'll use redis-cli --cluster call to execute on all nodes
+	// redis-cli --cluster call <addr> CLUSTER FORGET <nodeID>
+	command := []string{
+		"redis-cli",
+		"--cluster", "call", clusterAddr,
+		"CLUSTER", "FORGET", nodeIDToForget,
+	}
+
+	job := resource.BuildClusterOperationJob(kredis, jobName, string(JobTypeScaleDownForget), nodeIDToForget, command)
+
+	if err := jm.Create(ctx, job); err != nil {
+		return fmt.Errorf("failed to create scale-down forget job: %w", err)
+	}
+
+	logger.Info("Created scale-down forget job", "job", jobName, "nodeToForget", nodeIDToForget)
+	return nil
+}
+
+// GetScaleDownJobStatus checks the status of scale-down jobs for a specific node
+func (jm *JobManager) GetScaleDownJobStatus(ctx context.Context, kredis *cachev1alpha1.Kredis, jobType JobType, nodeID string) (*JobResult, error) {
+	jobName := jm.generateJobName(kredis, jobType, nodeID)
+
+	job := &batchv1.Job{}
+	if err := jm.Get(ctx, client.ObjectKey{Namespace: kredis.Namespace, Name: jobName}, job); err != nil {
+		if errors.IsNotFound(err) {
+			return &JobResult{Status: JobStatusNotFound}, nil
+		}
+		return nil, fmt.Errorf("failed to get job %s: %w", jobName, err)
+	}
+
+	result := &JobResult{JobName: job.Name}
+
+	if job.Status.StartTime != nil {
+		t := job.Status.StartTime.Time
+		result.StartTime = &t
+	}
+
+	if job.Status.Succeeded > 0 {
+		result.Status = JobStatusSucceeded
+		result.Message = "Job completed successfully"
+		if job.Status.CompletionTime != nil {
+			t := job.Status.CompletionTime.Time
+			result.FinishTime = &t
+		}
+		return result, nil
+	}
+
+	if job.Status.Failed > 0 {
+		result.Status = JobStatusFailed
+		result.Message = fmt.Sprintf("Job failed after %d attempts", job.Status.Failed)
+		return result, nil
+	}
+
+	if job.Status.Active > 0 {
+		result.Status = JobStatusRunning
+		result.Message = "Job is running"
+		return result, nil
+	}
+
+	result.Status = JobStatusPending
+	result.Message = "Job is pending"
+	return result, nil
 }
 
 // CleanupCompletedJobs removes old completed/failed jobs for a Kredis instance

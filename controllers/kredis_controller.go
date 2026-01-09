@@ -262,18 +262,84 @@ func (r *KredisReconciler) reconcileStatefulSet(ctx context.Context, kredis *cac
 		return err
 	}
 
+	currentReplicas := *foundStatefulSet.Spec.Replicas
+
 	// Check if update needed
-	if *foundStatefulSet.Spec.Replicas != expectedReplicas {
-		logger.Info("Updating StatefulSet replicas",
-			"current", *foundStatefulSet.Spec.Replicas,
+	if currentReplicas != expectedReplicas {
+		// IMPORTANT: Scale-down safety check
+		// Do NOT shrink StatefulSet immediately during scale-down!
+		// Scale-down requires:
+		// 1. Migrate slots from masters being removed (reshard)
+		// 2. Execute CLUSTER FORGET on all remaining nodes
+		// 3. Only then shrink StatefulSet
+		if currentReplicas > expectedReplicas {
+			// This is a scale-down operation
+			logger.Info("Scale-down detected - StatefulSet shrink is BLOCKED until cluster operations complete",
+				"currentReplicas", currentReplicas,
+				"desiredReplicas", expectedReplicas,
+				"scaleDownReady", kredis.Status.ScaleDownReady,
+				"pendingScaleDown", len(kredis.Status.PendingScaleDown))
+
+			// Only allow shrinking if ScaleDownReady is true
+			// This flag is set by scaleDownCluster after all nodes are safely removed
+			if !kredis.Status.ScaleDownReady {
+				logger.Info("Blocking StatefulSet shrink - scale-down operations not complete")
+				// Store the desired replicas in status for the controller to use later
+				if kredis.Status.DesiredStatefulSetReplicas == nil || *kredis.Status.DesiredStatefulSetReplicas != expectedReplicas {
+					// Update status to record desired replicas
+					// This will be done via updateStatus later in the reconcile loop
+					logger.V(1).Info("Recording desired StatefulSet replicas for after scale-down",
+						"desiredReplicas", expectedReplicas)
+				}
+				return nil // Block the update
+			}
+
+			// ScaleDownReady is true - safe to shrink
+			logger.Info("Scale-down complete - now shrinking StatefulSet",
+				"from", currentReplicas,
+				"to", expectedReplicas)
+
+			foundStatefulSet.Spec.Replicas = &expectedReplicas
+			if err := r.Update(ctx, foundStatefulSet); err != nil {
+				return err
+			}
+
+			// Reset ScaleDownReady flag after successful shrink
+			// This is done via a status update
+			return r.resetScaleDownStatus(ctx, kredis)
+		}
+
+		// Scale-up: Safe to update immediately
+		logger.Info("Updating StatefulSet replicas (scale-up)",
+			"current", currentReplicas,
 			"expected", expectedReplicas)
 
 		foundStatefulSet.Spec.Replicas = &expectedReplicas
-
 		return r.Update(ctx, foundStatefulSet)
 	}
 
 	return nil
+}
+
+// resetScaleDownStatus clears the scale-down status flags after StatefulSet shrink
+func (r *KredisReconciler) resetScaleDownStatus(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
+	logger := log.FromContext(ctx)
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Get latest version
+		currentKredis := &cachev1alpha1.Kredis{}
+		if err := r.Get(ctx, types.NamespacedName{Name: kredis.Name, Namespace: kredis.Namespace}, currentKredis); err != nil {
+			return err
+		}
+
+		// Reset scale-down flags
+		currentKredis.Status.ScaleDownReady = false
+		currentKredis.Status.PendingScaleDown = nil
+		currentKredis.Status.DesiredStatefulSetReplicas = nil
+
+		logger.Info("Resetting scale-down status flags after successful StatefulSet shrink")
+		return r.Status().Update(ctx, currentKredis)
+	})
 }
 
 func (r *KredisReconciler) updateStatus(ctx context.Context, kredis *cachev1alpha1.Kredis, delta *cluster.ClusterStatusDelta) error {
@@ -306,6 +372,16 @@ func (r *KredisReconciler) updateStatus(ctx context.Context, kredis *cachev1alph
 			if delta.ClusterState != "" {
 				currentKredis.Status.ClusterState = delta.ClusterState
 			}
+			// Scale-down related fields
+			if delta.PendingScaleDown != nil {
+				currentKredis.Status.PendingScaleDown = delta.PendingScaleDown
+			}
+			if delta.ScaleDownReady != nil {
+				currentKredis.Status.ScaleDownReady = *delta.ScaleDownReady
+			}
+			if delta.DesiredStatefulSetReplicas != nil {
+				currentKredis.Status.DesiredStatefulSetReplicas = delta.DesiredStatefulSetReplicas
+			}
 		}
 
 		newStatus := r.calculateStatus(currentKredis, foundStatefulSet)
@@ -337,21 +413,29 @@ func (r *KredisReconciler) calculateStatus(kredis *cachev1alpha1.Kredis, sts *ap
 	}
 
 	// Determine ClusterState based on current situation
-	// Priority: Scaling detection > delta state > success state
+	// Priority: Scale-down > Scaling detection > delta state > success state
 
-	// 1. Check if scaling is in progress (StatefulSet replicas != expected)
+	// 1. Check if scale-down is in progress
+	isScaleDownInProgress := strings.Contains(kredis.Status.LastClusterOperation, "scaledown-") ||
+		len(kredis.Status.PendingScaleDown) > 0
+
+	// 2. Check if scaling is in progress (StatefulSet replicas != expected)
 	// This catches the case where Spec changed but pods aren't ready yet
-	isScaling := sts.Status.Replicas != expectedReplicas || sts.Status.ReadyReplicas != expectedReplicas
+	// But exclude scale-down case (where we intentionally block StatefulSet shrink)
+	isScaling := (sts.Status.Replicas != expectedReplicas || sts.Status.ReadyReplicas != expectedReplicas) && !isScaleDownInProgress
 
-	// 2. Check if cluster operations are in progress
+	// 3. Check if cluster operations are in progress
 	isOperationInProgress := strings.Contains(kredis.Status.LastClusterOperation, "-in-progress") ||
 		strings.Contains(kredis.Status.LastClusterOperation, "-pending") ||
 		strings.Contains(kredis.Status.LastClusterOperation, "-needed")
 
-	// 3. Determine ClusterState
+	// 4. Determine ClusterState
 	if newStatus.ClusterState == "" {
 		// Initial state - no cluster operations have run yet
 		newStatus.ClusterState = string(cachev1alpha1.ClusterStateCreating)
+	} else if isScaleDownInProgress {
+		// Scale-down takes precedence
+		newStatus.ClusterState = string(cachev1alpha1.ClusterStateScalingDown)
 	} else if isScaling && newStatus.ClusterState == string(cachev1alpha1.ClusterStateRunning) {
 		// Was Running but now scaling (spec changed, waiting for pods)
 		newStatus.ClusterState = string(cachev1alpha1.ClusterStateScaling)
