@@ -82,7 +82,7 @@ func (cm *ClusterManager) isNodeReset(ctx context.Context, pod corev1.Pod, port 
 		return false
 	}
 	// DBSIZE returns "(integer) 0" or similar format
-	if !strings.Contains(dbsizeResult.Stdout, "0") {
+	if !strings.Contains(dbsizeResult.Stdout, "(integer) 0") {
 		logger.V(1).Info("Node still has data (FLUSHALL not complete)", "pod", pod.Name, "dbsize", dbsizeResult.Stdout)
 		return false
 	}
@@ -180,24 +180,4 @@ func (cm *ClusterManager) isNodeInCluster(pod corev1.Pod, clusterState []cachev1
 		}
 	}
 	return false, nil
-}
-
-// findNodeByPodName finds a cluster node by pod name
-func findNodeByPodName(podName string, clusterState []cachev1alpha1.ClusterNode) *cachev1alpha1.ClusterNode {
-	for i, node := range clusterState {
-		if node.PodName == podName {
-			return &clusterState[i]
-		}
-	}
-	return nil
-}
-
-// findNodeByID finds a cluster node by node ID
-func findNodeByID(nodeID string, clusterState []cachev1alpha1.ClusterNode) *cachev1alpha1.ClusterNode {
-	for i, node := range clusterState {
-		if node.NodeID == nodeID {
-			return &clusterState[i]
-		}
-	}
-	return nil
 }

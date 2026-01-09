@@ -270,34 +270,21 @@ func (a *Autoscaler) evaluateScalingDecision(kredis *cachev1alpha1.Kredis, memor
 	currentReplicas := kredis.Spec.Replicas
 
 	// Set defaults if thresholds are not configured
+	// NOTE: Scale-down thresholds not used (scale-down not supported yet)
 	memScaleUp := spec.MemoryScaleUpThreshold
 	if memScaleUp == 0 {
 		memScaleUp = 80 // Default 80%
-	}
-	memScaleDown := spec.MemoryScaleDownThreshold
-	if memScaleDown == 0 {
-		memScaleDown = 30 // Default 30%
 	}
 	cpuScaleUp := spec.CPUScaleUpThreshold
 	if cpuScaleUp == 0 {
 		cpuScaleUp = 80 // Default 80%
 	}
-	cpuScaleDown := spec.CPUScaleDownThreshold
-	if cpuScaleDown == 0 {
-		cpuScaleDown = 30 // Default 30%
-	}
 
-	// Set defaults for min/max
-	minMasters := spec.MinMasters
-	if minMasters == 0 {
-		minMasters = 3 // Redis cluster minimum
-	}
+	// Set defaults for max (min not used - scale-down not supported)
 	maxMasters := spec.MaxMasters
 	if maxMasters == 0 {
 		maxMasters = 100 // Reasonable upper limit
 	}
-	minReplicas := spec.MinReplicasPerMaster
-	// minReplicas can be 0
 	maxReplicas := spec.MaxReplicasPerMaster
 	if maxReplicas == 0 {
 		maxReplicas = 5 // Reasonable upper limit
@@ -315,16 +302,9 @@ func (a *Autoscaler) evaluateScalingDecision(kredis *cachev1alpha1.Kredis, memor
 		}
 	}
 
-	// Scale down masters when memory is low
-	if memoryPercent <= memScaleDown && currentMasters > minMasters {
-		newMasters := currentMasters - 1
-		return AutoscaleDecision{
-			ShouldScale: true,
-			ScaleType:   "masters-down",
-			NewMasters:  newMasters,
-			Reason:      fmt.Sprintf("Memory usage %d%% <= threshold %d%%, scaling masters %d -> %d", memoryPercent, memScaleDown, currentMasters, newMasters),
-		}
-	}
+	// NOTE: Scale-down masters is NOT supported yet
+	// Requires: reshard slots away → CLUSTER FORGET → delete pod
+	// Skipping scale-down decision to avoid noisy logs
 
 	// Priority 2: CPU-based replica scaling (for read capacity)
 	// Scale up replicas when CPU is high
@@ -338,16 +318,9 @@ func (a *Autoscaler) evaluateScalingDecision(kredis *cachev1alpha1.Kredis, memor
 		}
 	}
 
-	// Scale down replicas when CPU is low
-	if cpuPercent <= cpuScaleDown && currentReplicas > minReplicas {
-		newReplicas := currentReplicas - 1
-		return AutoscaleDecision{
-			ShouldScale: true,
-			ScaleType:   "replicas-down",
-			NewReplicas: newReplicas,
-			Reason:      fmt.Sprintf("CPU usage %d%% <= threshold %d%%, scaling replicas %d -> %d", cpuPercent, cpuScaleDown, currentReplicas, newReplicas),
-		}
-	}
+	// NOTE: Scale-down replicas is NOT supported yet
+	// Requires: CLUSTER FORGET → delete pod
+	// Skipping scale-down decision to avoid noisy logs
 
 	return AutoscaleDecision{
 		ShouldScale: false,
@@ -356,6 +329,7 @@ func (a *Autoscaler) evaluateScalingDecision(kredis *cachev1alpha1.Kredis, memor
 }
 
 // ApplyAutoscaling applies the autoscaling decision by updating the Kredis spec
+// NOTE: Only scale-up is supported. Scale-down requires proper Redis Cluster node removal.
 func (a *Autoscaler) ApplyAutoscaling(ctx context.Context, kredis *cachev1alpha1.Kredis, decision AutoscaleDecision) error {
 	logger := log.FromContext(ctx)
 
@@ -367,12 +341,16 @@ func (a *Autoscaler) ApplyAutoscaling(ctx context.Context, kredis *cachev1alpha1
 	patch := client.MergeFrom(kredis.DeepCopy())
 
 	switch decision.ScaleType {
-	case "masters-up", "masters-down":
+	case "masters-up":
 		kredis.Spec.Masters = decision.NewMasters
-		logger.Info("Applying master scale", "newMasters", decision.NewMasters, "reason", decision.Reason)
-	case "replicas-up", "replicas-down":
+		logger.Info("Applying master scale-up", "newMasters", decision.NewMasters, "reason", decision.Reason)
+	case "replicas-up":
 		kredis.Spec.Replicas = decision.NewReplicas
-		logger.Info("Applying replica scale", "newReplicas", decision.NewReplicas, "reason", decision.Reason)
+		logger.Info("Applying replica scale-up", "newReplicas", decision.NewReplicas, "reason", decision.Reason)
+	default:
+		// Unsupported scale type - should not happen
+		logger.Info("Unsupported scale type", "scaleType", decision.ScaleType)
+		return nil
 	}
 
 	// Update spec

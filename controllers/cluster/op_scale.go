@@ -161,8 +161,17 @@ func (cm *ClusterManager) checkAllClusterMastersHaveSlots(pods []corev1.Pod, clu
 // This can happen when:
 // 1. Previous add-node succeeded but status wasn't updated
 // 2. Node was added as master but should be slave (or vice versa)
-func (cm *ClusterManager) handleExistingNode(ctx context.Context, kredis *cachev1alpha1.Kredis, targetPod corev1.Pod, commandPod *corev1.Pod, existingNode *cachev1alpha1.ClusterNode, shouldBeMaster bool, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode, delta *ClusterStatusDelta) error {
+func (cm *ClusterManager) handleExistingNode(ctx context.Context, kredis *cachev1alpha1.Kredis, targetPod corev1.Pod, commandPod *corev1.Pod,
+	existingNode *cachev1alpha1.ClusterNode, shouldBeMaster bool, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode,
+	delta *ClusterStatusDelta) error {
 	logger := log.FromContext(ctx)
+
+	logger.Error(nil, "UNEXPECTED: handleExistingNode called - node already in cluster before adding node",
+		"pod", targetPod.Name,
+		"nodeID", existingNode.NodeID,
+		"currentRole", existingNode.Role,
+		"shouldBeMaster", shouldBeMaster,
+		"slotCount", existingNode.SlotCount)
 
 	currentIsMaster := existingNode.Role == "master"
 
@@ -184,8 +193,9 @@ func (cm *ClusterManager) handleExistingNode(ctx context.Context, kredis *cachev
 	if currentIsMaster && !shouldBeMaster {
 		// Only convert if master has no slots (empty master)
 		if existingNode.SlotCount == 0 {
+			// 빈 마스터 → 슬레이브로 변환
 			masterNodes := cm.getClusterMasterNodes(pods, clusterState)
-			targetMasterID, err := cm.selectMasterForReplica(pods, clusterState, masterNodes)
+			targetMasterID, err := cm.selectMasterForReplica(kredis, pods, clusterState, masterNodes)
 			if err != nil {
 				logger.Info("No master available for replication, keeping as master for now", "pod", targetPod.Name)
 				delta.LastClusterOperation = fmt.Sprintf("scale-in-progress:%d", time.Now().Unix())
@@ -197,7 +207,7 @@ func (cm *ClusterManager) handleExistingNode(ctx context.Context, kredis *cachev
 				return fmt.Errorf("failed to convert node %s to slave: %w", targetPod.Name, err)
 			}
 		} else {
-			// Master has slots, can't safely convert - treat as valid master
+			// 슬롯 있는 마스터 → 변환 불가, 유지
 			logger.Info("Node is master with slots, keeping as master", "pod", targetPod.Name, "slots", existingNode.SlotCount)
 		}
 		delta.LastClusterOperation = fmt.Sprintf("scale-in-progress:%d", time.Now().Unix())
@@ -226,7 +236,7 @@ func (cm *ClusterManager) addNodeToCluster(ctx context.Context, kredis *cachev1a
 		}
 	} else {
 		// 슬레이브로 추가할 마스터 선택
-		targetMasterID, err := cm.selectMasterForReplica(pods, clusterState, masterNodes)
+		targetMasterID, err := cm.selectMasterForReplica(kredis, pods, clusterState, masterNodes)
 		if err != nil {
 			return err
 		}
@@ -322,7 +332,7 @@ func (cm *ClusterManager) getClusterMasterNodes(pods []corev1.Pod, clusterState 
 // Uses clusterState (real-time Redis state) instead of JoinedPods.
 // This prevents the redis-cli --cluster add-node bug where adding a replica to an
 // empty master (no slots) can cause the node to be added as a master instead.
-func (cm *ClusterManager) selectMasterForReplica(pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode, masterNodes []cachev1alpha1.ClusterNode) (string, error) {
+func (cm *ClusterManager) selectMasterForReplica(kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode, masterNodes []cachev1alpha1.ClusterNode) (string, error) {
 	// Build set of our pods for filtering
 	ourPodsSet := make(map[string]struct{})
 	for _, pod := range pods {
@@ -343,24 +353,8 @@ func (cm *ClusterManager) selectMasterForReplica(pods []corev1.Pod, clusterState
 		}
 	}
 
-	// Get expected replicas from masterNodes (assumes all masters should have same replica count)
-	// Default to 1 if no masters yet
-	expectedReplicas := 1
-	if len(masterNodes) > 0 {
-		// Calculate expected replicas based on total slaves / masters
-		totalSlaves := 0
-		for _, node := range clusterState {
-			if _, isOurs := ourPodsSet[node.PodName]; isOurs && node.Role == "slave" && node.NodeID != "" {
-				totalSlaves++
-			}
-		}
-		if len(masterNodes) > 0 {
-			expectedReplicas = (totalSlaves + len(masterNodes) - 1) / len(masterNodes) // Round up
-			if expectedReplicas < 1 {
-				expectedReplicas = 1
-			}
-		}
-	}
+	// 목표 replica 수는 kredis.Spec.Replicas에서 직접 가져옴
+	expectedReplicas := int(kredis.Spec.Replicas)
 
 	// Phase 1: 슬롯이 있는 마스터 중 replica가 부족한 마스터 선택
 	var targetMasterID string
@@ -408,27 +402,12 @@ func (cm *ClusterManager) finalizeScale(ctx context.Context, kredis *cachev1alph
 	known := int(expectedTotalPods)
 	delta.KnownClusterNodes = &known
 
-	// 현재 마스터 수 확인
-	currentMasters := len(cm.getClusterMasterNodes(pods, clusterState))
-	expectedMasters := int(kredis.Spec.Masters)
-
-	// 마스터가 새로 추가되었는지 확인 (리밸런스 필요 여부)
-	if currentMasters >= expectedMasters && currentMasters > 0 {
-		// 마스터 수가 증가했다면 리밸런스 필요
-		// (이전 상태에서 마스터가 추가된 경우)
-		prevMasterCount := 0
-		for _, node := range clusterState {
-			if node.Role == "master" {
-				prevMasterCount++
-			}
-		}
-
-		if currentMasters > prevMasterCount || cm.needsRebalance(ctx, *commandPod, kredis.Spec.BasePort) {
-			logger.Info("New masters added or rebalance needed", "currentMasters", currentMasters)
-			delta.LastClusterOperation = fmt.Sprintf("rebalance-needed:%d", time.Now().Unix())
-			delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
-			return nil
-		}
+	// 리밸런스 필요 여부 확인 (빈 마스터가 있는지)
+	if cm.needsRebalance(ctx, *commandPod, kredis.Spec.BasePort) {
+		logger.Info("Rebalance needed, some masters have no slots")
+		delta.LastClusterOperation = fmt.Sprintf("rebalance-needed:%d", time.Now().Unix())
+		delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
+		return nil
 	}
 
 	logger.Info("Scale completed successfully")

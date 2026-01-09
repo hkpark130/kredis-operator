@@ -214,19 +214,6 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 		return ""
 	}
 
-	// Scenario 2: A cluster exists. Now we check its health and scaling needs.
-	// Find a reliable master pod to check cluster health
-	var healthCheckPod *corev1.Pod
-	if len(masterNodes) > 0 {
-		if pod, ok := podMap[masterNodes[0].PodName]; ok {
-			healthCheckPod = &pod
-		}
-	}
-	if healthCheckPod == nil {
-		logger.Info("Cluster exists, but no master pod is available for a health check. Waiting.")
-		return "" // Cannot proceed without a node to query
-	}
-
 	// Health is OK (already checked in isClusterAlreadyExists), now check for scaling.
 	expectedTotalNodes := cm.getExpectedPodCount(kredis)
 	currentJoinedNodes := len(clusterMembers)
@@ -323,7 +310,7 @@ func (cm *ClusterManager) isClusterAlreadyExists(ctx context.Context, kredis *ca
 	if err != nil {
 		// An error here might mean the cluster isn't up, which is not an "existence" failure.
 		logger.V(1).Info("Could not check cluster health, assuming cluster does not exist", "error", err)
-		return false, nil
+		return false, err
 	}
 	if !isHealthy {
 		logger.Info("Cluster state is not 'ok', assuming cluster does not exist or is not properly formed yet.")
