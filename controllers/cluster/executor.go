@@ -116,7 +116,8 @@ func (pe *PodExecutor) CheckRedisClusterInfo(ctx context.Context, pod corev1.Pod
 
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) == 2 {
-			info[parts[0]] = parts[1]
+			// IMPORTANT: TrimSpace the value to remove \r and other whitespace
+			info[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 		}
 	}
 

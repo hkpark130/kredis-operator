@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -105,9 +106,42 @@ func (a *Autoscaler) EvaluateAutoscaling(ctx context.Context, kredis *cachev1alp
 // isClusterStable checks if the cluster is in a state where autoscaling is safe
 func (a *Autoscaler) isClusterStable(kredis *cachev1alpha1.Kredis) bool {
 	state := kredis.Status.ClusterState
+	lastOp := kredis.Status.LastClusterOperation
+
 	// Only autoscale when cluster is Running or Initialized
-	return state == string(cachev1alpha1.ClusterStateRunning) ||
-		state == string(cachev1alpha1.ClusterStateInitialized)
+	if state != string(cachev1alpha1.ClusterStateRunning) &&
+		state != string(cachev1alpha1.ClusterStateInitialized) {
+		return false
+	}
+
+	// Additional check: Don't autoscale if there's an ongoing operation
+	// This prevents race conditions where state briefly becomes Running
+	// while operations are still in progress
+	if strings.Contains(lastOp, "-in-progress") ||
+		strings.Contains(lastOp, "-pending") ||
+		strings.Contains(lastOp, "-needed") {
+		return false
+	}
+
+	// Don't autoscale if scale-down is in progress (explicit check for in-progress states)
+	if strings.Contains(lastOp, "scaledown-migrate-in-progress") ||
+		strings.Contains(lastOp, "scaledown-forget-in-progress") ||
+		strings.Contains(lastOp, "scaledown-in-progress") ||
+		strings.Contains(lastOp, "scaledown-migrate-retry") {
+		return false
+	}
+
+	// Don't autoscale if there are pending scale-down nodes
+	if len(kredis.Status.PendingScaleDown) > 0 {
+		return false
+	}
+
+	// Don't autoscale if pods are marked for deletion
+	if kredis.Status.ScaleDownReady || len(kredis.Status.PodsToDelete) > 0 {
+		return false
+	}
+
+	return true
 }
 
 // canScaleInDirection checks if enough time has passed to allow scaling in the given direction.

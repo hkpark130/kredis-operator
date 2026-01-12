@@ -507,7 +507,12 @@ func (r *KredisReconciler) calculateStatus(ctx context.Context, kredis *cachev1a
 	}
 
 	// Determine ClusterState
-	isScaleDownInProgress := strings.Contains(kredis.Status.LastClusterOperation, "scaledown-") ||
+	// Check for specific in-progress states (more explicit than checking !success)
+	lastOp := kredis.Status.LastClusterOperation
+	isScaleDownInProgress := strings.Contains(lastOp, "scaledown-migrate-in-progress") ||
+		strings.Contains(lastOp, "scaledown-forget-in-progress") ||
+		strings.Contains(lastOp, "scaledown-in-progress") ||
+		strings.Contains(lastOp, "scaledown-migrate-retry") ||
 		len(kredis.Status.PendingScaleDown) > 0
 
 	isScaling := (int32(len(pods)) != expectedReplicas || readyCount != expectedReplicas) && !isScaleDownInProgress
