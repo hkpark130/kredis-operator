@@ -23,7 +23,6 @@ import (
 	"strings"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -58,7 +57,6 @@ type KredisReconciler struct {
 //+kubebuilder:rbac:groups=cache.docker.direa.synology.me,resources=kredis,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=cache.docker.direa.synology.me,resources=kredis/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=cache.docker.direa.synology.me,resources=kredis/finalizers,verbs=update
-//+kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
@@ -99,7 +97,7 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if controllerutil.ContainsFinalizer(kredis, kredisFinalizer) {
 			logger.Info("Kredis resource is being deleted, running cleanup")
 
-			// Cleanup: Delete all Jobs associated with this Kredis instance
+			// Cleanup: Delete all resources associated with this Kredis instance
 			if err := r.cleanupKredisResources(ctx, kredis); err != nil {
 				logger.Error(err, "Failed to cleanup Kredis resources")
 				// Don't block deletion, just log the error
@@ -116,35 +114,42 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, nil
 	}
 
+	totalNodes := kredis.Spec.Masters + (kredis.Spec.Masters * kredis.Spec.Replicas)
 	logger.Info("Reconciling Kredis",
 		"name", kredis.Name,
 		"masters", kredis.Spec.Masters,
 		"replicas", kredis.Spec.Replicas,
-		"totalNodes", kredis.Spec.Masters+(kredis.Spec.Masters*kredis.Spec.Replicas))
+		"totalNodes", totalNodes)
 
-	// 1. Create headless service
-	if err := r.reconcileService(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to reconcile service")
+	// 1. Create services (headless for DNS, master/slave for routing)
+	if err := r.reconcileServices(ctx, kredis); err != nil {
+		logger.Error(err, "Failed to reconcile services")
 		return ctrl.Result{}, err
 	}
 
-	// 2. Create unified StatefulSet
-	if err := r.reconcileStatefulSet(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to reconcile StatefulSet")
-		return ctrl.Result{}, err
+	// 2. Reconcile Pods and PVCs (direct pod management instead of StatefulSet)
+	if err := r.reconcilePods(ctx, kredis); err != nil {
+		logger.Error(err, "Failed to reconcile pods")
+		return ctrl.Result{RequeueAfter: time.Second * 10}, err
 	}
 
-	// 3. Manage Redis cluster state
+	// 3. Delete pods that are ready for deletion (after scale-down)
+	if err := r.deleteMarkedPods(ctx, kredis); err != nil {
+		logger.Error(err, "Failed to delete marked pods")
+		// Continue - don't block reconciliation
+	}
+
+	// 4. Manage Redis cluster state
 	clusterReady, delta, err := r.ClusterManager.ReconcileCluster(ctx, kredis)
 	if err != nil {
-		// 오류가 발생해도 delta에 담긴 진행중/실패 상태를 우선 반영하여 중복 작업을 방지
+		// 오류가 발생해도 delta에 담긴 진행중/실패 상태를 우선 반영
 		if delta != nil {
 			if uerr := r.updateStatus(ctx, kredis, delta); uerr != nil {
 				logger.Error(uerr, "Failed to update status after reconcile error")
 			}
 		}
 		logger.Error(err, "Failed to reconcile Redis cluster")
-		return ctrl.Result{RequeueAfter: time.Minute}, err // 클러스터 조정 실패 시 1분 후 재시도
+		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}
 
 	// 4. Evaluate autoscaling if cluster is stable
@@ -155,11 +160,9 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			if err != nil {
 				logger.Error(err, "Failed to evaluate autoscaling")
 			} else {
-				// Update metrics in status
 				if delta == nil {
 					delta = &cluster.ClusterStatusDelta{}
 				}
-				// Store current metrics in delta for status update
 				kredis.Status.CurrentMemoryUsagePercent = result.MemoryUsagePercent
 				kredis.Status.CurrentCPUUsagePercent = result.CPUUsagePercent
 
@@ -170,7 +173,6 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 					if err := r.Autoscaler.ApplyAutoscaling(ctx, kredis, result.Decision); err != nil {
 						logger.Error(err, "Failed to apply autoscaling")
 					} else {
-						// Re-fetch kredis after spec change to avoid conflicts
 						return ctrl.Result{RequeueAfter: time.Second * 5}, nil
 					}
 				}
@@ -184,7 +186,7 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: time.Second * 10}, err
 	}
 
-	// Adjust reconcile interval based on cluster state and in-progress
+	// Adjust reconcile interval based on cluster state
 	inProgress := false
 	if delta != nil && strings.Contains(delta.LastClusterOperation, "-in-progress") {
 		inProgress = true
@@ -193,27 +195,48 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	if clusterReady {
-		// Cluster is healthy - check less frequently
+		if kredis.Spec.Autoscaling.Enabled {
+			interval := time.Second * 30
+			if kredis.Spec.Autoscaling.ScaleUpStabilizationWindowSeconds > 0 &&
+				kredis.Spec.Autoscaling.ScaleUpStabilizationWindowSeconds < 30 {
+				interval = time.Duration(kredis.Spec.Autoscaling.ScaleUpStabilizationWindowSeconds) * time.Second
+			}
+			logger.V(1).Info("Cluster is healthy with autoscaling - scheduling next check", "interval", interval)
+			return ctrl.Result{RequeueAfter: interval}, nil
+		}
 		logger.V(1).Info("Cluster is healthy - scheduling next check in 10 minutes")
 		return ctrl.Result{RequeueAfter: time.Minute * 10}, nil
 	} else if inProgress {
-		// While operations are in progress, poll more frequently
 		logger.V(1).Info("Operation in progress - scheduling next check in 5 seconds")
 		return ctrl.Result{RequeueAfter: time.Second * 5}, nil
 	} else {
-		// Cluster needs attention - check more frequently
 		logger.V(1).Info("Cluster needs attention - scheduling next check in 15 seconds")
 		return ctrl.Result{RequeueAfter: time.Second * 15}, nil
 	}
 }
 
-func (r *KredisReconciler) reconcileService(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
+// reconcileServices creates/updates all required services
+func (r *KredisReconciler) reconcileServices(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
 	logger := log.FromContext(ctx)
 
-	// Master 서비스 생성 (쓰기용)
+	// 1. Headless service for pod DNS resolution
+	headlessSvcName := kredis.Name
+	foundHeadlessSvc := &corev1.Service{}
+	err := r.Get(ctx, types.NamespacedName{Name: headlessSvcName, Namespace: kredis.Namespace}, foundHeadlessSvc)
+	if err != nil && errors.IsNotFound(err) {
+		svc := resource.CreateRedisHeadlessService(kredis, r.Scheme)
+		logger.Info("Creating Redis headless service", "name", svc.Name)
+		if err := r.Create(ctx, svc); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+
+	// 2. Master service (for writes)
 	masterSvcName := kredis.Name + "-master"
 	foundMasterSvc := &corev1.Service{}
-	err := r.Get(ctx, types.NamespacedName{Name: masterSvcName, Namespace: kredis.Namespace}, foundMasterSvc)
+	err = r.Get(ctx, types.NamespacedName{Name: masterSvcName, Namespace: kredis.Namespace}, foundMasterSvc)
 	if err != nil && errors.IsNotFound(err) {
 		svc := resource.CreateRedisMasterService(kredis, r.Scheme)
 		logger.Info("Creating Redis master service", "name", svc.Name)
@@ -224,7 +247,7 @@ func (r *KredisReconciler) reconcileService(ctx context.Context, kredis *cachev1
 		return err
 	}
 
-	// Slave 서비스 생성 (읽기용)
+	// 3. Slave service (for reads)
 	slaveSvcName := kredis.Name + "-slave"
 	foundSlaveSvc := &corev1.Service{}
 	err = r.Get(ctx, types.NamespacedName{Name: slaveSvcName, Namespace: kredis.Namespace}, foundSlaveSvc)
@@ -241,124 +264,182 @@ func (r *KredisReconciler) reconcileService(ctx context.Context, kredis *cachev1
 	return nil
 }
 
-func (r *KredisReconciler) reconcileStatefulSet(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
+// reconcilePods manages Redis pods directly (instead of StatefulSet)
+// This allows selective pod deletion for proper Redis Cluster scale-down
+func (r *KredisReconciler) reconcilePods(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
 	logger := log.FromContext(ctx)
 
-	foundStatefulSet := &appsv1.StatefulSet{}
-	err := r.Get(ctx, types.NamespacedName{Name: kredis.Name, Namespace: kredis.Namespace}, foundStatefulSet)
+	// Get expected pod names based on current spec
+	expectedPodNames := resource.GetExpectedPodNames(kredis.Name, kredis.Spec.Masters, kredis.Spec.Replicas)
 
-	expectedReplicas := kredis.Spec.Masters + (kredis.Spec.Masters * kredis.Spec.Replicas)
+	// Get current pods
+	currentPods, err := r.getKredisPods(ctx, kredis)
+	if err != nil {
+		return fmt.Errorf("failed to list pods: %w", err)
+	}
 
+	currentPodMap := make(map[string]*corev1.Pod)
+	for i := range currentPods {
+		currentPodMap[currentPods[i].Name] = &currentPods[i]
+	}
+
+	// Create missing pods (scale-up)
+	for _, expectedName := range expectedPodNames {
+		if _, exists := currentPodMap[expectedName]; !exists {
+			// Pod doesn't exist - create it
+			if err := r.createPodWithPVCs(ctx, kredis, expectedName); err != nil {
+				logger.Error(err, "Failed to create pod", "pod", expectedName)
+				return err
+			}
+			logger.Info("Created pod", "pod", expectedName)
+		}
+	}
+
+	// Note: Pod deletion (scale-down) is handled by ClusterManager
+	// after Redis Cluster operations (slot migration, CLUSTER FORGET) are complete
+	// This ensures data safety during scale-down
+
+	return nil
+}
+
+// createPodWithPVCs creates a pod along with its required PVCs
+func (r *KredisReconciler) createPodWithPVCs(ctx context.Context, kredis *cachev1alpha1.Kredis, podName string) error {
+	logger := log.FromContext(ctx)
+
+	// Parse pod name to get shard and instance indices
+	shardIdx, instanceIdx, err := resource.ParsePodName(kredis.Name, podName)
+	if err != nil {
+		return fmt.Errorf("failed to parse pod name %s: %w", podName, err)
+	}
+
+	// 1. Create Data PVC if not exists
+	dataPVCName := resource.DataPVCName(podName)
+	dataPVC := &corev1.PersistentVolumeClaim{}
+	err = r.Get(ctx, types.NamespacedName{Name: dataPVCName, Namespace: kredis.Namespace}, dataPVC)
 	if err != nil && errors.IsNotFound(err) {
-		// Create new StatefulSet
-		sts := resource.CreateRedisStatefulSet(kredis, r.Scheme)
-		logger.Info("Creating unified Redis StatefulSet",
-			"name", sts.Name,
-			"totalReplicas", expectedReplicas,
-			"masters", kredis.Spec.Masters,
-			"replicasPerMaster", kredis.Spec.Replicas)
-		return r.Create(ctx, sts)
+		pvc := resource.CreateDataPVC(kredis, podName, r.Scheme)
+		logger.Info("Creating data PVC", "pvc", dataPVCName)
+		if err := r.Create(ctx, pvc); err != nil {
+			return fmt.Errorf("failed to create data PVC: %w", err)
+		}
 	} else if err != nil {
 		return err
 	}
 
-	currentReplicas := *foundStatefulSet.Spec.Replicas
-
-	// Check if update needed
-	if currentReplicas != expectedReplicas {
-		// IMPORTANT: Scale-down safety check
-		// Do NOT shrink StatefulSet immediately during scale-down!
-		// Scale-down requires:
-		// 1. Migrate slots from masters being removed (reshard)
-		// 2. Execute CLUSTER FORGET on all remaining nodes
-		// 3. Only then shrink StatefulSet
-		if currentReplicas > expectedReplicas {
-			// This is a scale-down operation
-			logger.Info("Scale-down detected - StatefulSet shrink is BLOCKED until cluster operations complete",
-				"currentReplicas", currentReplicas,
-				"desiredReplicas", expectedReplicas,
-				"scaleDownReady", kredis.Status.ScaleDownReady,
-				"pendingScaleDown", len(kredis.Status.PendingScaleDown))
-
-			// Only allow shrinking if ScaleDownReady is true
-			// This flag is set by scaleDownCluster after all nodes are safely removed
-			if !kredis.Status.ScaleDownReady {
-				logger.Info("Blocking StatefulSet shrink - scale-down operations not complete")
-				// Store the desired replicas in status for the controller to use later
-				if kredis.Status.DesiredStatefulSetReplicas == nil || *kredis.Status.DesiredStatefulSetReplicas != expectedReplicas {
-					// Update status to record desired replicas
-					// This will be done via updateStatus later in the reconcile loop
-					logger.V(1).Info("Recording desired StatefulSet replicas for after scale-down",
-						"desiredReplicas", expectedReplicas)
-				}
-				return nil // Block the update
-			}
-
-			// ScaleDownReady is true - safe to shrink
-			logger.Info("Scale-down complete - now shrinking StatefulSet",
-				"from", currentReplicas,
-				"to", expectedReplicas)
-
-			foundStatefulSet.Spec.Replicas = &expectedReplicas
-			if err := r.Update(ctx, foundStatefulSet); err != nil {
-				return err
-			}
-
-			// Reset ScaleDownReady flag after successful shrink
-			// This is done via a status update
-			return r.resetScaleDownStatus(ctx, kredis)
+	// 2. Create Logs PVC if not exists
+	logsPVCName := resource.LogsPVCName(podName)
+	logsPVC := &corev1.PersistentVolumeClaim{}
+	err = r.Get(ctx, types.NamespacedName{Name: logsPVCName, Namespace: kredis.Namespace}, logsPVC)
+	if err != nil && errors.IsNotFound(err) {
+		pvc := resource.CreateLogsPVC(kredis, podName, r.Scheme)
+		logger.Info("Creating logs PVC", "pvc", logsPVCName)
+		if err := r.Create(ctx, pvc); err != nil {
+			return fmt.Errorf("failed to create logs PVC: %w", err)
 		}
+	} else if err != nil {
+		return err
+	}
 
-		// Scale-up: Safe to update immediately
-		logger.Info("Updating StatefulSet replicas (scale-up)",
-			"current", currentReplicas,
-			"expected", expectedReplicas)
+	// 3. Create Pod
+	// Note: Initial role is determined by instance index (0 = master, 1+ = slave)
+	// Actual role may change after failover - Redis Cluster manages this
+	pod := resource.CreateShardPod(kredis, shardIdx, instanceIdx, r.Scheme)
 
-		foundStatefulSet.Spec.Replicas = &expectedReplicas
-		return r.Update(ctx, foundStatefulSet)
+	if err := r.Create(ctx, pod); err != nil {
+		return fmt.Errorf("failed to create pod: %w", err)
 	}
 
 	return nil
 }
 
-// resetScaleDownStatus clears the scale-down status flags after StatefulSet shrink
-func (r *KredisReconciler) resetScaleDownStatus(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
+// deleteMarkedPods deletes pods that have been marked for deletion after scale-down
+func (r *KredisReconciler) deleteMarkedPods(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
 	logger := log.FromContext(ctx)
 
+	// Check if there are pods to delete
+	if !kredis.Status.ScaleDownReady || len(kredis.Status.PodsToDelete) == 0 {
+		return nil
+	}
+
+	logger.Info("Deleting pods after scale-down", "pods", kredis.Status.PodsToDelete)
+
+	for _, podName := range kredis.Status.PodsToDelete {
+		if err := r.DeletePodWithPVCs(ctx, kredis, podName, true); err != nil {
+			logger.Error(err, "Failed to delete pod", "pod", podName)
+			// Continue with other pods
+		}
+	}
+
+	// Clear the PodsToDelete and ScaleDownReady flags
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Get latest version
 		currentKredis := &cachev1alpha1.Kredis{}
 		if err := r.Get(ctx, types.NamespacedName{Name: kredis.Name, Namespace: kredis.Namespace}, currentKredis); err != nil {
 			return err
 		}
 
-		// Reset scale-down flags
 		currentKredis.Status.ScaleDownReady = false
+		currentKredis.Status.PodsToDelete = nil
 		currentKredis.Status.PendingScaleDown = nil
-		currentKredis.Status.DesiredStatefulSetReplicas = nil
 
-		logger.Info("Resetting scale-down status flags after successful StatefulSet shrink")
+		logger.Info("Cleared scale-down status after pod deletion")
 		return r.Status().Update(ctx, currentKredis)
 	})
 }
 
+// DeletePodWithPVCs deletes a pod and optionally its PVCs
+// This is called by ClusterManager after Redis Cluster operations are complete
+func (r *KredisReconciler) DeletePodWithPVCs(ctx context.Context, kredis *cachev1alpha1.Kredis, podName string, deletePVCs bool) error {
+	logger := log.FromContext(ctx)
+
+	// Delete the pod
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: kredis.Namespace,
+		},
+	}
+	if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete pod %s: %w", podName, err)
+	}
+	logger.Info("Deleted pod", "pod", podName)
+
+	// Optionally delete PVCs
+	if deletePVCs {
+		// Delete data PVC
+		dataPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      resource.DataPVCName(podName),
+				Namespace: kredis.Namespace,
+			},
+		}
+		if err := r.Delete(ctx, dataPVC); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to delete data PVC", "pvc", dataPVC.Name)
+		}
+
+		// Delete logs PVC
+		logsPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      resource.LogsPVCName(podName),
+				Namespace: kredis.Namespace,
+			},
+		}
+		if err := r.Delete(ctx, logsPVC); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to delete logs PVC", "pvc", logsPVC.Name)
+		}
+	}
+
+	return nil
+}
+
 func (r *KredisReconciler) updateStatus(ctx context.Context, kredis *cachev1alpha1.Kredis, delta *cluster.ClusterStatusDelta) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Get the latest version of Kredis
 		currentKredis := &cachev1alpha1.Kredis{}
 		err := r.Get(ctx, types.NamespacedName{Name: kredis.Name, Namespace: kredis.Namespace}, currentKredis)
 		if err != nil {
 			return err
 		}
 
-		// Calculate the new status
-		foundStatefulSet := &appsv1.StatefulSet{}
-		err = r.Get(ctx, types.NamespacedName{Name: kredis.Name, Namespace: kredis.Namespace}, foundStatefulSet)
-		if err != nil {
-			return err
-		}
-
-		// Merge delta from ClusterManager first
+		// Merge delta from ClusterManager
 		if delta != nil {
 			if delta.LastClusterOperation != "" {
 				currentKredis.Status.LastClusterOperation = delta.LastClusterOperation
@@ -372,21 +453,25 @@ func (r *KredisReconciler) updateStatus(ctx context.Context, kredis *cachev1alph
 			if delta.ClusterState != "" {
 				currentKredis.Status.ClusterState = delta.ClusterState
 			}
-			// Scale-down related fields
 			if delta.PendingScaleDown != nil {
 				currentKredis.Status.PendingScaleDown = delta.PendingScaleDown
 			}
 			if delta.ScaleDownReady != nil {
 				currentKredis.Status.ScaleDownReady = *delta.ScaleDownReady
 			}
-			if delta.DesiredStatefulSetReplicas != nil {
-				currentKredis.Status.DesiredStatefulSetReplicas = delta.DesiredStatefulSetReplicas
+			if delta.PodsToDelete != nil {
+				currentKredis.Status.PodsToDelete = delta.PodsToDelete
+			}
+			if delta.LastScaleTime != nil {
+				currentKredis.Status.LastScaleTime = &metav1.Time{Time: *delta.LastScaleTime}
+			}
+			if delta.LastScaleType != "" {
+				currentKredis.Status.LastScaleType = delta.LastScaleType
 			}
 		}
 
-		newStatus := r.calculateStatus(currentKredis, foundStatefulSet)
+		newStatus := r.calculateStatus(ctx, currentKredis)
 
-		// If the status has not changed, do nothing
 		if reflect.DeepEqual(currentKredis.Status, newStatus) {
 			return nil
 		}
@@ -396,55 +481,51 @@ func (r *KredisReconciler) updateStatus(ctx context.Context, kredis *cachev1alph
 	})
 }
 
-func (r *KredisReconciler) calculateStatus(kredis *cachev1alpha1.Kredis, sts *appsv1.StatefulSet) cachev1alpha1.KredisStatus {
+func (r *KredisReconciler) calculateStatus(ctx context.Context, kredis *cachev1alpha1.Kredis) cachev1alpha1.KredisStatus {
 	newStatus := kredis.Status.DeepCopy()
 
-	newStatus.Replicas = sts.Status.Replicas
-	newStatus.ReadyReplicas = sts.Status.ReadyReplicas
+	// Count pods
+	pods, _ := r.getKredisPods(ctx, kredis)
+	readyCount := int32(0)
+	for _, pod := range pods {
+		if isPodReady(&pod) {
+			readyCount++
+		}
+	}
+
+	newStatus.Replicas = int32(len(pods))
+	newStatus.ReadyReplicas = readyCount
 
 	expectedReplicas := kredis.Spec.Masters + (kredis.Spec.Masters * kredis.Spec.Replicas)
 
-	if sts.Status.ReadyReplicas == expectedReplicas {
+	if readyCount == expectedReplicas {
 		newStatus.Phase = "Ready"
-	} else if sts.Status.Replicas > 0 {
+	} else if len(pods) > 0 {
 		newStatus.Phase = "Pending"
 	} else {
 		newStatus.Phase = "Creating"
 	}
 
-	// Determine ClusterState based on current situation
-	// Priority: Scale-down > Scaling detection > delta state > success state
-
-	// 1. Check if scale-down is in progress
+	// Determine ClusterState
 	isScaleDownInProgress := strings.Contains(kredis.Status.LastClusterOperation, "scaledown-") ||
 		len(kredis.Status.PendingScaleDown) > 0
 
-	// 2. Check if scaling is in progress (StatefulSet replicas != expected)
-	// This catches the case where Spec changed but pods aren't ready yet
-	// But exclude scale-down case (where we intentionally block StatefulSet shrink)
-	isScaling := (sts.Status.Replicas != expectedReplicas || sts.Status.ReadyReplicas != expectedReplicas) && !isScaleDownInProgress
+	isScaling := (int32(len(pods)) != expectedReplicas || readyCount != expectedReplicas) && !isScaleDownInProgress
 
-	// 3. Check if cluster operations are in progress
 	isOperationInProgress := strings.Contains(kredis.Status.LastClusterOperation, "-in-progress") ||
 		strings.Contains(kredis.Status.LastClusterOperation, "-pending") ||
 		strings.Contains(kredis.Status.LastClusterOperation, "-needed")
 
-	// 4. Determine ClusterState
 	if newStatus.ClusterState == "" {
-		// Initial state - no cluster operations have run yet
 		newStatus.ClusterState = string(cachev1alpha1.ClusterStateCreating)
 	} else if isScaleDownInProgress {
-		// Scale-down takes precedence
 		newStatus.ClusterState = string(cachev1alpha1.ClusterStateScalingDown)
 	} else if isScaling && newStatus.ClusterState == string(cachev1alpha1.ClusterStateRunning) {
-		// Was Running but now scaling (spec changed, waiting for pods)
 		newStatus.ClusterState = string(cachev1alpha1.ClusterStateScaling)
 	} else if isOperationInProgress {
-		// Keep the current state if an operation is in progress
-		// (delta should have set this, don't override)
+		// Keep the current state
 	} else if strings.Contains(kredis.Status.LastClusterOperation, "-success") {
-		// If last operation was successful and all pods are ready, show Running
-		if sts.Status.ReadyReplicas == expectedReplicas && !isScaling {
+		if readyCount == expectedReplicas && !isScaling {
 			newStatus.ClusterState = string(cachev1alpha1.ClusterStateRunning)
 		}
 	}
@@ -454,11 +535,11 @@ func (r *KredisReconciler) calculateStatus(kredis *cachev1alpha1.Kredis, sts *ap
 		Type:               "Ready",
 		Status:             metav1.ConditionFalse,
 		Reason:             "NotReady",
-		Message:            fmt.Sprintf("Ready replicas: %d/%d", newStatus.ReadyReplicas, expectedReplicas),
+		Message:            fmt.Sprintf("Ready replicas: %d/%d", readyCount, expectedReplicas),
 		LastTransitionTime: metav1.Now(),
 	}
 
-	if newStatus.ReadyReplicas == expectedReplicas && expectedReplicas > 0 {
+	if readyCount == expectedReplicas && expectedReplicas > 0 {
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = "AllReady"
 		condition.Message = "All Redis nodes are ready"
@@ -467,6 +548,18 @@ func (r *KredisReconciler) calculateStatus(kredis *cachev1alpha1.Kredis, sts *ap
 	newStatus.Conditions = []metav1.Condition{condition}
 
 	return *newStatus
+}
+
+func isPodReady(pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // getKredisPods returns all pods belonging to this Kredis instance
@@ -485,18 +578,18 @@ func (r *KredisReconciler) getKredisPods(ctx context.Context, kredis *cachev1alp
 	return podList.Items, nil
 }
 
-// cleanupKredisResources cleans up all resources associated with a Kredis instance during deletion.
-// This includes Jobs, and any other resources that might be orphaned.
+// cleanupKredisResources cleans up all resources associated with a Kredis instance
 func (r *KredisReconciler) cleanupKredisResources(ctx context.Context, kredis *cachev1alpha1.Kredis) error {
 	logger := log.FromContext(ctx)
 
 	// Cleanup Jobs
-	if err := r.ClusterManager.JobManager.CleanupCompletedJobs(ctx, kredis); err != nil {
-		logger.Error(err, "Failed to cleanup Jobs during deletion")
-		// Continue with other cleanup
+	if r.ClusterManager != nil && r.ClusterManager.JobManager != nil {
+		if err := r.ClusterManager.JobManager.CleanupCompletedJobs(ctx, kredis); err != nil {
+			logger.Error(err, "Failed to cleanup Jobs during deletion")
+		}
 	}
 
-	// Delete all Jobs (including running ones) for this Kredis instance
+	// Delete all Jobs
 	jobList := &batchv1.JobList{}
 	listOpts := []client.ListOption{
 		client.InNamespace(kredis.Namespace),
@@ -514,8 +607,37 @@ func (r *KredisReconciler) cleanupKredisResources(ctx context.Context, kredis *c
 				PropagationPolicy: &deletePolicy,
 			}); err != nil && !errors.IsNotFound(err) {
 				logger.Error(err, "Failed to delete Job", "job", job.Name)
-			} else {
-				logger.Info("Deleted Job during cleanup", "job", job.Name)
+			}
+		}
+	}
+
+	// Delete all Pods (they should be deleted by owner reference, but ensure cleanup)
+	pods, err := r.getKredisPods(ctx, kredis)
+	if err != nil {
+		logger.Error(err, "Failed to list pods for cleanup")
+	} else {
+		for _, pod := range pods {
+			if err := r.Delete(ctx, &pod); err != nil && !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to delete pod", "pod", pod.Name)
+			}
+		}
+	}
+
+	// Delete all PVCs
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	pvcListOpts := []client.ListOption{
+		client.InNamespace(kredis.Namespace),
+		client.MatchingLabels{
+			"app":                        "kredis",
+			"app.kubernetes.io/instance": kredis.Name,
+		},
+	}
+	if err := r.List(ctx, pvcList, pvcListOpts...); err != nil {
+		logger.Error(err, "Failed to list PVCs for cleanup")
+	} else {
+		for _, pvc := range pvcList.Items {
+			if err := r.Delete(ctx, &pvc); err != nil && !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to delete PVC", "pvc", pvc.Name)
 			}
 		}
 	}
@@ -528,8 +650,9 @@ func (r *KredisReconciler) cleanupKredisResources(ctx context.Context, kredis *c
 func (r *KredisReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cachev1alpha1.Kredis{}).
-		Owns(&appsv1.StatefulSet{}).
+		Owns(&corev1.Pod{}).
 		Owns(&corev1.Service{}).
+		Owns(&corev1.PersistentVolumeClaim{}).
 		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		Complete(r)
 }

@@ -196,15 +196,15 @@ type KredisStatus struct {
 	// +optional
 	PendingScaleDown []ScaleDownNode `json:"pendingScaleDown,omitempty"`
 
-	// ScaleDownReady indicates that all scale-down operations are complete and StatefulSet can be shrunk.
+	// ScaleDownReady indicates that all scale-down operations are complete and pods can be deleted.
 	// This is set to true when all nodes in PendingScaleDown have been safely removed from the cluster.
 	// +optional
 	ScaleDownReady bool `json:"scaleDownReady,omitempty"`
 
-	// DesiredStatefulSetReplicas stores the target replica count after scale-down is complete.
-	// This is used to prevent premature StatefulSet updates during scale-down.
+	// PodsToDelete contains pod names that are ready to be deleted after scale-down operations.
+	// The operator deletes these pods directly instead of relying on StatefulSet.
 	// +optional
-	DesiredStatefulSetReplicas *int32 `json:"desiredStatefulSetReplicas,omitempty"`
+	PodsToDelete []string `json:"podsToDelete,omitempty"`
 }
 
 // ScaleDownNode represents a node being removed during scale-down

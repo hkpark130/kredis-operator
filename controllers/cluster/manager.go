@@ -48,9 +48,12 @@ type ClusterStatusDelta struct {
 	ClusterNodes         []cachev1alpha1.ClusterNode
 	ClusterState         string
 	// Scale-down related fields
-	PendingScaleDown           []cachev1alpha1.ScaleDownNode
-	ScaleDownReady             *bool
-	DesiredStatefulSetReplicas *int32
+	PendingScaleDown []cachev1alpha1.ScaleDownNode
+	ScaleDownReady   *bool
+	PodsToDelete     []string // Pod names ready to be deleted after scale-down
+	// Autoscaling stabilization fields - set when scale operations complete
+	LastScaleTime *time.Time
+	LastScaleType string
 }
 
 // ReconcileCluster manages the Redis cluster state and returns whether cluster is ready
@@ -248,7 +251,7 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 	// NOTE: This condition only handles scale-up. Scale-down requires different handling:
 	// - Need to reshard slots away from nodes being removed
 	// - Need to gracefully remove nodes from cluster before pod deletion
-	// - Current StatefulSet-based approach doesn't support this well
+	// - Operator directly manages pod deletion for precise control
 	if currentJoinedNodes < int(expectedTotalNodes) && unassignedPodCount > 0 {
 		logger.Info("Cluster needs scaling. More nodes need to be joined.", "action", "OperationScale")
 		return OperationScale
@@ -261,8 +264,8 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 	// Scale-down process:
 	// 1. Migrate slots from masters being removed (reshard with weight=0)
 	// 2. Execute CLUSTER FORGET on all remaining nodes
-	// 3. Set ScaleDownReady=true in status
-	// 4. Controller then shrinks StatefulSet
+	// 3. Set ScaleDownReady=true and PodsToDelete in status
+	// 4. Controller then deletes specific pods directly
 	if currentJoinedNodes > int(expectedTotalNodes) {
 		logger.Info("Cluster has more nodes than expected - initiating scale-down",
 			"currentJoined", currentJoinedNodes,
@@ -459,11 +462,25 @@ func (cm *ClusterManager) discoverClusterState(ctx context.Context, kredis *cach
 	return clusterNodes, nil
 }
 
-// areAllPodsReady checks if all expected pods are ready
+// areAllPodsReady checks if all expected pods are ready.
+// For scale-down: pods > expectedCount is normal, so we check if at least expectedCount are ready.
+// For scale-up: pods < expectedCount means we're waiting for pods to be created.
 func (cm *ClusterManager) areAllPodsReady(pods []corev1.Pod, kredis *cachev1alpha1.Kredis) bool {
 	expectedCount := cm.getExpectedPodCount(kredis)
 	readyPods := cm.getReadyPods(pods)
-	return len(readyPods) == int(expectedCount) && len(pods) == int(expectedCount)
+	podCount := int32(len(pods))
+	readyCount := int32(len(readyPods))
+
+	// Scale-down scenario: more pods exist than expected
+	// In this case, we should proceed if we have enough ready pods
+	if podCount > expectedCount {
+		// For scale-down, we need at least expectedCount ready pods to proceed
+		// But actually, we need ALL current pods to be ready for safe operation
+		return readyCount == podCount
+	}
+
+	// Normal or scale-up scenario: check if we have exactly the expected count
+	return readyCount == expectedCount && podCount == expectedCount
 }
 
 // getReadyPods returns only the ready pods
@@ -667,8 +684,7 @@ func filterNewPods(pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) 
 }
 
 // SyncPodRoleLabels: discovered cluster state 를 바탕으로 각 파드의 role 라벨(master/replica/unknown)을 동기화
-// StatefulSet selector 에 포함되지 않은 라벨만 수정해야 함 (현재 selector 는 app, app.kubernetes.io/name, app.kubernetes.io/instance, role
-// 이므로 role 은 selector 에 포함되어 StatefulSet 자체의 PodTemplate 라벨 변경은 재생성 위험 -> Patch 로 개별 Pod 업데이트)
+// role 라벨은 Service selector에 사용되므로 Patch로 개별 Pod 업데이트
 func (cm *ClusterManager) SyncPodRoleLabels(ctx context.Context, kredis *cachev1alpha1.Kredis, clusterState []cachev1alpha1.ClusterNode) {
 	logger := log.FromContext(ctx)
 	for _, node := range clusterState {
@@ -696,7 +712,7 @@ func (cm *ClusterManager) SyncPodRoleLabels(ctx context.Context, kredis *cachev1
 		if current == desired {
 			continue
 		}
-		// Patch only the metadata.labels.role field to avoid touching spec for StatefulSet managed pods
+		// Patch only the metadata.labels.role field
 		patch := client.MergeFrom(pod.DeepCopy())
 		pod.Labels["role"] = desired
 		if err := cm.Patch(ctx, &pod, patch); err != nil {

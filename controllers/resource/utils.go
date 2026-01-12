@@ -32,7 +32,7 @@ func LabelsForKredis(name string, role string) map[string]string {
 	}
 }
 
-// BaseLabelsForKredis returns labels without role (for StatefulSet, etc.)
+// BaseLabelsForKredis returns labels without role (for Services, etc.)
 func BaseLabelsForKredis(name string) map[string]string {
 	return map[string]string{
 		"app":                        "kredis",

@@ -22,11 +22,12 @@ const (
 
 // scaleDownCluster handles removing nodes from the cluster safely.
 // Scale-down order:
-// 1. Identify nodes to remove (highest ordinal pods first for StatefulSet compatibility)
-// 2. For masters: Migrate all slots to remaining masters using rebalance with weight=0
-// 3. For all nodes: Execute CLUSTER FORGET on all remaining nodes
-// 4. After all nodes are removed from cluster, set ScaleDownReady=true
-// 5. Controller then shrinks StatefulSet
+//  1. Identify nodes to remove (based on pod naming: highest master index for master scale-down,
+//     highest replica index for replica scale-down)
+//  2. For masters: Migrate all slots to remaining masters using rebalance with weight=0
+//  3. For all nodes: Execute CLUSTER FORGET on all remaining nodes
+//  4. After all nodes are removed from cluster, set ScaleDownReady=true and PodsToDelete
+//  5. Controller then deletes specific pods directly
 func (cm *ClusterManager) scaleDownCluster(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode, delta *ClusterStatusDelta) error {
 	logger := log.FromContext(ctx)
 	lastOp := kredis.Status.LastClusterOperation
@@ -147,7 +148,9 @@ func (cm *ClusterManager) scaleDownCluster(ctx context.Context, kredis *cachev1a
 }
 
 // identifyNodesToRemove determines which nodes need to be removed based on spec vs actual state.
-// Returns nodes in order they should be removed (replicas first, then masters; highest ordinal first).
+// This function works with both new Pod naming (kredis-master-0) and legacy StatefulSet naming (kredis-0).
+// It uses clusterState to determine node roles, not Pod names.
+// Returns nodes in order they should be removed (replicas first, then masters).
 func (cm *ClusterManager) identifyNodesToRemove(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode) []cachev1alpha1.ClusterNode {
 	logger := log.FromContext(ctx)
 
@@ -155,43 +158,113 @@ func (cm *ClusterManager) identifyNodesToRemove(ctx context.Context, kredis *cac
 	currentTotal := int32(len(clusterState))
 
 	if currentTotal <= expectedTotal {
-		return nil // No nodes to remove
+		logger.Info("No nodes to remove", "current", currentTotal, "expected", expectedTotal)
+		return nil
 	}
 
 	nodesToRemove := int(currentTotal - expectedTotal)
 	logger.Info("Calculating nodes to remove", "current", currentTotal, "expected", expectedTotal, "toRemove", nodesToRemove)
 
-	// Build a map of nodes for quick lookup
-	nodeMap := make(map[string]cachev1alpha1.ClusterNode)
+	// Separate masters and slaves from clusterState
+	var masters, slaves []cachev1alpha1.ClusterNode
 	for _, node := range clusterState {
 		if node.NodeID != "" && node.Role != "unknown" && node.Role != "" {
-			nodeMap[node.PodName] = node
+			if node.Role == "master" {
+				masters = append(masters, node)
+			} else if node.Role == "slave" {
+				slaves = append(slaves, node)
+			}
 		}
 	}
 
-	// Sort pods by ordinal (highest first) - these are the ones to remove
-	// StatefulSet scales down by removing highest ordinal pods first
-	var candidateNodes []cachev1alpha1.ClusterNode
+	currentMasterCount := int32(len(masters))
+	currentSlaveCount := int32(len(slaves))
+	expectedMasters := kredis.Spec.Masters
+	expectedSlaves := kredis.Spec.Masters * kredis.Spec.Replicas
 
-	// Get nodes from highest ordinal pods
-	for i := len(pods) - 1; i >= 0 && len(candidateNodes) < nodesToRemove; i-- {
-		pod := pods[i]
-		if node, ok := nodeMap[pod.Name]; ok {
-			candidateNodes = append(candidateNodes, node)
+	logger.Info("Current cluster composition",
+		"masters", currentMasterCount,
+		"slaves", currentSlaveCount,
+		"expectedMasters", expectedMasters,
+		"expectedSlaves", expectedSlaves)
+
+	var result []cachev1alpha1.ClusterNode
+
+	// Case 1: Need to remove masters (memory scale-down)
+	mastersToRemove := currentMasterCount - expectedMasters
+	if mastersToRemove > 0 {
+		logger.Info("Master scale-down detected", "toRemove", mastersToRemove)
+
+		// Sort masters by slot count (remove ones with fewest slots first, or empty ones)
+		// For simplicity, just take masters from the end (assuming highest index)
+		// But since we can't rely on Pod naming, we select masters with slots=0 first
+		var emptyMasters, slottedMasters []cachev1alpha1.ClusterNode
+		for _, m := range masters {
+			if m.SlotCount == 0 {
+				emptyMasters = append(emptyMasters, m)
+			} else {
+				slottedMasters = append(slottedMasters, m)
+			}
+		}
+
+		// Remove empty masters first, then slotted ones from the end
+		mastersToRemoveList := append(emptyMasters, slottedMasters...)
+		if len(mastersToRemoveList) > int(mastersToRemove) {
+			mastersToRemoveList = mastersToRemoveList[len(mastersToRemoveList)-int(mastersToRemove):]
+		}
+
+		// Build set of master NodeIDs being removed
+		removeMasterIDs := make(map[string]struct{})
+		for _, m := range mastersToRemoveList {
+			removeMasterIDs[m.NodeID] = struct{}{}
+		}
+
+		// First add slaves of masters being removed
+		for _, slave := range slaves {
+			if _, shouldRemove := removeMasterIDs[slave.MasterID]; shouldRemove {
+				result = append(result, slave)
+				logger.Info("Marking slave for removal (master being removed)", "pod", slave.PodName, "masterID", slave.MasterID)
+			}
+		}
+
+		// Then add the masters
+		for _, m := range mastersToRemoveList {
+			result = append(result, m)
+			logger.Info("Marking master for removal", "pod", m.PodName, "slots", m.SlotCount)
 		}
 	}
 
-	// Reorder: replicas first, then masters (safer to remove replicas first)
-	var replicas, masters []cachev1alpha1.ClusterNode
-	for _, node := range candidateNodes {
-		if node.Role == "slave" {
-			replicas = append(replicas, node)
-		} else {
-			masters = append(masters, node)
+	// Case 2: Need to remove replicas (CPU scale-down) - masters are at expected count
+	if mastersToRemove <= 0 && currentSlaveCount > expectedSlaves {
+		slavesToRemove := currentSlaveCount - expectedSlaves
+		logger.Info("Replica scale-down detected", "toRemove", slavesToRemove)
+
+		// Remove slaves evenly from each master
+		// Build a map of masterID -> slaves
+		masterSlaveMap := make(map[string][]cachev1alpha1.ClusterNode)
+		for _, slave := range slaves {
+			masterSlaveMap[slave.MasterID] = append(masterSlaveMap[slave.MasterID], slave)
+		}
+
+		// Calculate how many to remove per master
+		perMasterRemove := int(slavesToRemove) / len(masterSlaveMap)
+		if perMasterRemove == 0 {
+			perMasterRemove = 1
+		}
+
+		removed := 0
+		for masterID, slaveList := range masterSlaveMap {
+			for i := 0; i < perMasterRemove && removed < int(slavesToRemove); i++ {
+				if i < len(slaveList) {
+					result = append(result, slaveList[len(slaveList)-1-i])
+					logger.Info("Marking slave for removal", "pod", slaveList[len(slaveList)-1-i].PodName, "masterID", masterID)
+					removed++
+				}
+			}
 		}
 	}
 
-	result := append(replicas, masters...)
+	logger.Info("Identified nodes to remove", "count", len(result))
 	return result
 }
 
@@ -460,7 +533,7 @@ func (cm *ClusterManager) checkScaleDownForgetAndProceed(ctx context.Context, kr
 	return nil
 }
 
-// markNodeCompletedAndContinue marks a node as completed and processes the next one
+// markNodeCompletedAndContinue marks a node as completed and sets up for next reconcile
 func (cm *ClusterManager) markNodeCompletedAndContinue(ctx context.Context, kredis *cachev1alpha1.Kredis, completedNodeID string, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode, delta *ClusterStatusDelta) error {
 	logger := log.FromContext(ctx)
 
@@ -476,23 +549,29 @@ func (cm *ClusterManager) markNodeCompletedAndContinue(ctx context.Context, kred
 	}
 	delta.PendingScaleDown = pendingNodes
 
-	// Find next node to process
+	// Check if there are more nodes to process
+	hasMoreNodes := false
 	for _, node := range pendingNodes {
 		if node.Phase != ScaleDownPhaseCompleted {
-			// Found next node - restart scale-down process for it
-			logger.Info("Processing next node for scale-down", "nodeID", node.NodeID)
-			delta.LastClusterOperation = fmt.Sprintf("scaledown-in-progress:%d", time.Now().Unix())
-			// Update kredis status with the new pending nodes for the recursive call
-			kredis.Status.PendingScaleDown = pendingNodes
-			return cm.scaleDownCluster(ctx, kredis, pods, clusterState, delta)
+			hasMoreNodes = true
+			logger.Info("More nodes pending for scale-down", "nextNodeID", node.NodeID, "phase", node.Phase)
+			break
 		}
+	}
+
+	if hasMoreNodes {
+		// Set status for next reconcile to continue processing
+		// DO NOT use recursive call - it causes infinite loop because kredis.Status is not yet updated
+		delta.LastClusterOperation = fmt.Sprintf("scaledown-in-progress:%d", time.Now().Unix())
+		delta.ClusterState = string(cachev1alpha1.ClusterStateScalingDown)
+		return nil // Next reconcile will pick up where we left off
 	}
 
 	// All nodes completed
 	return cm.finalizeScaleDown(ctx, kredis, pods, clusterState, delta)
 }
 
-// finalizeScaleDown completes the scale-down operation and allows StatefulSet shrinking
+// finalizeScaleDown completes the scale-down operation and marks pods for deletion
 func (cm *ClusterManager) finalizeScaleDown(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode, delta *ClusterStatusDelta) error {
 	logger := log.FromContext(ctx)
 
@@ -525,21 +604,31 @@ func (cm *ClusterManager) finalizeScaleDown(ctx context.Context, kredis *cachev1
 	}
 
 	// All nodes successfully removed from cluster
-	logger.Info("Scale-down complete - all nodes removed from cluster, ready to shrink StatefulSet")
+	logger.Info("Scale-down complete - all nodes removed from cluster, ready to delete pods")
 
-	// Set ScaleDownReady flag to allow controller to shrink StatefulSet via delta
+	// Set ScaleDownReady flag to allow controller to delete pods
 	scaleDownReady := true
 	delta.ScaleDownReady = &scaleDownReady
 
-	// Calculate desired StatefulSet replicas
-	expectedReplicas := cm.getExpectedPodCount(kredis)
-	delta.DesiredStatefulSetReplicas = &expectedReplicas
+	// Collect pod names to delete
+	var podsToDelete []string
+	for _, node := range kredis.Status.PendingScaleDown {
+		if node.PodName != "" {
+			podsToDelete = append(podsToDelete, node.PodName)
+		}
+	}
+	delta.PodsToDelete = podsToDelete
 
 	// Clear PendingScaleDown via delta
 	delta.PendingScaleDown = []cachev1alpha1.ScaleDownNode{} // Empty slice to clear
 
 	delta.LastClusterOperation = fmt.Sprintf("scaledown-success:%d", time.Now().Unix())
 	delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
+
+	// Update LastScaleTime to enable stabilization window for autoscaling
+	now := time.Now()
+	delta.LastScaleTime = &now
+	delta.LastScaleType = "masters-down" // Scale-down operation
 
 	return nil
 }

@@ -317,9 +317,50 @@ spec:
                 description: LastScaleType indicates the last scale operation type
                   (masters-up, masters-down, replicas-up, replicas-down)
                 type: string
+              pendingScaleDown:
+                description: |-
+                  PendingScaleDown contains nodes waiting to be removed from the cluster.
+                  These nodes must complete data migration (reshard) and cluster forget before pod deletion.
+                  Format: list of node IDs that are being removed
+                items:
+                  description: ScaleDownNode represents a node being removed during
+                    scale-down
+                  properties:
+                    nodeId:
+                      description: NodeID is the Redis cluster node ID to be removed
+                      type: string
+                    phase:
+                      description: |-
+                        Phase indicates the current phase of scale-down for this node
+                        Values: pending, resharding, forgetting, completed
+                      type: string
+                    podName:
+                      description: PodName is the name of the pod to be deleted
+                      type: string
+                    role:
+                      description: Role is the role of the node (master/slave)
+                      type: string
+                    slotsMigrated:
+                      description: SlotsMigrated indicates how many slots have been
+                        migrated (for masters)
+                      type: integer
+                  required:
+                  - nodeId
+                  - phase
+                  - podName
+                  - role
+                  type: object
+                type: array
               phase:
                 description: Phase represents the current state of the Kredis deployment
                 type: string
+              podsToDelete:
+                description: |-
+                  PodsToDelete contains pod names that are ready to be deleted after scale-down operations.
+                  The operator deletes these pods directly instead of relying on StatefulSet.
+                items:
+                  type: string
+                type: array
               readyReplicas:
                 description: Number of ready replicas
                 format: int32
@@ -328,6 +369,11 @@ spec:
                 description: Total number of replicas
                 format: int32
                 type: integer
+              scaleDownReady:
+                description: |-
+                  ScaleDownReady indicates that all scale-down operations are complete and pods can be deleted.
+                  This is set to true when all nodes in PendingScaleDown have been safely removed from the cluster.
+                type: boolean
             type: object
         type: object
     served: true

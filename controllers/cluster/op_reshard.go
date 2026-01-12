@@ -121,6 +121,7 @@ func (cm *ClusterManager) checkReshardJobsAndProceed(ctx context.Context, kredis
 		// No empty masters, proceed to rebalance
 		logger.Info("No empty masters remaining, proceeding to rebalance")
 		delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
+		delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
 		return nil
 
 	case JobStatusPending, JobStatusRunning:
@@ -159,6 +160,7 @@ func (cm *ClusterManager) checkReshardJobsAndProceed(ctx context.Context, kredis
 		// All empty masters handled, proceed to rebalance
 		logger.Info("All reshard Jobs complete, proceeding to rebalance phase")
 		delta.LastClusterOperation = fmt.Sprintf("rebalance-in-progress:%d", time.Now().Unix())
+		delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
 		return nil
 
 	case JobStatusFailed:

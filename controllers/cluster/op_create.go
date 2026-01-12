@@ -168,6 +168,12 @@ func (cm *ClusterManager) verifyClusterCreation(ctx context.Context, kredis *cac
 	known := len(pods)
 	delta.KnownClusterNodes = &known
 
+	// Update LastScaleTime to enable stabilization window for autoscaling
+	// This prevents autoscaling from triggering immediately after cluster creation
+	now := time.Now()
+	delta.LastScaleTime = &now
+	delta.LastScaleType = "create"
+
 	// Cleanup completed jobs
 	_ = cm.JobManager.CleanupCompletedJobs(ctx, kredis)
 

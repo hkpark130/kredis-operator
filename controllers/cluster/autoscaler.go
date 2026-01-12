@@ -67,11 +67,8 @@ func (a *Autoscaler) EvaluateAutoscaling(ctx context.Context, kredis *cachev1alp
 		return &AutoscaleResult{Decision: AutoscaleDecision{ShouldScale: false, Reason: "Cluster not stable"}}, nil
 	}
 
-	// Check stabilization windows
-	if !a.canScale(kredis) {
-		logger.V(1).Info("Within stabilization window, skipping autoscaling")
-		return &AutoscaleResult{Decision: AutoscaleDecision{ShouldScale: false, Reason: "Within stabilization window"}}, nil
-	}
+	// Note: Stabilization window check is now done per-direction in evaluateScalingDecision
+	// This allows different windows for scale-up vs scale-down
 
 	// Collect metrics from Kubernetes Metrics API
 	memoryPercent, cpuPercent, err := a.collectMetrics(ctx, kredis, pods)
@@ -113,38 +110,43 @@ func (a *Autoscaler) isClusterStable(kredis *cachev1alpha1.Kredis) bool {
 		state == string(cachev1alpha1.ClusterStateInitialized)
 }
 
-// canScale checks if enough time has passed since the last scale operation
-func (a *Autoscaler) canScale(kredis *cachev1alpha1.Kredis) bool {
-	if kredis.Status.LastScaleTime == nil {
-		return true
-	}
-
+// canScaleInDirection checks if enough time has passed to allow scaling in the given direction.
+// direction should be "up" or "down".
+// This considers:
+// 1. Time since last scale operation (if available)
+// 2. Time since cluster was created (fallback for initial stabilization)
+func (a *Autoscaler) canScaleInDirection(kredis *cachev1alpha1.Kredis, direction string) bool {
 	spec := kredis.Spec.Autoscaling
-	lastScaleTime := kredis.Status.LastScaleTime.Time
 	now := time.Now()
 
-	// Determine which stabilization window to use
+	// Determine which stabilization window to use based on intended direction
 	var stabilizationSeconds int32
-	lastScaleType := kredis.Status.LastScaleType
-
-	// If last operation was scale up, use scale down stabilization for scale down decisions
-	// and shorter window for scale up
-	if lastScaleType == "masters-down" || lastScaleType == "replicas-down" {
+	if direction == "down" {
 		stabilizationSeconds = spec.ScaleDownStabilizationWindowSeconds
+		if stabilizationSeconds == 0 {
+			stabilizationSeconds = 300 // Default 5 minutes for scale down
+		}
 	} else {
 		stabilizationSeconds = spec.ScaleUpStabilizationWindowSeconds
-	}
-
-	if stabilizationSeconds == 0 {
-		// Use defaults if not set
-		if lastScaleType == "masters-down" || lastScaleType == "replicas-down" {
-			stabilizationSeconds = 300 // 5 minutes for scale down
-		} else {
-			stabilizationSeconds = 60 // 1 minute for scale up
+		if stabilizationSeconds == 0 {
+			stabilizationSeconds = 60 // Default 1 minute for scale up
 		}
 	}
 
-	return now.Sub(lastScaleTime) >= time.Duration(stabilizationSeconds)*time.Second
+	// If LastScaleTime is set, use it as the primary reference
+	if kredis.Status.LastScaleTime != nil {
+		lastScaleTime := kredis.Status.LastScaleTime.Time
+		return now.Sub(lastScaleTime) >= time.Duration(stabilizationSeconds)*time.Second
+	}
+
+	// Fallback: Use cluster creation time if LastScaleTime is not set
+	// This prevents scaling immediately after cluster creation
+	if kredis.CreationTimestamp.Time.IsZero() {
+		return true // Shouldn't happen, but allow if no creation time
+	}
+
+	creationTime := kredis.CreationTimestamp.Time
+	return now.Sub(creationTime) >= time.Duration(stabilizationSeconds)*time.Second
 }
 
 // collectMetrics collects CPU and memory metrics from Kubernetes Metrics API
@@ -264,13 +266,13 @@ func (a *Autoscaler) collectMetrics(ctx context.Context, kredis *cachev1alpha1.K
 }
 
 // evaluateScalingDecision determines if and how to scale based on metrics
+// Each scaling decision checks its own stabilization window before proceeding
 func (a *Autoscaler) evaluateScalingDecision(kredis *cachev1alpha1.Kredis, memoryPercent, cpuPercent int32) AutoscaleDecision {
 	spec := kredis.Spec.Autoscaling
 	currentMasters := kredis.Spec.Masters
 	currentReplicas := kredis.Spec.Replicas
 
 	// Set defaults if thresholds are not configured
-	// NOTE: Scale-down thresholds not used (scale-down not supported yet)
 	memScaleUp := spec.MemoryScaleUpThreshold
 	if memScaleUp == 0 {
 		memScaleUp = 80 // Default 80%
@@ -280,7 +282,7 @@ func (a *Autoscaler) evaluateScalingDecision(kredis *cachev1alpha1.Kredis, memor
 		cpuScaleUp = 80 // Default 80%
 	}
 
-	// Set defaults for max (min not used - scale-down not supported)
+	// Set defaults for max
 	maxMasters := spec.MaxMasters
 	if maxMasters == 0 {
 		maxMasters = 100 // Reasonable upper limit
@@ -290,64 +292,83 @@ func (a *Autoscaler) evaluateScalingDecision(kredis *cachev1alpha1.Kredis, memor
 		maxReplicas = 5 // Reasonable upper limit
 	}
 
-	// Priority 1: Memory-based master scaling (for data capacity)
-	// Scale up masters when memory is high
-	if memoryPercent >= memScaleUp && currentMasters < maxMasters {
-		newMasters := currentMasters + 1
-		return AutoscaleDecision{
-			ShouldScale: true,
-			ScaleType:   "masters-up",
-			NewMasters:  newMasters,
-			Reason:      fmt.Sprintf("Memory usage %d%% >= threshold %d%%, scaling masters %d -> %d", memoryPercent, memScaleUp, currentMasters, newMasters),
-		}
-	}
-
-	// Priority 1.5: Memory-based master scale-down (when memory usage is low)
-	// Scale down masters when memory is consistently low
-	memScaleDown := spec.MemoryScaleDownThreshold
-	if memScaleDown == 0 {
-		memScaleDown = 30 // Default 30%
-	}
+	// Set defaults for min
 	minMasters := spec.MinMasters
 	if minMasters == 0 {
 		minMasters = 3 // Minimum 3 masters for Redis Cluster
 	}
-	if memoryPercent <= memScaleDown && currentMasters > minMasters {
-		newMasters := currentMasters - 1
-		return AutoscaleDecision{
-			ShouldScale: true,
-			ScaleType:   "masters-down",
-			NewMasters:  newMasters,
-			Reason:      fmt.Sprintf("Memory usage %d%% <= threshold %d%%, scaling masters %d -> %d", memoryPercent, memScaleDown, currentMasters, newMasters),
-		}
-	}
+	minReplicas := spec.MinReplicasPerMaster
+	// minReplicas can be 0 (no replicas), so no default needed
 
-	// Priority 2: CPU-based replica scaling (for read capacity)
-	// Scale up replicas when CPU is high
-	if cpuPercent >= cpuScaleUp && currentReplicas < maxReplicas {
-		newReplicas := currentReplicas + 1
-		return AutoscaleDecision{
-			ShouldScale: true,
-			ScaleType:   "replicas-up",
-			NewReplicas: newReplicas,
-			Reason:      fmt.Sprintf("CPU usage %d%% >= threshold %d%%, scaling replicas %d -> %d", cpuPercent, cpuScaleUp, currentReplicas, newReplicas),
-		}
+	// Set defaults for scale-down thresholds
+	memScaleDown := spec.MemoryScaleDownThreshold
+	if memScaleDown == 0 {
+		memScaleDown = 30 // Default 30%
 	}
-
-	// Priority 2.5: CPU-based replica scale-down (when CPU usage is low)
 	cpuScaleDown := spec.CPUScaleDownThreshold
 	if cpuScaleDown == 0 {
 		cpuScaleDown = 30 // Default 30%
 	}
-	minReplicas := spec.MinReplicasPerMaster
-	// minReplicas can be 0 (no replicas), so no default needed
+
+	// Priority 1: Memory-based master scale-up (for data capacity)
+	if memoryPercent >= memScaleUp && currentMasters < maxMasters {
+		// Check if scale-up is allowed (stabilization window)
+		if !a.canScaleInDirection(kredis, "up") {
+			// Can't scale up yet, but maybe scale down is needed - continue checking
+		} else {
+			newMasters := currentMasters + 1
+			return AutoscaleDecision{
+				ShouldScale: true,
+				ScaleType:   "masters-up",
+				NewMasters:  newMasters,
+				Reason:      fmt.Sprintf("Memory usage %d%% >= threshold %d%%, scaling masters %d -> %d", memoryPercent, memScaleUp, currentMasters, newMasters),
+			}
+		}
+	}
+
+	// Priority 1.5: Memory-based master scale-down (when memory usage is low)
+	if memoryPercent <= memScaleDown && currentMasters > minMasters {
+		// Check if scale-down is allowed (stabilization window)
+		if !a.canScaleInDirection(kredis, "down") {
+			// Can't scale down yet - but continue checking other options
+		} else {
+			newMasters := currentMasters - 1
+			return AutoscaleDecision{
+				ShouldScale: true,
+				ScaleType:   "masters-down",
+				NewMasters:  newMasters,
+				Reason:      fmt.Sprintf("Memory usage %d%% <= threshold %d%%, scaling masters %d -> %d", memoryPercent, memScaleDown, currentMasters, newMasters),
+			}
+		}
+	}
+
+	// Priority 2: CPU-based replica scale-up (for read capacity)
+	if cpuPercent >= cpuScaleUp && currentReplicas < maxReplicas {
+		if !a.canScaleInDirection(kredis, "up") {
+			// Can't scale up yet
+		} else {
+			newReplicas := currentReplicas + 1
+			return AutoscaleDecision{
+				ShouldScale: true,
+				ScaleType:   "replicas-up",
+				NewReplicas: newReplicas,
+				Reason:      fmt.Sprintf("CPU usage %d%% >= threshold %d%%, scaling replicas %d -> %d", cpuPercent, cpuScaleUp, currentReplicas, newReplicas),
+			}
+		}
+	}
+
+	// Priority 2.5: CPU-based replica scale-down (when CPU usage is low)
 	if cpuPercent <= cpuScaleDown && currentReplicas > minReplicas {
-		newReplicas := currentReplicas - 1
-		return AutoscaleDecision{
-			ShouldScale: true,
-			ScaleType:   "replicas-down",
-			NewReplicas: newReplicas,
-			Reason:      fmt.Sprintf("CPU usage %d%% <= threshold %d%%, scaling replicas %d -> %d", cpuPercent, cpuScaleDown, currentReplicas, newReplicas),
+		if !a.canScaleInDirection(kredis, "down") {
+			// Can't scale down yet
+		} else {
+			newReplicas := currentReplicas - 1
+			return AutoscaleDecision{
+				ShouldScale: true,
+				ScaleType:   "replicas-down",
+				NewReplicas: newReplicas,
+				Reason:      fmt.Sprintf("CPU usage %d%% <= threshold %d%%, scaling replicas %d -> %d", cpuPercent, cpuScaleDown, currentReplicas, newReplicas),
+			}
 		}
 	}
 

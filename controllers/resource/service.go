@@ -96,6 +96,32 @@ func CreateRedisSlaveNodePortService(k *cachev1alpha1.Kredis, scheme *runtime.Sc
 }
 */
 
+// CreateRedisHeadlessService creates a headless service for pod DNS resolution
+// Each pod gets DNS: {podName}.{serviceName}.{namespace}.svc.cluster.local
+func CreateRedisHeadlessService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
+	baseLabels := BaseLabelsForKredis(k.Name)
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      k.Name, // kredis-sample
+			Namespace: k.Namespace,
+			Labels:    baseLabels,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector:  baseLabels,
+			ClusterIP: "None", // Headless
+			Ports: []corev1.ServicePort{
+				{Name: "redis", Port: k.Spec.BasePort, TargetPort: intstr.FromString("redis")},
+				{Name: "cluster-bus", Port: k.Spec.BasePort + 10000, TargetPort: intstr.FromString("cluster-bus")},
+			},
+			// PublishNotReadyAddresses allows DNS resolution even for not-ready pods
+			PublishNotReadyAddresses: true,
+		},
+	}
+	controllerutil.SetControllerReference(k, svc, scheme)
+	return svc
+}
+
 // CreateRedisMasterService: 쓰기용 Master 전용 서비스
 func CreateRedisMasterService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
 	baseLabels := BaseLabelsForKredis(k.Name)

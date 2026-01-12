@@ -110,6 +110,7 @@ func (cm *ClusterManager) executeRebalancePhase(ctx context.Context, kredis *cac
 			logger.Info("Some masters still have no slots after rebalance")
 			// Might need another rebalance round
 			delta.LastClusterOperation = fmt.Sprintf("rebalance-needed:%d", time.Now().Unix())
+			delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
 			return nil
 		}
 
@@ -117,6 +118,12 @@ func (cm *ClusterManager) executeRebalancePhase(ctx context.Context, kredis *cac
 		logger.Info("Rebalance completed successfully - all masters have slots")
 		delta.LastClusterOperation = fmt.Sprintf("rebalance-success:%d", time.Now().Unix())
 		delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
+
+		// Update LastScaleTime to enable stabilization window for autoscaling
+		// Rebalance completes the scale-up process, so mark scale time here
+		now := time.Now()
+		delta.LastScaleTime = &now
+		delta.LastScaleType = "masters-up"
 
 		// Cleanup completed Jobs
 		_ = cm.JobManager.CleanupCompletedJobs(ctx, kredis)

@@ -21,10 +21,10 @@ import (
 type JobType string
 
 const (
-	JobTypeCreate          JobType = "create"
-	JobTypeReshard         JobType = "reshard"
-	JobTypeRebalance       JobType = "rebalance"
-	JobTypeAddNode         JobType = "add-node"
+	JobTypeCreate           JobType = "create"
+	JobTypeReshard          JobType = "reshard"
+	JobTypeRebalance        JobType = "rebalance"
+	JobTypeAddNode          JobType = "add-node"
 	JobTypeScaleDownMigrate JobType = "scaledown-migrate" // Migrate slots from master to be removed
 	JobTypeScaleDownForget  JobType = "scaledown-forget"  // Remove node from cluster
 )

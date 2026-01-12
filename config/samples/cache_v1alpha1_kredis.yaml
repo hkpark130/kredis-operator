@@ -35,4 +35,4 @@ spec:
     cpuScaleUpThreshold: 30      # CPU 30% 이상 → Replica 추가 (테스트용) 보통 70%
     cpuScaleDownThreshold: 10    # CPU 10% 이하 → Replica 감소 보통 30%
     scaleUpStabilizationWindowSeconds: 10   # 스케일업 대기 시간 (테스트용 짧게) 보통 60초
-    scaleDownStabilizationWindowSeconds: 30 # 스케일다운 대기 시간 보통 300초
+    scaleDownStabilizationWindowSeconds: 60 # 스케일다운 대기 시간 보통 10분 (600)
