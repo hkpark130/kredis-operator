@@ -36,6 +36,10 @@ func (cm *ClusterManager) scaleDownCluster(ctx context.Context, kredis *cachev1a
 	if strings.Contains(lastOp, "scaledown-migrate-in-progress") {
 		return cm.checkScaleDownMigrateAndProceed(ctx, kredis, pods, clusterState, delta)
 	}
+	if strings.Contains(lastOp, "scaledown-migrate-retry") {
+		// Retry migration after failure - restart the migration process
+		return cm.retryScaleDownMigrate(ctx, kredis, pods, clusterState, delta, lastOp)
+	}
 	if strings.Contains(lastOp, "scaledown-forget-in-progress") {
 		return cm.checkScaleDownForgetAndProceed(ctx, kredis, pods, clusterState, delta)
 	}
@@ -304,6 +308,54 @@ func (cm *ClusterManager) findCommandPodForScaleDown(pods []corev1.Pod, nodesToR
 		}
 	}
 
+	return nil
+}
+
+// retryScaleDownMigrate handles retry of failed migration job
+func (cm *ClusterManager) retryScaleDownMigrate(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod, clusterState []cachev1alpha1.ClusterNode, delta *ClusterStatusDelta, lastOp string) error {
+	logger := log.FromContext(ctx)
+
+	// Parse node ID from lastOp: "scaledown-migrate-retry:<nodeID>:<timestamp>"
+	parts := strings.Split(lastOp, ":")
+	if len(parts) < 2 {
+		logger.Error(nil, "Invalid scaledown-migrate-retry format", "lastOp", lastOp)
+		delta.LastClusterOperation = fmt.Sprintf("scaledown-failed:%d", time.Now().Unix())
+		return nil
+	}
+	nodeID := parts[1]
+
+	// Check if node still has slots
+	var nodeSlots int
+	for _, node := range clusterState {
+		if node.NodeID == nodeID {
+			nodeSlots = node.SlotCount
+			break
+		}
+	}
+
+	if nodeSlots == 0 {
+		// No slots left, proceed to forget phase
+		logger.Info("Node has no slots after retry, proceeding to forget", "nodeID", nodeID)
+		return cm.proceedToForget(ctx, kredis, nodeID, pods, clusterState, delta)
+	}
+
+	// Still has slots, recreate the migrate job
+	logger.Info("Retrying slot migration", "nodeID", nodeID, "remainingSlots", nodeSlots)
+
+	nodesToRemove := cm.identifyNodesToRemove(ctx, kredis, pods, clusterState)
+	commandPod := cm.findCommandPodForScaleDown(pods, nodesToRemove, clusterState)
+	if commandPod == nil {
+		return fmt.Errorf("no command pod available for retry migration")
+	}
+
+	clusterAddr := clusterAddr(*commandPod, kredis.Spec.BasePort)
+
+	if err := cm.JobManager.CreateScaleDownMigrateJob(ctx, kredis, nodeID, "", clusterAddr, nodeSlots); err != nil {
+		return fmt.Errorf("failed to create retry migrate job: %w", err)
+	}
+
+	delta.LastClusterOperation = fmt.Sprintf("scaledown-migrate-in-progress:%s:%d", nodeID, time.Now().Unix())
+	delta.ClusterState = string(cachev1alpha1.ClusterStateScalingDown)
 	return nil
 }
 

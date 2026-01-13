@@ -285,25 +285,47 @@ func (cm *ClusterManager) addNodeToCluster(ctx context.Context, kredis *cachev1a
 		}
 	} else {
 		// Find target master for this slave
-		// In shard-based naming, try to find the master in the same shard first
+		// In shard-based naming, MUST find the master in the same shard
+		// This ensures correct master-slave pairing for failover scenarios
 		var targetMasterID string
 		shardIdx, _, err := resource.ParsePodName(kredis.Name, targetPod.Name)
 		if err == nil {
-			// Find the master in the same shard
+			// Find the master in the same shard with slots
+			var shardMasterFound bool
 			for _, node := range clusterState {
-				if node.Role == "master" && node.NodeID != "" && node.SlotCount > 0 {
+				if node.Role == "master" && node.NodeID != "" {
 					nodeShardIdx, _, nodeErr := resource.ParsePodName(kredis.Name, node.PodName)
 					if nodeErr == nil && nodeShardIdx == shardIdx {
-						targetMasterID = node.NodeID
-						break
+						shardMasterFound = true
+						if node.SlotCount > 0 {
+							targetMasterID = node.NodeID
+							break
+						}
+						// Master found but has no slots - rebalance not complete
+						logger.Info("Same-shard master found but has no slots, waiting for rebalance",
+							"pod", targetPod.Name, "shardIdx", shardIdx, "masterPod", node.PodName)
 					}
 				}
 			}
+			// If shard master exists but has no slots, trigger rebalance and wait
+			if shardMasterFound && targetMasterID == "" {
+				delta.LastClusterOperation = fmt.Sprintf("rebalance-needed:%d", time.Now().Unix())
+				delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
+				return nil
+			}
 		}
 
-		// If not found (different shard or legacy naming), find master with fewest slaves
-		if targetMasterID == "" {
+		// If shard parsing failed (legacy naming), use fallback
+		// But if shard was parsed and no master found, that's an error
+		if targetMasterID == "" && err != nil {
+			// Legacy naming - use fallback
 			targetMasterID = cm.selectMasterWithFewestSlaves(clusterState, kredis.Spec.Replicas)
+		} else if targetMasterID == "" {
+			// Shard naming but no master found - wait for master to be created
+			logger.Info("No master found for shard, waiting for master creation",
+				"pod", targetPod.Name, "shardIdx", shardIdx)
+			delta.LastClusterOperation = fmt.Sprintf("scale-in-progress:%d", time.Now().Unix())
+			return nil
 		}
 
 		if targetMasterID == "" {

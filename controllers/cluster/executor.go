@@ -171,34 +171,6 @@ func (pe *PodExecutor) GetRedisClusterNodes(ctx context.Context, pod corev1.Pod,
 	return nodes, nil
 }
 
-// CreateCluster initializes a new Redis cluster with the given nodes.
-func (pe *PodExecutor) CreateCluster(ctx context.Context, pod corev1.Pod, port int32, nodeIPs []string, replicas int) (*ExecResult, error) {
-	logger := log.FromContext(ctx)
-
-	addrs := make([]string, len(nodeIPs))
-	for i, ip := range nodeIPs {
-		addrs[i] = fmt.Sprintf("%s:%d", ip, port)
-	}
-
-	command := []string{"redis-cli", "--cluster", "create"}
-	command = append(command, addrs...)
-	command = append(command, "--cluster-replicas", fmt.Sprintf("%d", replicas))
-	command = append(command, "--cluster-yes")
-
-	logger.Info("Creating cluster with nodes", "command", strings.Join(command, " "))
-
-	return pe.ExecuteCommand(ctx, pod, command)
-}
-
-// MeetNode tells a node to meet another node.
-func (pe *PodExecutor) MeetNode(ctx context.Context, pod corev1.Pod, port int32, meetIP string, meetPort int32) (*ExecResult, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("Telling node to meet another node", "pod", pod.Name, "meetIP", meetIP, "meetPort", meetPort)
-
-	args := []string{"cluster", "meet", meetIP, fmt.Sprintf("%d", meetPort)}
-	return pe.ExecuteRedisCommand(ctx, pod, port, args...)
-}
-
 // ReplicateNode tells a node to replicate a master node.
 func (pe *PodExecutor) ReplicateNode(ctx context.Context, pod corev1.Pod, port int32, masterNodeID string) (*ExecResult, error) {
 	logger := log.FromContext(ctx)
@@ -231,58 +203,6 @@ func (pe *PodExecutor) AddNodeToCluster(ctx context.Context, newPod corev1.Pod, 
 	}
 
 	return nil
-}
-
-// RebalanceCluster rebalances cluster slots among all nodes.
-func (pe *PodExecutor) RebalanceCluster(ctx context.Context, pod corev1.Pod, port int32) (*ExecResult, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("Rebalancing cluster", "pod", pod.Name)
-
-	nodeAddr := fmt.Sprintf("%s:%d", pod.Status.PodIP, port)
-	command := []string{
-		"redis-cli",
-		"--cluster",
-		"rebalance",
-		nodeAddr,
-		"--cluster-use-empty-masters",
-		"--cluster-pipeline", "1000",
-	}
-
-	return pe.ExecuteCommand(ctx, pod, command)
-}
-
-// ReshardCluster moves slots from source nodes to a target node using reshard.
-// This is used to quickly give a new empty master some slots before full rebalance.
-// slotsToMove: number of slots to move to the target node
-// targetNodeID: the node ID of the new master receiving slots
-// sourceNodeIDs: optional list of source node IDs. If empty, slots are taken from all masters.
-func (pe *PodExecutor) ReshardCluster(ctx context.Context, pod corev1.Pod, port int32, targetNodeID string, slotsToMove int, sourceNodeIDs []string) (*ExecResult, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("Resharding cluster", "pod", pod.Name, "targetNode", targetNodeID, "slots", slotsToMove)
-
-	nodeAddr := fmt.Sprintf("%s:%d", pod.Status.PodIP, port)
-
-	// Build reshard command
-	// redis-cli --cluster reshard <host>:<port> --cluster-from <node-id,...> --cluster-to <node-id> --cluster-slots <slots> --cluster-yes
-	command := []string{
-		"redis-cli",
-		"--cluster",
-		"reshard",
-		nodeAddr,
-		"--cluster-to", targetNodeID,
-		"--cluster-slots", fmt.Sprintf("%d", slotsToMove),
-		"--cluster-yes",
-		"--cluster-pipeline", "100",
-	}
-
-	// If specific source nodes are provided, use them; otherwise let Redis choose from all
-	if len(sourceNodeIDs) > 0 {
-		command = append(command, "--cluster-from", strings.Join(sourceNodeIDs, ","))
-	} else {
-		command = append(command, "--cluster-from", "all")
-	}
-
-	return pe.ExecuteCommand(ctx, pod, command)
 }
 
 // RepairCluster attempts to fix a degraded Redis cluster using redis-cli --cluster fix.

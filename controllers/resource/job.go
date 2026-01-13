@@ -33,9 +33,9 @@ const (
 	AnnotationTargetID = "cache.docker.direa.synology.me/target-node-id"
 
 	// Job configuration
-	JobTTLSeconds     = int32(300) // Clean up completed jobs after 5 minutes
-	JobBackoffLimit   = int32(3)   // Retry up to 3 times
-	JobActiveDeadline = int64(600) // Timeout after 10 minutes
+	JobTTLSeconds     = int32(300)  // Clean up completed jobs after 5 minutes
+	JobBackoffLimit   = int32(3)    // Retry up to 3 times
+	JobActiveDeadline = int64(1800) // Timeout after 30 minutes (migration can take long)
 )
 
 // BuildClusterOperationJob constructs a Kubernetes Job for Redis cluster operations.

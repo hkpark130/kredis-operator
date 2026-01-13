@@ -1,0 +1,80 @@
+---
+# CPU Load Test - 레플리카 노드에 읽기 부하 생성 (지속적)
+# 레플리카에 GET 등 읽기 요청을 보냄 (READONLY 모드)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: redis-cpu-load-replica
+  namespace: kredis-operator-system
+spec:
+  containers:
+  - name: load-test
+    image: redis:7.0
+    command:
+    - /bin/bash
+    - -c
+    - |
+      echo "Starting CONTINUOUS CPU load test on REPLICAS..."
+      REDIS_HOST="kredis-sample-slave.kredis-operator-system.svc.cluster.local"
+      
+      echo "Cluster nodes (slaves):"
+      redis-cli -c -h $REDIS_HOST -p 6379 CLUSTER NODES | grep slave | head -5
+      
+      # 먼저 마스터에 테스트 데이터 생성
+      echo "Preparing test data on masters..."
+      MASTER_HOST="kredis-sample-master.kredis-operator-system.svc.cluster.local"
+      for i in $(seq 1 10000); do
+        redis-cli -c -h $MASTER_HOST -p 6379 SET "readtest:$i" "value_$i" > /dev/null
+      done
+      echo "Test data prepared: 10000 keys"
+      
+      ROUND=0
+      while true; do
+        ROUND=$((ROUND + 1))
+        echo ""
+        echo "========== REPLICA BENCHMARK ROUND $ROUND =========="
+        
+        # 레플리카에서 읽기 부하
+        # redis-benchmark는 READONLY를 직접 지원하지 않으므로 직접 구현
+        for i in $(seq 1 500000); do
+          # 각 레플리카에 READONLY 후 GET
+          redis-cli -h $REDIS_HOST -p 6379 READONLY > /dev/null 2>&1
+          redis-cli -h $REDIS_HOST -p 6379 GET "readtest:$((i % 10000 + 1))" > /dev/null 2>&1
+          
+          if [ $((i % 50000)) -eq 0 ]; then
+            echo "Read $i keys from replicas..."
+          fi
+        done
+        
+        echo "Round $ROUND completed. Starting next round..."
+      done
+  restartPolicy: Never
+---
+# CPU Load Test - 레플리카에 추가 읽기 부하 (redis-benchmark 사용)
+# 참고: --cluster 모드에서 GET은 마스터로 리다이렉트되지만, 부하 자체는 생성됨
+apiVersion: v1
+kind: Pod
+metadata:
+  name: redis-cpu-load-replica-2
+  namespace: kredis-operator-system
+spec:
+  containers:
+  - name: load-test
+    image: redis:7.0
+    command:
+    - /bin/bash
+    - -c
+    - |
+      echo "Starting CPU load test worker 2 on cluster (mixed)..."
+      REDIS_HOST="kredis-sample.kredis-operator-system.svc.cluster.local"
+      
+      while true; do
+        # GET 위주의 읽기 부하 (일부는 마스터로 리다이렉트됨)
+        redis-benchmark -h $REDIS_HOST -p 6379 \
+          -c 200 -n 3500000 \
+          -t get \
+          -d 512 \
+          --cluster \
+          -q
+      done
+  restartPolicy: Never

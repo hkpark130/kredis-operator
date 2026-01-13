@@ -166,7 +166,7 @@ func (jm *JobManager) CreateReshardJob(ctx context.Context, kredis *cachev1alpha
 		"--cluster-slots", fmt.Sprintf("%d", slotsToMove),
 		"--cluster-from", "all",
 		"--cluster-yes",
-		"--cluster-pipeline", "100",
+		"--cluster-pipeline", "10000",
 	}
 
 	job := resource.BuildClusterOperationJob(kredis, jobName, string(JobTypeReshard), targetNodeID, command)
@@ -316,9 +316,8 @@ func (jm *JobManager) CreateScaleDownMigrateJob(ctx context.Context, kredis *cac
 		"redis-cli",
 		"--cluster", "rebalance", clusterAddr,
 		"--cluster-weight", fmt.Sprintf("%s=0", sourceNodeID),
-		"--cluster-use-empty-masters",
-		"--cluster-pipeline", "100",
-		"--cluster-yes",
+		// "--cluster-use-empty-masters",
+		"--cluster-pipeline", "1000",
 	}
 
 	job := resource.BuildClusterOperationJob(kredis, jobName, string(JobTypeScaleDownMigrate), sourceNodeID, command)

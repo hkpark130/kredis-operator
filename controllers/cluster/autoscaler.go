@@ -194,7 +194,7 @@ func (a *Autoscaler) collectMetrics(ctx context.Context, kredis *cachev1alpha1.K
 		return 0, 0, fmt.Errorf("failed to list pod metrics: %w", err)
 	}
 
-	logger.Info("Metrics collection debug",
+	logger.V(1).Info("Metrics collection debug",
 		"podsCount", len(pods),
 		"metricsCount", len(podMetricsList.Items))
 

@@ -162,6 +162,13 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 			"currentTime", time.Now().Unix())
 		return OperationScale
 	}
+	if strings.Contains(lastOp, "scale-failed") {
+		// 스케일 실패 후 재시도 - unknown 노드가 있을 수 있음
+		logger.Info("Scale failed previously - will retry scaling",
+			"lastOperation", lastOp,
+			"currentTime", time.Now().Unix())
+		return OperationScale
+	}
 	if strings.Contains(lastOp, "heal-in-progress") {
 		// 힐 작업 진행 중이면 검증/완료 단계 재실행
 		logger.Info("Heal in progress - will continue heal verification",
@@ -237,7 +244,7 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 	currentJoinedNodes := len(clusterMembers)
 	unassignedPodCount := len(pods) - currentJoinedNodes
 
-	logger.Info("Cluster state for scaling check",
+	logger.V(1).Info("Cluster state for scaling check",
 		"isHealthy", true, // From isClusterAlreadyExists
 		"currentJoinedNodes", currentJoinedNodes,
 		"expectedTotalNodes", expectedTotalNodes,
@@ -297,8 +304,18 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 		}
 	}
 
+	// Check for unknown/pending nodes that need to be joined to the cluster
+	// These are pods that exist but haven't successfully joined the cluster
+	for _, node := range clusterState {
+		if node.PodName != "" && (node.Role == "unknown" || node.Role == "" || node.Status == "pending") {
+			logger.Info("Found unknown/pending node, initiating scale operation to join cluster",
+				"pod", node.PodName, "role", node.Role, "status", node.Status)
+			return OperationScale
+		}
+	}
+
 	// If none of the above, the cluster is stable.
-	logger.Info("Cluster is properly formed and scaled - no operation needed")
+	logger.V(1).Info("Cluster is properly formed and scaled - no operation needed")
 	return ""
 }
 
@@ -374,6 +391,10 @@ func (cm *ClusterManager) isClusterAlreadyExists(ctx context.Context, kredis *ca
 }
 
 // getKredisPods retrieves all pods belonging to this Kredis instance
+// Pods are sorted in cluster creation order: masters first (X-0), then replicas (X-1, X-2, ...)
+// This ensures redis-cli --cluster create assigns master/slave roles correctly:
+// - kredis-0-0, kredis-1-0, kredis-2-0 become masters
+// - kredis-0-1, kredis-1-1, kredis-2-1 become their respective slaves
 func (cm *ClusterManager) getKredisPods(ctx context.Context, kredis *cachev1alpha1.Kredis) ([]corev1.Pod, error) {
 	podList := &corev1.PodList{}
 	labelSelector := client.MatchingLabels{
@@ -385,7 +406,21 @@ func (cm *ClusterManager) getKredisPods(ctx context.Context, kredis *cachev1alph
 		return nil, err
 	}
 	pods := podList.Items
-	sort.Slice(pods, func(i, j int) bool { return pods[i].Name < pods[j].Name })
+
+	// Sort pods for correct master-slave pairing:
+	// Order: 0-0, 1-0, 2-0, 0-1, 1-1, 2-1 (masters first, then replicas in same master order)
+	sort.Slice(pods, func(i, j int) bool {
+		iMaster, iReplica := parsePodIndices(pods[i].Name)
+		jMaster, jReplica := parsePodIndices(pods[j].Name)
+
+		// Sort by replica index first (0 = master comes first)
+		if iReplica != jReplica {
+			return iReplica < jReplica
+		}
+		// Within same replica index, sort by master index
+		return iMaster < jMaster
+	})
+
 	return pods, nil
 }
 

@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -14,6 +15,34 @@ import (
 // ========================================
 // Common utility functions for cluster operations
 // ========================================
+
+// parsePodIndices extracts master index and replica index from pod name.
+// Pod name format: <kredis-name>-<masterIdx>-<replicaIdx>
+// Examples:
+//   - "kredis-sample-0-0" -> (0, 0) - master 0
+//   - "kredis-sample-0-1" -> (0, 1) - replica of master 0
+//   - "kredis-sample-2-1" -> (2, 1) - replica of master 2
+//
+// Returns (-1, -1) if parsing fails.
+func parsePodIndices(podName string) (masterIdx, replicaIdx int) {
+	parts := strings.Split(podName, "-")
+	if len(parts) < 2 {
+		return -1, -1
+	}
+
+	// Last two parts are masterIdx and replicaIdx
+	replicaStr := parts[len(parts)-1]
+	masterStr := parts[len(parts)-2]
+
+	masterIdx, err1 := strconv.Atoi(masterStr)
+	replicaIdx, err2 := strconv.Atoi(replicaStr)
+
+	if err1 != nil || err2 != nil {
+		return -1, -1
+	}
+
+	return masterIdx, replicaIdx
+}
 
 // clusterAddr returns the cluster address in "ip:port" format for a given pod
 func clusterAddr(pod corev1.Pod, port int32) string {
@@ -82,7 +111,10 @@ func (cm *ClusterManager) isNodeReset(ctx context.Context, pod corev1.Pod, port 
 		return false
 	}
 	// DBSIZE returns "(integer) 0" or similar format
-	if !strings.Contains(dbsizeResult.Stdout, "(integer) 0") {
+	trimmed := strings.TrimSpace(dbsizeResult.Stdout)
+	numStr := strings.TrimPrefix(trimmed, "(integer) ") // "(integer) 0" → "0"
+	num, err := strconv.Atoi(strings.TrimSpace(numStr))
+	if err != nil || num != 0 {
 		logger.V(1).Info("Node still has data (FLUSHALL not complete)", "pod", pod.Name, "dbsize", dbsizeResult.Stdout)
 		return false
 	}

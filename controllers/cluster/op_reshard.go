@@ -59,7 +59,14 @@ func (cm *ClusterManager) reshardCluster(ctx context.Context, kredis *cachev1alp
 				"desiredMasters", desiredMasters,
 				"emptyMasters", len(emptyMasters))
 			delta.LastClusterOperation = fmt.Sprintf("rebalance-success:%d", time.Now().Unix())
-			delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
+
+			// Check if scaling is still needed (more nodes to add, e.g., slaves)
+			if cm.isScalingStillNeeded(ctx, kredis, masterPod) {
+				logger.Info("Reshard skipped but scaling still in progress (more nodes to add)")
+				delta.ClusterState = string(cachev1alpha1.ClusterStateScaling)
+			} else {
+				delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
+			}
 			return nil
 		}
 	}

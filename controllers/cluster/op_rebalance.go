@@ -67,9 +67,17 @@ func (cm *ClusterManager) executeRebalancePhase(ctx context.Context, kredis *cac
 
 		if isHealthy && allMastersHaveSlots {
 			// Cluster is healthy and all masters have slots - rebalance must have succeeded
-			logger.Info("No rebalance Job found but cluster is healthy with all masters having slots - marking as success")
+			// But check if there are still nodes to add (slaves) before marking as Running
+			logger.Info("No rebalance Job found but cluster is healthy with all masters having slots - checking for pending scale")
 			delta.LastClusterOperation = fmt.Sprintf("rebalance-success:%d", time.Now().Unix())
-			delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
+
+			// Check if scaling is still needed (more nodes to add)
+			if cm.isScalingStillNeeded(ctx, kredis, masterPod) {
+				logger.Info("Rebalance complete but scaling still in progress (more nodes to add)")
+				delta.ClusterState = string(cachev1alpha1.ClusterStateScaling)
+			} else {
+				delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
+			}
 			return nil
 		}
 
@@ -117,13 +125,19 @@ func (cm *ClusterManager) executeRebalancePhase(ctx context.Context, kredis *cac
 		// Success!
 		logger.Info("Rebalance completed successfully - all masters have slots")
 		delta.LastClusterOperation = fmt.Sprintf("rebalance-success:%d", time.Now().Unix())
-		delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
 
-		// Update LastScaleTime to enable stabilization window for autoscaling
-		// Rebalance completes the scale-up process, so mark scale time here
-		now := time.Now()
-		delta.LastScaleTime = &now
-		delta.LastScaleType = "masters-up"
+		// Check if scaling is still needed (more nodes to add, e.g., slaves)
+		if cm.isScalingStillNeeded(ctx, kredis, masterPod) {
+			logger.Info("Rebalance complete but scaling still in progress (more nodes to add)")
+			delta.ClusterState = string(cachev1alpha1.ClusterStateScaling)
+		} else {
+			delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
+
+			// Update LastScaleTime only when fully complete
+			now := time.Now()
+			delta.LastScaleTime = &now
+			delta.LastScaleType = "masters-up"
+		}
 
 		// Cleanup completed Jobs
 		_ = cm.JobManager.CleanupCompletedJobs(ctx, kredis)
@@ -137,4 +151,51 @@ func (cm *ClusterManager) executeRebalancePhase(ctx context.Context, kredis *cac
 	}
 
 	return nil
+}
+
+// isScalingStillNeeded checks if there are still nodes that need to be added to the cluster.
+// This is used after rebalance to determine if we should stay in Scaling state or go to Running.
+// Returns true if:
+// - Current cluster node count < expected total nodes (masters * (1 + replicas))
+// - Scale-down is NOT in progress (scale-down has more nodes than expected, which is normal)
+func (cm *ClusterManager) isScalingStillNeeded(ctx context.Context, kredis *cachev1alpha1.Kredis, masterPod *corev1.Pod) bool {
+	logger := log.FromContext(ctx)
+
+	// If scale-down is in progress, don't consider it as "scaling still needed"
+	// Scale-down is handled by op_scale_down.go separately
+	lastOp := kredis.Status.LastClusterOperation
+	if strings.Contains(lastOp, "scaledown") {
+		logger.V(1).Info("Scale-down in progress, not considering as scaling needed")
+		return false
+	}
+
+	// Get current cluster state
+	clusterNodes, err := cm.PodExecutor.GetRedisClusterNodes(ctx, *masterPod, kredis.Spec.BasePort)
+	if err != nil {
+		logger.V(1).Info("Failed to get cluster nodes, assuming scaling still needed", "error", err)
+		return true
+	}
+
+	// Count nodes that are actually connected (not pending/unknown)
+	connectedNodes := 0
+	for _, node := range clusterNodes {
+		if node.NodeID != "" && node.Role != "unknown" && node.Role != "" {
+			connectedNodes++
+		}
+	}
+
+	// Calculate expected total nodes
+	expectedTotal := int(kredis.Spec.Masters * (1 + kredis.Spec.Replicas))
+
+	// For scale-up: connected < expected means more nodes to add
+	// For scale-down: connected > expected is normal (nodes being removed)
+	if connectedNodes < expectedTotal {
+		logger.Info("Scaling still needed",
+			"connectedNodes", connectedNodes,
+			"expectedTotal", expectedTotal,
+			"remaining", expectedTotal-connectedNodes)
+		return true
+	}
+
+	return false
 }

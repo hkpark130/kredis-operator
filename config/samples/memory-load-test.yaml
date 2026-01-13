@@ -1,0 +1,68 @@
+---
+# Memory Load Test - 대량의 데이터를 삽입하여 Memory 부하 생성 (지속적)
+# 사용법: kubectl apply -f config/samples/memory-load-test.yaml
+# 삭제: kubectl delete -f config/samples/memory-load-test.yaml
+# 주의: 마스터가 많을수록 더 많은 데이터 필요 (데이터가 분산되기 때문)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: redis-memory-load-test
+  namespace: kredis-operator-system
+spec:
+  containers:
+  - name: load-test
+    image: redis:7.0
+    command:
+    - /bin/bash
+    - -c
+    - |
+      echo "Starting CONTINUOUS memory load test..."
+      REDIS_HOST="kredis-sample-master.kredis-operator-system.svc.cluster.local"
+      
+      # 연결 테스트
+      echo "Testing connection..."
+      redis-cli -c -h $REDIS_HOST -p 6379 PING
+      if [ $? -ne 0 ]; then
+        echo "Failed to connect to Redis!"
+        exit 1
+      fi
+      
+      echo "Cluster info:"
+      redis-cli -c -h $REDIS_HOST -p 6379 CLUSTER INFO | head -5
+      
+      # 100KB 크기의 값 (더 큰 값으로 메모리를 빠르게 채움)
+      VALUE_SIZE=102400  # 100KB
+      echo "Generating ${VALUE_SIZE} byte value..."
+      VALUE=$(head -c $VALUE_SIZE /dev/urandom | base64 | head -c $VALUE_SIZE)
+      
+      ROUND=0
+      # 무한 루프로 계속 데이터 삽입
+      while true; do
+        ROUND=$((ROUND + 1))
+        echo ""
+        echo "========== ROUND $ROUND =========="
+        echo "Starting data insertion (100KB x 100000 keys = ~10GB total, distributed across masters)..."
+        
+        for i in $(seq 1 100000); do
+          KEY="loadtest:round${ROUND}:key:$i"
+          RESULT=$(redis-cli -c -h $REDIS_HOST -p 6379 SET "$KEY" "$VALUE" 2>&1)
+          
+          if [ $((i % 5000)) -eq 0 ]; then
+            echo "[$ROUND] Inserted $i keys..."
+            # 각 마스터 노드의 메모리 확인
+            echo "Memory per master node:"
+            for node in $(redis-cli -c -h $REDIS_HOST -p 6379 CLUSTER NODES | grep master | awk '{print $2}' | cut -d@ -f1); do
+              HOST=$(echo $node | cut -d: -f1)
+              PORT=$(echo $node | cut -d: -f2)
+              MEM=$(redis-cli -h $HOST -p $PORT INFO memory 2>/dev/null | grep used_memory_human | cut -d: -f2 | tr -d '\r')
+              echo "  $HOST:$PORT -> $MEM"
+            done
+          fi
+        done
+        
+        echo "Round $ROUND completed. Waiting 30 seconds before next round..."
+        echo "Total keys in cluster:"
+        redis-cli -c -h $REDIS_HOST -p 6379 DBSIZE
+        sleep 30
+      done
+  restartPolicy: Never
