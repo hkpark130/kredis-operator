@@ -101,6 +101,22 @@ func CreateRedisSlaveNodePortService(k *cachev1alpha1.Kredis, scheme *runtime.Sc
 func CreateRedisHeadlessService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
 	baseLabels := BaseLabelsForKredis(k.Name)
 
+	ports := []corev1.ServicePort{
+		{Name: "redis", Port: k.Spec.BasePort, TargetPort: intstr.FromString("redis")},
+		{Name: "cluster-bus", Port: k.Spec.BasePort + 10000, TargetPort: intstr.FromString("cluster-bus")},
+	}
+
+	// Add exporter port if enabled
+	if k.Spec.Exporter.Enabled {
+		exporterPort := k.Spec.Exporter.Port
+		if exporterPort == 0 {
+			exporterPort = 9121
+		}
+		ports = append(ports, corev1.ServicePort{
+			Name: "exporter", Port: exporterPort, TargetPort: intstr.FromString("exporter"),
+		})
+	}
+
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      k.Name, // kredis-sample
@@ -110,12 +126,48 @@ func CreateRedisHeadlessService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme)
 		Spec: corev1.ServiceSpec{
 			Selector:  baseLabels,
 			ClusterIP: "None", // Headless
-			Ports: []corev1.ServicePort{
-				{Name: "redis", Port: k.Spec.BasePort, TargetPort: intstr.FromString("redis")},
-				{Name: "cluster-bus", Port: k.Spec.BasePort + 10000, TargetPort: intstr.FromString("cluster-bus")},
-			},
+			Ports:     ports,
 			// PublishNotReadyAddresses allows DNS resolution even for not-ready pods
 			PublishNotReadyAddresses: true,
+		},
+	}
+	controllerutil.SetControllerReference(k, svc, scheme)
+	return svc
+}
+
+// CreateRedisMetricsService creates a service for Prometheus to scrape Redis exporter metrics
+// This is a regular ClusterIP service (not headless) for easier Prometheus discovery
+func CreateRedisMetricsService(k *cachev1alpha1.Kredis, scheme *runtime.Scheme) *corev1.Service {
+	if !k.Spec.Exporter.Enabled {
+		return nil
+	}
+
+	baseLabels := BaseLabelsForKredis(k.Name)
+	// Add prometheus scrape annotations for auto-discovery
+	annotations := map[string]string{
+		"prometheus.io/scrape": "true",
+		"prometheus.io/port":   "9121",
+		"prometheus.io/path":   "/metrics",
+	}
+
+	exporterPort := k.Spec.Exporter.Port
+	if exporterPort == 0 {
+		exporterPort = 9121
+	}
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        k.Name + "-metrics",
+			Namespace:   k.Namespace,
+			Labels:      baseLabels,
+			Annotations: annotations,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: baseLabels,
+			Type:     corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{
+				{Name: "exporter", Port: exporterPort, TargetPort: intstr.FromString("exporter")},
+			},
 		},
 	}
 	controllerutil.SetControllerReference(k, svc, scheme)

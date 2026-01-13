@@ -58,6 +58,23 @@ type ResourceRequirements struct {
 	Requests corev1.ResourceList `json:"requests,omitempty"`
 }
 
+// ExporterSpec defines the Redis Exporter sidecar configuration
+type ExporterSpec struct {
+	// Enabled enables redis-exporter sidecar for Prometheus metrics
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Image is the redis-exporter container image
+	// +kubebuilder:default="bitnami/redis-exporter:latest"
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Port is the exporter metrics port
+	// +kubebuilder:default=9121
+	// +optional
+	Port int32 `json:"port,omitempty"`
+}
+
 // AutoscalingSpec defines autoscaling configuration for Kredis cluster
 type AutoscalingSpec struct {
 	// Enabled enables autoscaling
@@ -147,6 +164,10 @@ type KredisSpec struct {
 	// Autoscaling configuration for the Redis cluster
 	// +optional
 	Autoscaling AutoscalingSpec `json:"autoscaling,omitempty"`
+
+	// Exporter configuration for Prometheus metrics
+	// +optional
+	Exporter ExporterSpec `json:"exporter,omitempty"`
 }
 
 // KredisStatus defines the observed state of Kredis

@@ -1,0 +1,186 @@
+# Prometheus Server for Redis Monitoring
+# kubectl apply -f prometheus.yaml
+# kubectl delete -f prometheus.yaml
+# kubectl -n monitoring port-forward deploy/prometheus 9090:9090
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      # Prometheus 자체 메트릭
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+
+      # Redis Exporter 메트릭 (kredis-operator에서 생성한 서비스)
+      - job_name: 'redis-exporter'
+        static_configs:
+          - targets: ['kredis-sample-metrics.kredis-operator-system:9121']
+        metrics_path: /metrics
+
+      # Kubernetes Service Discovery (annotation 기반 자동 디스커버리)
+      - job_name: 'kubernetes-services'
+        kubernetes_sd_configs:
+          - role: service
+        relabel_configs:
+          # prometheus.io/scrape: "true" annotation이 있는 서비스만 스크랩
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          # 포트 설정
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_port]
+            action: replace
+            target_label: __address__
+            regex: (.+)
+            replacement: ${1}
+          # 메트릭 경로 설정
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          # 네임스페이스 라벨
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          # 서비스 이름 라벨
+          - source_labels: [__meta_kubernetes_service_name]
+            action: replace
+            target_label: kubernetes_service_name
+
+      # Kubernetes Pod Discovery (Redis Pod 직접 스크랩)
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # kredis 앱만 스크랩
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: kredis
+          # exporter 포트만 스크랩
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            action: keep
+            regex: exporter
+          # Pod 이름 라벨
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod_name
+          # 네임스페이스 라벨
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - services
+      - endpoints
+      - pods
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources:
+      - configmaps
+    verbs: ["get"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:latest
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--web.enable-lifecycle"
+          ports:
+            - containerPort: 9090
+              name: http
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+spec:
+  type: NodePort
+  ports:
+    - port: 9090
+      targetPort: 9090
+      nodePort: 30090
+      name: http
+  selector:
+    app: prometheus

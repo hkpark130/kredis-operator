@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -183,6 +184,44 @@ func createBasePod(k *cachev1alpha1.Kredis, podName string, labels map[string]st
 		}
 	}
 
+	// Build containers list
+	containers := []corev1.Container{redisContainer}
+
+	// Add redis-exporter sidecar if enabled
+	if k.Spec.Exporter.Enabled {
+		exporterImage := k.Spec.Exporter.Image
+		if exporterImage == "" {
+			exporterImage = "bitnami/redis-exporter:latest"
+		}
+		exporterPort := k.Spec.Exporter.Port
+		if exporterPort == 0 {
+			exporterPort = 9121
+		}
+
+		exporterContainer := corev1.Container{
+			Name:            "redis-exporter",
+			Image:           exporterImage,
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			Ports: []corev1.ContainerPort{
+				{ContainerPort: exporterPort, Name: "exporter"},
+			},
+			Env: []corev1.EnvVar{
+				{Name: "REDIS_ADDR", Value: fmt.Sprintf("localhost:%d", k.Spec.BasePort)},
+			},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("50m"),
+					corev1.ResourceMemory: resource.MustParse("64Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("128Mi"),
+				},
+			},
+		}
+		containers = append(containers, exporterContainer)
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
@@ -194,9 +233,7 @@ func createBasePod(k *cachev1alpha1.Kredis, podName string, labels map[string]st
 		Spec: corev1.PodSpec{
 			Hostname:  podName,
 			Subdomain: k.Name, // Headless service name for DNS
-			Containers: []corev1.Container{
-				redisContainer,
-			},
+			Containers: containers,
 			ImagePullSecrets: []corev1.LocalObjectReference{{Name: secretName}},
 			Volumes: []corev1.Volume{
 				{

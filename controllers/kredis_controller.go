@@ -261,6 +261,24 @@ func (r *KredisReconciler) reconcileServices(ctx context.Context, kredis *cachev
 		return err
 	}
 
+	// 4. Metrics service (for Prometheus scraping) - only if exporter is enabled
+	if kredis.Spec.Exporter.Enabled {
+		metricsSvcName := kredis.Name + "-metrics"
+		foundMetricsSvc := &corev1.Service{}
+		err = r.Get(ctx, types.NamespacedName{Name: metricsSvcName, Namespace: kredis.Namespace}, foundMetricsSvc)
+		if err != nil && errors.IsNotFound(err) {
+			svc := resource.CreateRedisMetricsService(kredis, r.Scheme)
+			if svc != nil {
+				logger.Info("Creating Redis metrics service for Prometheus", "name", svc.Name)
+				if err := r.Create(ctx, svc); err != nil {
+					return err
+				}
+			}
+		} else if err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
