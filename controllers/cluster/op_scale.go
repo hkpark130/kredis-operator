@@ -37,6 +37,29 @@ func (cm *ClusterManager) scaleCluster(ctx context.Context, kredis *cachev1alpha
 	}
 	logger.Info("Using pod for scaling command", "pod", commandPod.Name)
 
+	// 스케일 작업 전에 클러스터가 healthy한지 확인
+	// scale-failed 후 재시도 시 클러스터가 깨져있을 수 있음 (open slots, uncovered slots 등)
+	if strings.Contains(lastOp, "scale-failed") {
+		isHealthy, _ := cm.PodExecutor.IsClusterHealthy(ctx, *commandPod, kredis.Spec.BasePort)
+		if !isHealthy {
+			logger.Info("Cluster is unhealthy before scale retry, attempting repair first")
+			if err := cm.PodExecutor.RepairCluster(ctx, *commandPod, kredis.Spec.BasePort); err != nil {
+				logger.Error(err, "Failed to repair cluster before scale, will retry")
+				// repair 실패해도 계속 진행 - 다음 reconcile에서 다시 시도
+			} else {
+				logger.Info("Cluster repair attempted, will verify in next reconcile")
+				// repair 후 다음 reconcile에서 상태 재확인
+				delta.LastClusterOperation = fmt.Sprintf("scale-repair-done:%d", time.Now().Unix())
+				delta.ClusterState = string(cachev1alpha1.ClusterStateScaling)
+				return nil
+			}
+		} else {
+			// 클러스터가 healthy한 경우 - scale-failed에서 복구되었으므로 상태 업데이트
+			logger.Info("Cluster is healthy after previous scale-failed, resuming scale operation")
+			delta.ClusterState = string(cachev1alpha1.ClusterStateScaling)
+		}
+	}
+
 	// 리밸런싱 진행 중이면 스케일 작업 대기 (마스터 추가는 허용, 슬레이브만 대기)
 	isRebalancing := strings.Contains(lastOp, "rebalance-in-progress") ||
 		strings.Contains(lastOp, "reshard-in-progress")
@@ -279,6 +302,13 @@ func (cm *ClusterManager) addNodeToCluster(ctx context.Context, kredis *cachev1a
 	if isMaster {
 		logger.Info("Adding new master node to cluster", "pod", targetPod.Name, "ip", targetPod.Status.PodIP)
 		if err := cm.PodExecutor.AddNodeToCluster(ctx, targetPod, *commandPod, kredis.Spec.BasePort, ""); err != nil {
+			// 노드 추가 실패 시 클러스터 repair 시도 후 다음 reconcile에서 재시도
+			logger.Error(err, "Failed to add master node, attempting cluster repair", "pod", targetPod.Name)
+			if repairErr := cm.PodExecutor.RepairCluster(ctx, *commandPod, kredis.Spec.BasePort); repairErr != nil {
+				logger.Error(repairErr, "Cluster repair also failed")
+			} else {
+				logger.Info("Cluster repair attempted after add-node failure")
+			}
 			delta.LastClusterOperation = fmt.Sprintf("scale-failed:%d", time.Now().Unix())
 			delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
 			return fmt.Errorf("failed to add master node %s to cluster: %w", targetPod.Name, err)
@@ -316,16 +346,20 @@ func (cm *ClusterManager) addNodeToCluster(ctx context.Context, kredis *cachev1a
 		}
 
 		// If shard parsing failed (legacy naming), use fallback
-		// But if shard was parsed and no master found, that's an error
-		if targetMasterID == "" && err != nil {
-			// Legacy naming - use fallback
+		// If shard was parsed but no master found, also use fallback
+		// This handles cases where shard master doesn't exist or was incorrectly assigned
+		if targetMasterID == "" {
+			if err != nil {
+				// Legacy naming - use fallback
+				logger.Info("Legacy naming detected, using fewest slaves selection",
+					"pod", targetPod.Name)
+			} else {
+				// Shard naming but no master found - use fallback to avoid infinite wait
+				// This can happen when cluster topology is inconsistent
+				logger.Info("No master found for shard, falling back to fewest slaves selection",
+					"pod", targetPod.Name, "shardIdx", shardIdx)
+			}
 			targetMasterID = cm.selectMasterWithFewestSlaves(clusterState, kredis.Spec.Replicas)
-		} else if targetMasterID == "" {
-			// Shard naming but no master found - wait for master to be created
-			logger.Info("No master found for shard, waiting for master creation",
-				"pod", targetPod.Name, "shardIdx", shardIdx)
-			delta.LastClusterOperation = fmt.Sprintf("scale-in-progress:%d", time.Now().Unix())
-			return nil
 		}
 
 		if targetMasterID == "" {
@@ -334,6 +368,13 @@ func (cm *ClusterManager) addNodeToCluster(ctx context.Context, kredis *cachev1a
 
 		logger.Info("Adding new slave node to cluster", "pod", targetPod.Name, "ip", targetPod.Status.PodIP, "masterID", targetMasterID)
 		if err := cm.PodExecutor.AddNodeToCluster(ctx, targetPod, *commandPod, kredis.Spec.BasePort, targetMasterID); err != nil {
+			// 노드 추가 실패 시 클러스터 repair 시도 후 다음 reconcile에서 재시도
+			logger.Error(err, "Failed to add slave node, attempting cluster repair", "pod", targetPod.Name)
+			if repairErr := cm.PodExecutor.RepairCluster(ctx, *commandPod, kredis.Spec.BasePort); repairErr != nil {
+				logger.Error(repairErr, "Cluster repair also failed")
+			} else {
+				logger.Info("Cluster repair attempted after add-node failure")
+			}
 			delta.LastClusterOperation = fmt.Sprintf("scale-failed:%d", time.Now().Unix())
 			delta.ClusterState = string(cachev1alpha1.ClusterStateFailed)
 			return fmt.Errorf("failed to add slave node %s to cluster: %w", targetPod.Name, err)
@@ -457,9 +498,11 @@ func (cm *ClusterManager) finalizeScale(ctx context.Context, kredis *cachev1alph
 	known := int(expectedTotalPods)
 	delta.KnownClusterNodes = &known
 
-	// 리밸런스 필요 여부 확인 (빈 마스터가 있는지)
-	if cm.needsRebalance(ctx, *commandPod, kredis.Spec.BasePort) {
-		logger.Info("Rebalance needed, some masters have no slots")
+	// 리밸런스 필요 여부 확인: spec.Masters 수와 슬롯이 있는 마스터 수를 비교
+	// 슬롯이 있는 마스터 수 >= spec.Masters 면 rebalance 불필요 (replica만 추가된 경우)
+	// 슬롯이 있는 마스터 수 < spec.Masters 면 rebalance 필요 (새 마스터가 추가된 경우)
+	if cm.needsRebalanceForMasters(ctx, *commandPod, kredis.Spec.BasePort, int(kredis.Spec.Masters)) {
+		logger.Info("Rebalance needed, not enough masters have slots", "expectedMasters", kredis.Spec.Masters)
 		delta.LastClusterOperation = fmt.Sprintf("rebalance-needed:%d", time.Now().Unix())
 		delta.ClusterState = string(cachev1alpha1.ClusterStateRebalancing)
 		return nil
@@ -470,17 +513,24 @@ func (cm *ClusterManager) finalizeScale(ctx context.Context, kredis *cachev1alph
 	delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
 
 	// Update LastScaleTime to enable stabilization window for autoscaling
+	// Note: LastScaleType is already set by autoscaler before triggering scale
+	// Only set LastScaleTime here; don't overwrite LastScaleType
 	now := time.Now()
 	delta.LastScaleTime = &now
-	delta.LastScaleType = "masters-up" // Scale-up operation
+	// delta.LastScaleType is intentionally not set here - autoscaler already set it correctly
+	// (e.g., "replicas-up", "masters-up", etc.)
 	return nil
 }
 
-// needsRebalance checks if any master has no slots assigned
-func (cm *ClusterManager) needsRebalance(ctx context.Context, commandPod corev1.Pod, basePort int32) bool {
-	ok, err := cm.checkAllMastersHaveSlots(ctx, commandPod, basePort)
+// needsRebalanceForMasters checks if rebalance is needed based on expected master count
+// Returns true if the number of masters with slots is less than expectedMasters
+// This correctly handles replica-only scale-ups (no rebalance needed) vs master scale-ups (rebalance needed)
+func (cm *ClusterManager) needsRebalanceForMasters(ctx context.Context, commandPod corev1.Pod, basePort int32, expectedMasters int) bool {
+	_, mastersWithSlots, err := cm.countMastersWithSlots(ctx, commandPod, basePort)
 	if err != nil {
-		return true // 에러시 안전하게 리밸런스 진행
+		// 에러시 안전하게 리밸런스 진행
+		return true
 	}
-	return !ok
+	// 슬롯이 있는 마스터 수가 예상 마스터 수보다 적으면 리밸런스 필요
+	return mastersWithSlots < expectedMasters
 }

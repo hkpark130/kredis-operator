@@ -66,7 +66,8 @@ func (jm *JobManager) generateJobName(kredis *cachev1alpha1.Kredis, jobType JobT
 	return fmt.Sprintf("%s-%s-%s", kredis.Name, jobType, hash)
 }
 
-// GetJobStatus checks the status of an existing job
+// GetJobStatus checks the status of an existing job using Condition-based logic.
+// This is more accurate than checking Active/Succeeded/Failed counters which may miss edge cases.
 func (jm *JobManager) GetJobStatus(ctx context.Context, kredis *cachev1alpha1.Kredis, jobType JobType) (*JobResult, error) {
 	logger := log.FromContext(ctx)
 
@@ -97,25 +98,34 @@ func (jm *JobManager) GetJobStatus(ctx context.Context, kredis *cachev1alpha1.Kr
 		result.StartTime = &t
 	}
 
-	// Check job status
-	if job.Status.Succeeded > 0 {
-		result.Status = JobStatusSucceeded
-		result.Message = "Job completed successfully"
-		if job.Status.CompletionTime != nil {
-			t := job.Status.CompletionTime.Time
-			result.FinishTime = &t
+	// Check job status using Conditions (more reliable than counters)
+	// Conditions provide definitive terminal states
+	for _, condition := range job.Status.Conditions {
+		if condition.Status != corev1.ConditionTrue {
+			continue
 		}
-		logger.Info("Job succeeded", "job", job.Name, "type", jobType)
-		return result, nil
+
+		switch condition.Type {
+		case batchv1.JobComplete:
+			result.Status = JobStatusSucceeded
+			result.Message = "Job completed successfully"
+			if job.Status.CompletionTime != nil {
+				t := job.Status.CompletionTime.Time
+				result.FinishTime = &t
+			}
+			logger.Info("Job succeeded (Condition)", "job", job.Name, "type", jobType)
+			return result, nil
+
+		case batchv1.JobFailed:
+			result.Status = JobStatusFailed
+			result.Message = fmt.Sprintf("Job failed: %s", condition.Reason)
+			logger.Info("Job failed (Condition)", "job", job.Name, "type", jobType, "reason", condition.Reason)
+			return result, nil
+		}
 	}
 
-	if job.Status.Failed > 0 {
-		result.Status = JobStatusFailed
-		result.Message = fmt.Sprintf("Job failed after %d attempts", job.Status.Failed)
-		logger.Info("Job failed", "job", job.Name, "type", jobType, "failures", job.Status.Failed)
-		return result, nil
-	}
-
+	// No terminal condition found - check if job is still active
+	// This handles jobs that are still running or in backoff retry
 	if job.Status.Active > 0 {
 		result.Status = JobStatusRunning
 		result.Message = "Job is running"
@@ -123,8 +133,20 @@ func (jm *JobManager) GetJobStatus(ctx context.Context, kredis *cachev1alpha1.Kr
 		return result, nil
 	}
 
-	result.Status = JobStatusPending
-	result.Message = "Job is pending"
+	// Job has no active pods and no terminal condition
+	// This could mean it's pending, in backoff, or being scheduled
+	// Check if it has started at all
+	if job.Status.StartTime == nil {
+		result.Status = JobStatusPending
+		result.Message = "Job is pending (not started)"
+		return result, nil
+	}
+
+	// Job has started but has no active pods and no terminal condition
+	// This likely means it's in backoff retry - treat as running to avoid premature cleanup
+	result.Status = JobStatusRunning
+	result.Message = "Job is in backoff retry"
+	logger.V(1).Info("Job in backoff retry (no active pods, no terminal condition)", "job", job.Name, "type", jobType)
 	return result, nil
 }
 
@@ -144,7 +166,8 @@ func (jm *JobManager) getMostRecentJob(jobs []batchv1.Job) *batchv1.Job {
 }
 
 // CreateReshardJob creates a Job to reshard slots to an empty master
-func (jm *JobManager) CreateReshardJob(ctx context.Context, kredis *cachev1alpha1.Kredis, targetNodeID string, targetAddr string, clusterAddr string, slotsToMove int) error {
+// donorNodeID can be empty (will use "all"), or a specific NodeID to take slots from
+func (jm *JobManager) CreateReshardJob(ctx context.Context, kredis *cachev1alpha1.Kredis, targetNodeID string, targetAddr string, clusterAddr string, slotsToMove int, donorNodeID string) error {
 	logger := log.FromContext(ctx)
 
 	jobName := jm.generateJobName(kredis, JobTypeReshard, targetNodeID)
@@ -158,13 +181,19 @@ func (jm *JobManager) CreateReshardJob(ctx context.Context, kredis *cachev1alpha
 		return fmt.Errorf("failed to check existing job: %w", err)
 	}
 
+	// Determine the source: specific donor or all masters
+	fromSource := "all"
+	if donorNodeID != "" {
+		fromSource = donorNodeID
+	}
+
 	// Build reshard command
 	command := []string{
 		"redis-cli",
 		"--cluster", "reshard", clusterAddr,
 		"--cluster-to", targetNodeID,
 		"--cluster-slots", fmt.Sprintf("%d", slotsToMove),
-		"--cluster-from", "all",
+		"--cluster-from", fromSource,
 		"--cluster-yes",
 		"--cluster-pipeline", "10000",
 	}
@@ -175,11 +204,12 @@ func (jm *JobManager) CreateReshardJob(ctx context.Context, kredis *cachev1alpha
 		return fmt.Errorf("failed to create reshard job: %w", err)
 	}
 
-	logger.Info("Created reshard job", "job", jobName, "targetNode", targetNodeID, "slots", slotsToMove)
+	logger.Info("Created reshard job", "job", jobName, "targetNode", targetNodeID, "slots", slotsToMove, "donor", fromSource)
 	return nil
 }
 
 // CreateRebalanceJob creates a Job to rebalance the cluster
+// Uses non-interactive options (--cluster-yes, etc.) to ensure unattended execution
 func (jm *JobManager) CreateRebalanceJob(ctx context.Context, kredis *cachev1alpha1.Kredis, clusterAddr string) error {
 	logger := log.FromContext(ctx)
 
@@ -197,12 +227,18 @@ func (jm *JobManager) CreateRebalanceJob(ctx context.Context, kredis *cachev1alp
 		return nil
 	}
 
-	// Build rebalance command
+	// Build rebalance command with non-interactive options
+	// --cluster-yes: Auto-confirm slot moves without prompting
+	// --cluster-use-empty-masters: Include empty masters in rebalancing
+	// --cluster-pipeline: Batch size for slot migration
+	// --cluster-timeout: Timeout for cluster operations (prevents hanging)
 	command := []string{
 		"redis-cli",
 		"--cluster", "rebalance", clusterAddr,
+		"--cluster-yes",
 		"--cluster-use-empty-masters",
 		"--cluster-pipeline", "1000",
+		"--cluster-timeout", "30000",
 	}
 
 	job := resource.BuildClusterOperationJob(kredis, jobName, string(JobTypeRebalance), "", command)
@@ -211,7 +247,7 @@ func (jm *JobManager) CreateRebalanceJob(ctx context.Context, kredis *cachev1alp
 		return fmt.Errorf("failed to create rebalance job: %w", err)
 	}
 
-	logger.Info("Created rebalance job", "job", jobName, "clusterAddr", clusterAddr)
+	logger.Info("Created rebalance job (non-interactive)", "job", jobName, "clusterAddr", clusterAddr)
 	return nil
 }
 
@@ -309,15 +345,17 @@ func (jm *JobManager) CreateScaleDownMigrateJob(ctx context.Context, kredis *cac
 	// For simplicity, we use reshard with "all" remaining masters by running rebalance with --cluster-weight <source>=0
 
 	// Actually, the best approach for scale-down is to use:
-	// redis-cli --cluster rebalance <addr> --cluster-weight <sourceNodeID>=0 --cluster-use-empty-masters
+	// redis-cli --cluster rebalance <addr> --cluster-weight <sourceNodeID>=0
 	// This will move all slots away from the source node
+	// Use --cluster-yes for non-interactive execution
 
 	command := []string{
 		"redis-cli",
 		"--cluster", "rebalance", clusterAddr,
 		"--cluster-weight", fmt.Sprintf("%s=0", sourceNodeID),
-		// "--cluster-use-empty-masters",
+		"--cluster-yes",
 		"--cluster-pipeline", "1000",
+		"--cluster-timeout", "30000",
 	}
 
 	job := resource.BuildClusterOperationJob(kredis, jobName, string(JobTypeScaleDownMigrate), sourceNodeID, command)
@@ -367,8 +405,9 @@ func (jm *JobManager) CreateScaleDownForgetJob(ctx context.Context, kredis *cach
 	return nil
 }
 
-// GetScaleDownJobStatus checks the status of scale-down jobs for a specific node
+// GetScaleDownJobStatus checks the status of scale-down jobs for a specific node using Condition-based logic.
 func (jm *JobManager) GetScaleDownJobStatus(ctx context.Context, kredis *cachev1alpha1.Kredis, jobType JobType, nodeID string) (*JobResult, error) {
+	logger := log.FromContext(ctx)
 	jobName := jm.generateJobName(kredis, jobType, nodeID)
 
 	job := &batchv1.Job{}
@@ -386,25 +425,41 @@ func (jm *JobManager) GetScaleDownJobStatus(ctx context.Context, kredis *cachev1
 		result.StartTime = &t
 	}
 
-	if job.Status.Succeeded > 0 {
-		result.Status = JobStatusSucceeded
-		result.Message = "Job completed successfully"
-		if job.Status.CompletionTime != nil {
-			t := job.Status.CompletionTime.Time
-			result.FinishTime = &t
+	// Check job status using Conditions (more reliable than counters)
+	for _, condition := range job.Status.Conditions {
+		if condition.Status != corev1.ConditionTrue {
+			continue
 		}
-		return result, nil
+
+		switch condition.Type {
+		case batchv1.JobComplete:
+			result.Status = JobStatusSucceeded
+			result.Message = "Job completed successfully"
+			if job.Status.CompletionTime != nil {
+				t := job.Status.CompletionTime.Time
+				result.FinishTime = &t
+			}
+			return result, nil
+
+		case batchv1.JobFailed:
+			result.Status = JobStatusFailed
+			result.Message = fmt.Sprintf("Job failed: %s", condition.Reason)
+			return result, nil
+		}
 	}
 
-	if job.Status.Failed > 0 {
-		result.Status = JobStatusFailed
-		result.Message = fmt.Sprintf("Job failed after %d attempts", job.Status.Failed)
-		return result, nil
-	}
-
+	// No terminal condition - check if still active
 	if job.Status.Active > 0 {
 		result.Status = JobStatusRunning
 		result.Message = "Job is running"
+		return result, nil
+	}
+
+	// Job has started but no active pods and no terminal condition - likely in backoff
+	if job.Status.StartTime != nil {
+		result.Status = JobStatusRunning
+		result.Message = "Job is in backoff retry"
+		logger.V(1).Info("Scale-down job in backoff", "job", jobName, "type", jobType)
 		return result, nil
 	}
 

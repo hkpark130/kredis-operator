@@ -678,9 +678,10 @@ func (cm *ClusterManager) finalizeScaleDown(ctx context.Context, kredis *cachev1
 	delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
 
 	// Update LastScaleTime to enable stabilization window for autoscaling
+	// Note: LastScaleType is already set by autoscaler before triggering scale-down
+	// (e.g., "replicas-down", "masters-down"), so we don't overwrite it here
 	now := time.Now()
 	delta.LastScaleTime = &now
-	delta.LastScaleType = "masters-down" // Scale-down operation
 
 	return nil
 }

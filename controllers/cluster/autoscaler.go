@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,11 +42,12 @@ type AutoscaleResult struct {
 type Autoscaler struct {
 	client.Client
 	metricsClient metricsv.Interface
+	podExecutor   *PodExecutor
 }
 
 // NewAutoscaler creates a new Autoscaler
-func NewAutoscaler(c client.Client, metricsClient metricsv.Interface) *Autoscaler {
-	return &Autoscaler{Client: c, metricsClient: metricsClient}
+func NewAutoscaler(c client.Client, metricsClient metricsv.Interface, podExecutor *PodExecutor) *Autoscaler {
+	return &Autoscaler{Client: c, metricsClient: metricsClient, podExecutor: podExecutor}
 }
 
 // EvaluateAutoscaling evaluates if autoscaling is needed based on current metrics
@@ -59,11 +61,40 @@ func (a *Autoscaler) EvaluateAutoscaling(ctx context.Context, kredis *cachev1alp
 
 	// Check if metrics client is available
 	if a.metricsClient == nil {
+		// #region agent log
+		logger.Info("agent_debug",
+			"sessionId", "debug-session",
+			"runId", "run1",
+			"hypothesisId", "A2",
+			"location", "controllers/cluster/autoscaler.go:EvaluateAutoscaling",
+			"message", "metricsClient is nil (autoscaling disabled at runtime)",
+			"data", map[string]interface{}{
+				"clusterState": kredis.Status.ClusterState,
+				"lastOp":       kredis.Status.LastClusterOperation,
+			},
+			"timestamp", time.Now().UnixMilli(),
+		)
+		// #endregion
 		return &AutoscaleResult{Decision: AutoscaleDecision{ShouldScale: false, Reason: "Metrics client not available"}}, nil
 	}
 
 	// Check if cluster is in a stable state
 	if !a.isClusterStable(kredis) {
+		// #region agent log
+		logger.Info("agent_debug",
+			"sessionId", "debug-session",
+			"runId", "run1",
+			"hypothesisId", "A3",
+			"location", "controllers/cluster/autoscaler.go:EvaluateAutoscaling",
+			"message", "cluster not stable - skipping autoscaling",
+			"data", map[string]interface{}{
+				"clusterState":  kredis.Status.ClusterState,
+				"lastOp":        kredis.Status.LastClusterOperation,
+				"lastScaleType": kredis.Status.LastScaleType,
+			},
+			"timestamp", time.Now().UnixMilli(),
+		)
+		// #endregion
 		logger.V(1).Info("Cluster not stable, skipping autoscaling evaluation")
 		return &AutoscaleResult{Decision: AutoscaleDecision{ShouldScale: false, Reason: "Cluster not stable"}}, nil
 	}
@@ -75,6 +106,22 @@ func (a *Autoscaler) EvaluateAutoscaling(ctx context.Context, kredis *cachev1alp
 	memoryPercent, cpuPercent, err := a.collectMetrics(ctx, kredis, pods)
 	if err != nil {
 		logger.Error(err, "Failed to collect metrics for autoscaling")
+		// #region agent log
+		logger.Info("agent_debug",
+			"sessionId", "debug-session",
+			"runId", "run1",
+			"hypothesisId", "A4",
+			"location", "controllers/cluster/autoscaler.go:EvaluateAutoscaling",
+			"message", "collectMetrics failed (autoscaling decision forced false)",
+			"data", map[string]interface{}{
+				"err":          err.Error(),
+				"podsTotal":    len(pods),
+				"clusterState": kredis.Status.ClusterState,
+				"lastOp":       kredis.Status.LastClusterOperation,
+			},
+			"timestamp", time.Now().UnixMilli(),
+		)
+		// #endregion
 		return &AutoscaleResult{
 			MemoryUsagePercent: 0,
 			CPUUsagePercent:    0,
@@ -91,6 +138,25 @@ func (a *Autoscaler) EvaluateAutoscaling(ctx context.Context, kredis *cachev1alp
 	// Priority: Memory-based master scaling > CPU-based replica scaling
 	decision := a.evaluateScalingDecision(kredis, memoryPercent, cpuPercent)
 	result.Decision = decision
+
+	// #region agent log
+	logger.Info("agent_debug",
+		"sessionId", "debug-session",
+		"runId", "run1",
+		"hypothesisId", "A5",
+		"location", "controllers/cluster/autoscaler.go:EvaluateAutoscaling",
+		"message", "autoscaling evaluated",
+		"data", map[string]interface{}{
+			"memoryPercent": memoryPercent,
+			"cpuPercent":    cpuPercent,
+			"shouldScale":   decision.ShouldScale,
+			"scaleType":     decision.ScaleType,
+			"newMasters":    decision.NewMasters,
+			"reason":        decision.Reason,
+		},
+		"timestamp", time.Now().UnixMilli(),
+	)
+	// #endregion
 
 	if decision.ShouldScale {
 		logger.Info("Autoscaling decision made",
@@ -131,6 +197,23 @@ func (a *Autoscaler) isClusterStable(kredis *cachev1alpha1.Kredis) bool {
 		return false
 	}
 
+	// Don't autoscale immediately after rebalance/reshard operations
+	// Wait for data to stabilize across new masters
+	if strings.Contains(lastOp, "rebalance-success") ||
+		strings.Contains(lastOp, "reshard-success") ||
+		strings.Contains(lastOp, "scale-complete") {
+		// Check if enough time has passed since the operation
+		if kredis.Status.LastScaleTime != nil {
+			timeSinceScale := time.Since(kredis.Status.LastScaleTime.Time)
+			// Use a minimum stabilization period after rebalance (at least 2 minutes)
+			// to allow data distribution to normalize
+			minRebalanceStabilization := 2 * time.Minute
+			if timeSinceScale < minRebalanceStabilization {
+				return false
+			}
+		}
+	}
+
 	// Don't autoscale if there are pending scale-down nodes
 	if len(kredis.Status.PendingScaleDown) > 0 {
 		return false
@@ -142,6 +225,26 @@ func (a *Autoscaler) isClusterStable(kredis *cachev1alpha1.Kredis) bool {
 	}
 
 	return true
+}
+
+// hasRecentScaleUp checks if there was a recent scale-up operation that hasn't had
+// enough time for data redistribution. This prevents cascading scale-ups.
+func (a *Autoscaler) hasRecentScaleUp(kredis *cachev1alpha1.Kredis) bool {
+	// Check LastScaleType - only care about master scale-ups
+	if kredis.Status.LastScaleType != "masters-up" {
+		return false
+	}
+
+	// Check if last scale-up was recent (within 5 minutes)
+	if kredis.Status.LastScaleTime == nil {
+		return false
+	}
+
+	timeSinceScale := time.Since(kredis.Status.LastScaleTime.Time)
+	// 5 minute window for data redistribution after rebalancing
+	redistributionWindow := 5 * time.Minute
+
+	return timeSinceScale < redistributionWindow
 }
 
 // canScaleInDirection checks if enough time has passed to allow scaling in the given direction.
@@ -183,26 +286,166 @@ func (a *Autoscaler) canScaleInDirection(kredis *cachev1alpha1.Kredis, direction
 	return now.Sub(creationTime) >= time.Duration(stabilizationSeconds)*time.Second
 }
 
-// collectMetrics collects CPU and memory metrics from Kubernetes Metrics API
-// Uses direct API calls via metricsClient (not controller-runtime cache) to avoid watch issues
+// collectMetrics collects CPU and memory metrics
+// Memory: Uses Redis INFO memory (used_memory / maxmemory) for masters only, returns MAX across all masters
+// CPU: Uses Kubernetes Metrics API for all pods
 func (a *Autoscaler) collectMetrics(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod) (memoryPercent, cpuPercent int32, err error) {
 	logger := log.FromContext(ctx)
+
+	// Build pod name to pod map for quick lookup
+	podMap := make(map[string]*corev1.Pod)
+	for i := range pods {
+		podMap[pods[i].Name] = &pods[i]
+	}
+
+	// Identify master pods from ClusterNodes status
+	masterPods := a.getMasterPods(kredis, podMap)
+	logger.V(1).Info("Master pods identified", "count", len(masterPods))
+
+	// Collect memory metrics from Redis INFO memory for masters only
+	// Use max(used_memory / maxmemory) across all masters as the trigger
+	memoryPercent = a.collectRedisMemoryMetrics(ctx, masterPods, kredis.Spec.BasePort)
+
+	// Collect CPU metrics from Kubernetes Metrics API for all pods
+	cpuPercent = a.collectCPUMetrics(ctx, kredis, pods)
+
+	logger.V(1).Info("Collected metrics",
+		"memoryPercent (max of masters)", memoryPercent,
+		"cpuPercent (avg of all)", cpuPercent,
+		"masterCount", len(masterPods))
+
+	return memoryPercent, cpuPercent, nil
+}
+
+// getMasterPods extracts master pods from ClusterNodes status
+func (a *Autoscaler) getMasterPods(kredis *cachev1alpha1.Kredis, podMap map[string]*corev1.Pod) []*corev1.Pod {
+	var masterPods []*corev1.Pod
+
+	for _, node := range kredis.Status.ClusterNodes {
+		if node.Role != "master" {
+			continue
+		}
+		if pod, ok := podMap[node.PodName]; ok {
+			masterPods = append(masterPods, pod)
+		}
+	}
+
+	return masterPods
+}
+
+// collectRedisMemoryMetrics collects memory usage from Redis INFO memory command
+// Returns max(used_memory / maxmemory * 100) across all masters
+func (a *Autoscaler) collectRedisMemoryMetrics(ctx context.Context, masterPods []*corev1.Pod, basePort int32) int32 {
+	logger := log.FromContext(ctx)
+
+	if a.podExecutor == nil || len(masterPods) == 0 {
+		return 0
+	}
+
+	var maxPercent int32 = 0
+
+	for _, pod := range masterPods {
+		if pod.Status.PodIP == "" {
+			continue
+		}
+
+		// Execute INFO memory command
+		result, err := a.podExecutor.ExecuteRedisCommand(ctx, *pod, basePort, "INFO", "memory")
+		if err != nil {
+			logger.V(1).Info("Failed to get INFO memory", "pod", pod.Name, "error", err)
+			continue
+		}
+
+		usedMemory, maxMemory := a.parseRedisMemoryInfo(result.Stdout)
+
+		// #region agent log
+		logger.Info("agent_debug",
+			"sessionId", "debug-session",
+			"runId", "run1",
+			"hypothesisId", "H1",
+			"location", "controllers/cluster/autoscaler.go:collectRedisMemoryMetrics",
+			"message", "Redis memory info parsed",
+			"data", map[string]interface{}{
+				"pod":        pod.Name,
+				"usedMemory": usedMemory,
+				"maxMemory":  maxMemory,
+			},
+			"timestamp", time.Now().UnixMilli(),
+		)
+		// #endregion
+
+		if maxMemory <= 0 {
+			// maxmemory not set, skip this master
+			logger.Info("maxmemory not set for pod - autoscaling will not work!", "pod", pod.Name, "usedMemory", usedMemory)
+			continue
+		}
+
+		percent := int32((usedMemory * 100) / maxMemory)
+		logger.V(1).Info("Master memory usage",
+			"pod", pod.Name,
+			"usedMemory", resource.NewQuantity(usedMemory, resource.BinarySI).String(),
+			"maxMemory", resource.NewQuantity(maxMemory, resource.BinarySI).String(),
+			"percent", percent)
+
+		if percent > maxPercent {
+			maxPercent = percent
+		}
+	}
+
+	return maxPercent
+}
+
+// parseRedisMemoryInfo parses Redis INFO memory output and returns used_memory and maxmemory
+func (a *Autoscaler) parseRedisMemoryInfo(infoOutput string) (usedMemory, maxMemory int64) {
+	lines := strings.Split(infoOutput, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+
+		switch key {
+		case "used_memory":
+			if v, err := strconv.ParseInt(value, 10, 64); err == nil {
+				usedMemory = v
+			}
+		case "maxmemory":
+			if v, err := strconv.ParseInt(value, 10, 64); err == nil {
+				maxMemory = v
+			}
+		}
+	}
+
+	return usedMemory, maxMemory
+}
+
+// collectCPUMetrics collects CPU usage from Kubernetes Metrics API for all pods
+func (a *Autoscaler) collectCPUMetrics(ctx context.Context, kredis *cachev1alpha1.Kredis, pods []corev1.Pod) int32 {
+	logger := log.FromContext(ctx)
+
+	if a.metricsClient == nil {
+		return 0
+	}
 
 	// Get pod metrics using direct API call (no watch)
 	podMetricsList, err := a.metricsClient.MetricsV1beta1().PodMetricses(kredis.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to list pod metrics: %w", err)
+		logger.V(1).Info("Failed to list pod metrics", "error", err)
+		return 0
 	}
-
-	logger.V(1).Info("Metrics collection debug",
-		"podsCount", len(pods),
-		"metricsCount", len(podMetricsList.Items))
 
 	// Build a map of pod names for this Kredis instance
 	kredisPodNames := make(map[string]bool)
 	for _, pod := range pods {
 		kredisPodNames[pod.Name] = true
-		logger.V(1).Info("Kredis pod", "name", pod.Name)
 	}
 
 	// Build a map of pod resource requests
@@ -214,20 +457,11 @@ func (a *Autoscaler) collectMetrics(ctx context.Context, kredis *cachev1alpha1.K
 					Requests: container.Resources.Requests,
 					Limits:   container.Resources.Limits,
 				}
-				logger.V(1).Info("Found redis container", "pod", pod.Name,
-					"memRequest", container.Resources.Requests.Memory().String(),
-					"cpuRequest", container.Resources.Requests.Cpu().String())
 				break
 			}
 		}
 	}
 
-	// Log metrics pod names for debugging
-	for _, pm := range podMetricsList.Items {
-		logger.V(1).Info("Metrics pod", "name", pm.Name, "containers", len(pm.Containers))
-	}
-
-	var totalMemoryUsage, totalMemoryRequest int64
 	var totalCPUUsage, totalCPURequest int64
 	metricsCount := 0
 
@@ -241,31 +475,18 @@ func (a *Autoscaler) collectMetrics(ctx context.Context, kredis *cachev1alpha1.K
 				continue
 			}
 
-			// Get current usage
-			memUsage := container.Usage.Memory().Value()
 			cpuUsage := container.Usage.Cpu().MilliValue()
 
-			// Get requests from pod spec
 			requests, ok := podRequests[podMetrics.Name]
 			if !ok {
 				continue
 			}
 
-			memRequest := requests.Requests.Memory()
 			cpuRequest := requests.Requests.Cpu()
-
-			// Use limits if requests are not set
-			if memRequest == nil || memRequest.Value() == 0 {
-				memRequest = requests.Limits.Memory()
-			}
 			if cpuRequest == nil || cpuRequest.MilliValue() == 0 {
 				cpuRequest = requests.Limits.Cpu()
 			}
 
-			if memRequest != nil && memRequest.Value() > 0 {
-				totalMemoryUsage += memUsage
-				totalMemoryRequest += memRequest.Value()
-			}
 			if cpuRequest != nil && cpuRequest.MilliValue() > 0 {
 				totalCPUUsage += cpuUsage
 				totalCPURequest += cpuRequest.MilliValue()
@@ -274,29 +495,19 @@ func (a *Autoscaler) collectMetrics(ctx context.Context, kredis *cachev1alpha1.K
 		}
 	}
 
-	if metricsCount == 0 {
-		logger.V(1).Info("No metrics available for Kredis pods")
-		return 0, 0, fmt.Errorf("no metrics available")
+	if metricsCount == 0 || totalCPURequest == 0 {
+		return 0
 	}
 
-	// Calculate percentages
-	if totalMemoryRequest > 0 {
-		memoryPercent = int32((totalMemoryUsage * 100) / totalMemoryRequest)
-	}
-	if totalCPURequest > 0 {
-		cpuPercent = int32((totalCPUUsage * 100) / totalCPURequest)
-	}
+	cpuPercent := int32((totalCPUUsage * 100) / totalCPURequest)
 
-	logger.V(1).Info("Collected metrics",
-		"memoryUsage", resource.NewQuantity(totalMemoryUsage, resource.BinarySI).String(),
-		"memoryRequest", resource.NewQuantity(totalMemoryRequest, resource.BinarySI).String(),
-		"memoryPercent", memoryPercent,
+	logger.V(1).Info("Collected CPU metrics",
 		"cpuUsageMillis", totalCPUUsage,
 		"cpuRequestMillis", totalCPURequest,
 		"cpuPercent", cpuPercent,
 		"podCount", metricsCount)
 
-	return memoryPercent, cpuPercent, nil
+	return cpuPercent
 }
 
 // evaluateScalingDecision determines if and how to scale based on metrics
@@ -350,12 +561,19 @@ func (a *Autoscaler) evaluateScalingDecision(kredis *cachev1alpha1.Kredis, memor
 		if !a.canScaleInDirection(kredis, "up") {
 			// Can't scale up yet, but maybe scale down is needed - continue checking
 		} else {
-			newMasters := currentMasters + 1
-			return AutoscaleDecision{
-				ShouldScale: true,
-				ScaleType:   "masters-up",
-				NewMasters:  newMasters,
-				Reason:      fmt.Sprintf("Memory usage %d%% >= threshold %d%%, scaling masters %d -> %d", memoryPercent, memScaleUp, currentMasters, newMasters),
+			// Additional check: If memory is very high (>90%), allow immediate scale-up
+			// Otherwise, ensure previous scale operation had time to distribute data
+			if memoryPercent < 90 && a.hasRecentScaleUp(kredis) {
+				// Recent scale-up detected, wait for data to redistribute
+				// This prevents cascading scale-ups before rebalancing takes effect
+			} else {
+				newMasters := currentMasters + 1
+				return AutoscaleDecision{
+					ShouldScale: true,
+					ScaleType:   "masters-up",
+					NewMasters:  newMasters,
+					Reason:      fmt.Sprintf("Memory usage %d%% >= threshold %d%%, scaling masters %d -> %d", memoryPercent, memScaleUp, currentMasters, newMasters),
+				}
 			}
 		}
 	}

@@ -15,6 +15,34 @@ log_info() { log "INFO: $*"; }
 log_warn() { log "WARN: $*"; }
 log_error() { log "ERROR: $*"; }
 
+# Kubernetes 메모리 형식을 바이트로 변환
+# 지원 형식: 100, 100k, 100Ki, 100M, 100Mi, 100G, 100Gi
+convert_k8s_memory_to_bytes() {
+    local mem="$1"
+    local value
+    local unit
+    
+    # 숫자와 단위 분리
+    value=$(echo "$mem" | sed 's/[^0-9]//g')
+    unit=$(echo "$mem" | sed 's/[0-9]//g')
+    
+    if [ -z "$value" ]; then
+        echo "0"
+        return
+    fi
+    
+    case "$unit" in
+        "")     echo "$value" ;;
+        "k"|"K") echo $((value * 1000)) ;;
+        "Ki")   echo $((value * 1024)) ;;
+        "m"|"M") echo $((value * 1000 * 1000)) ;;
+        "Mi")   echo $((value * 1024 * 1024)) ;;
+        "g"|"G") echo $((value * 1000 * 1000 * 1000)) ;;
+        "Gi")   echo $((value * 1024 * 1024 * 1024)) ;;
+        *)      echo "$value" ;;  # 알 수 없는 단위는 그대로 반환
+    esac
+}
+
 # 파드 정보 파싱
 parse_pod_info() {
     local hostname=$(hostname)
@@ -53,18 +81,34 @@ cluster-enabled yes
 cluster-announce-ip $SELF_IP
 cluster-announce-port $REDIS_PORT
 cluster-announce-bus-port $((REDIS_PORT + 10000))
-cluster-use-empty-masters yes
 
 # 로그 설정
 logfile /logs/redis.log
 loglevel notice
+
+# 캐시 모드 설정 - MISCONF 에러 방지
+# RDB 저장 완전 비활성화 (캐시 용도이므로 persistence 불필요)
+save ""
+
+# AOF 비활성화 (캐시 용도)
+appendonly no
+
+# 디스크 저장 실패 시에도 쓰기 허용 (MISCONF stop-writes-on-bgsave-error 방지)
+stop-writes-on-bgsave-error no
 EOF
 
     # MaxMemory 설정 (선택)
+    # Kubernetes 메모리 형식(예: 700Mi, 1Gi)을 Redis 바이트로 변환
     if [ -n "$REDIS_MAXMEMORY" ]; then
-        echo "maxmemory $REDIS_MAXMEMORY" >> "$config_file"
-        # 기본 정책: allkeys-lfu (LFU 는 인기/빈도 기반, 캐시 워크로드에서 더 일관된 hit ratio)
-        echo "maxmemory-policy allkeys-lfu" >> "$config_file"
+        MAXMEM_BYTES=$(convert_k8s_memory_to_bytes "$REDIS_MAXMEMORY")
+        if [ "$MAXMEM_BYTES" -gt 0 ] 2>/dev/null; then
+            echo "maxmemory $MAXMEM_BYTES" >> "$config_file"
+            # 기본 정책: allkeys-lfu (LFU 는 인기/빈도 기반, 캐시 워크로드에서 더 일관된 hit ratio)
+            echo "maxmemory-policy allkeys-lfu" >> "$config_file"
+            log_info "MaxMemory 설정: $REDIS_MAXMEMORY -> ${MAXMEM_BYTES} bytes"
+        else
+            log_warn "MaxMemory 변환 실패: $REDIS_MAXMEMORY"
+        fi
     fi
 
     log_info "Redis 설정 파일 생성됨: $config_file"
@@ -73,6 +117,10 @@ EOF
 # 주 실행 함수 (매우 단순화 - 컨트롤러가 클러스터 관리)
 main() {
     log_info "Redis 엔트리포인트 시작"
+    
+    # 데이터/로그 디렉토리 먼저 생성 (설정 파일에서 참조하기 전에)
+    mkdir -p /data /logs /usr/local/etc/redis
+    chown -R redis:redis /data /logs 2>/dev/null || true
     
     # 파드 정보 파싱
     parse_pod_info
@@ -83,10 +131,6 @@ main() {
     
     # Redis 설정 생성
     create_redis_config
-    
-    # 데이터 디렉토리 생성
-    mkdir -p /data /logs
-    chown redis:redis /data /logs
     
     # Redis 시작 (클러스터 관리는 컨트롤러가 담당)
     log_info "Redis 서버 시작..."

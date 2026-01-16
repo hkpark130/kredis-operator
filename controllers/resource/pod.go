@@ -231,9 +231,9 @@ func createBasePod(k *cachev1alpha1.Kredis, podName string, labels map[string]st
 			// Pod DNS: {podName}.{serviceName}.{namespace}.svc.cluster.local
 		},
 		Spec: corev1.PodSpec{
-			Hostname:  podName,
-			Subdomain: k.Name, // Headless service name for DNS
-			Containers: containers,
+			Hostname:         podName,
+			Subdomain:        k.Name, // Headless service name for DNS
+			Containers:       containers,
 			ImagePullSecrets: []corev1.LocalObjectReference{{Name: secretName}},
 			Volumes: []corev1.Volume{
 				{

@@ -21,7 +21,7 @@ spec:
       cpu: "1"
       memory: "1Gi"
     requests:
-      cpu: 100m
+      cpu: 500m         # 100m → 500m로 증가 (CPU % 계산 정상화)
       memory: "512Mi"
   # Autoscaling 설정 (테스트용으로 낮은 임계값 사용)
   autoscaling:
@@ -30,9 +30,13 @@ spec:
     maxMasters: 10            # 최대 마스터 수
     minReplicasPerMaster: 1   # 최소 레플리카 수
     maxReplicasPerMaster: 5   # 최대 레플리카 수
-    memoryScaleUpThreshold: 30   # Memory 30% 이상 → Master 추가 (테스트용) 보통 70%
-    memoryScaleDownThreshold: 10 # Memory 10% 이하 → Master 감소 보통 30%
-    cpuScaleUpThreshold: 30      # CPU 30% 이상 → Replica 추가 (테스트용) 보통 70%
-    cpuScaleDownThreshold: 10    # CPU 10% 이하 → Replica 감소 보통 30%
+    memoryScaleUpThreshold: 70   # Memory 70% 이상 → Master 추가
+    memoryScaleDownThreshold: 10 # Memory 10% 이하 → Master 감소
+    cpuScaleUpThreshold: 70      # CPU 70% 이상 → Replica 추가
+    cpuScaleDownThreshold: 20    # CPU 10% 이하 → Replica 감소
     scaleUpStabilizationWindowSeconds: 10   # 스케일업 대기 시간 (테스트용 짧게) 보통 60초
     scaleDownStabilizationWindowSeconds: 60 # 스케일다운 대기 시간 보통 10분 (600)
+  exporter:
+    enabled: true
+    image: "bitnami/redis-exporter:latest"
+    port: 9121

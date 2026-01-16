@@ -3,6 +3,10 @@
 # 사용법: kubectl apply -f config/samples/memory-load-test.yaml
 # 삭제: kubectl delete -f config/samples/memory-load-test.yaml
 # 주의: 마스터가 많을수록 더 많은 데이터 필요 (데이터가 분산되기 때문)
+#
+# 테스트 모드 설정 (환경변수로 조절 가능):
+#   - AGGRESSIVE=true : 리밸런싱 중에도 계속 삽입 (스트레스 테스트)
+#   - AGGRESSIVE=false (기본) : 리밸런싱 중 대기 (현실적 테스트)
 apiVersion: v1
 kind: Pod
 metadata:
@@ -12,12 +16,33 @@ spec:
   containers:
   - name: load-test
     image: redis:7.0
+    env:
+    - name: AGGRESSIVE
+      value: "true"  # true로 변경하면 리밸런싱 중에도 계속 삽입
     command:
     - /bin/bash
     - -c
     - |
       echo "Starting CONTINUOUS memory load test..."
+      echo "Mode: $([ "$AGGRESSIVE" = "true" ] && echo "AGGRESSIVE (stress test)" || echo "GRADUAL (realistic)")"
       REDIS_HOST="kredis-sample-master.kredis-operator-system.svc.cluster.local"
+      
+      # 클러스터 상태 확인 함수
+      wait_for_cluster_ready() {
+        local max_wait=300  # 최대 5분 대기
+        local waited=0
+        while [ $waited -lt $max_wait ]; do
+          STATE=$(redis-cli -c -h $REDIS_HOST -p 6379 CLUSTER INFO 2>/dev/null | grep cluster_state | cut -d: -f2 | tr -d '\r\n')
+          if [ "$STATE" = "ok" ]; then
+            return 0
+          fi
+          echo "Cluster state: $STATE, waiting..."
+          sleep 5
+          waited=$((waited + 5))
+        done
+        echo "WARNING: Cluster not ready after ${max_wait}s, continuing anyway..."
+        return 1
+      }
       
       # 연결 테스트
       echo "Testing connection..."
@@ -30,39 +55,82 @@ spec:
       echo "Cluster info:"
       redis-cli -c -h $REDIS_HOST -p 6379 CLUSTER INFO | head -5
       
-      # 100KB 크기의 값 (더 큰 값으로 메모리를 빠르게 채움)
-      VALUE_SIZE=102400  # 100KB
-      echo "Generating ${VALUE_SIZE} byte value..."
-      VALUE=$(head -c $VALUE_SIZE /dev/urandom | base64 | head -c $VALUE_SIZE)
+      # 500KB 크기의 값을 파일로 생성 (셸 변수 문제 회피)
+      VALUE_SIZE=512000  # 500KB
+      VALUE_FILE="/tmp/value.txt"
+      echo "Generating ${VALUE_SIZE} byte value to file..."
+      dd if=/dev/zero bs=1 count=$VALUE_SIZE 2>/dev/null | tr '\0' 'A' > $VALUE_FILE
+      echo "Value file size: $(wc -c < $VALUE_FILE) bytes"
       
       ROUND=0
+      BATCH_SIZE=1000  # 배치당 삽입 개수
+      TOTAL_KEYS=0
+      
       # 무한 루프로 계속 데이터 삽입
       while true; do
         ROUND=$((ROUND + 1))
         echo ""
         echo "========== ROUND $ROUND =========="
-        echo "Starting data insertion (100KB x 100000 keys = ~10GB total, distributed across masters)..."
         
-        for i in $(seq 1 100000); do
-          KEY="loadtest:round${ROUND}:key:$i"
-          RESULT=$(redis-cli -c -h $REDIS_HOST -p 6379 SET "$KEY" "$VALUE" 2>&1)
+        # 클러스터 상태 확인 (AGGRESSIVE 모드가 아닐 때)
+        if [ "$AGGRESSIVE" != "true" ]; then
+          echo "Checking cluster state before insertion..."
+          wait_for_cluster_ready
+        fi
+        
+        echo "Inserting ${BATCH_SIZE} keys per batch (50KB each)..."
+        
+        BATCH=0
+        ERRORS=0
+        for i in $(seq 1 10000); do
+          KEY="loadtest:${ROUND}:${i}"
+          # 파일에서 값 읽어서 SET (파이프라인으로 전달)
+          RESULT=$(cat $VALUE_FILE | redis-cli -c -h $REDIS_HOST -p 6379 -x SET "$KEY" 2>&1)
           
-          if [ $((i % 5000)) -eq 0 ]; then
-            echo "[$ROUND] Inserted $i keys..."
+          # 성공 여부 확인
+          if [ "$RESULT" = "OK" ]; then
+            TOTAL_KEYS=$((TOTAL_KEYS + 1))
+          else
+            ERRORS=$((ERRORS + 1))
+            if [ $ERRORS -le 5 ]; then
+              echo "SET error: $RESULT"
+            fi
+            # 에러 시 잠시 대기
+            if echo "$RESULT" | grep -q "CLUSTERDOWN"; then
+              echo "Cluster down, waiting..."
+              sleep 5
+              wait_for_cluster_ready
+            fi
+          fi
+          
+          if [ $((i % $BATCH_SIZE)) -eq 0 ]; then
+            BATCH=$((BATCH + 1))
+            echo "[$ROUND] Batch $BATCH: $i keys this round, $TOTAL_KEYS total, $ERRORS errors"
+            
             # 각 마스터 노드의 메모리 확인
             echo "Memory per master node:"
-            for node in $(redis-cli -c -h $REDIS_HOST -p 6379 CLUSTER NODES | grep master | awk '{print $2}' | cut -d@ -f1); do
+            for node in $(redis-cli -c -h $REDIS_HOST -p 6379 CLUSTER NODES 2>/dev/null | grep master | grep -v fail | awk '{print $2}' | cut -d@ -f1); do
               HOST=$(echo $node | cut -d: -f1)
               PORT=$(echo $node | cut -d: -f2)
               MEM=$(redis-cli -h $HOST -p $PORT INFO memory 2>/dev/null | grep used_memory_human | cut -d: -f2 | tr -d '\r')
-              echo "  $HOST:$PORT -> $MEM"
+              KEYS=$(redis-cli -h $HOST -p $PORT DBSIZE 2>/dev/null | awk '{print $2}')
+              echo "  $HOST:$PORT -> mem: $MEM, keys: $KEYS"
             done
+            
+            # 배치 간 짧은 대기
+            if [ "$AGGRESSIVE" != "true" ]; then
+              sleep 1
+            fi
           fi
         done
         
-        echo "Round $ROUND completed. Waiting 30 seconds before next round..."
-        echo "Total keys in cluster:"
+        echo "Round $ROUND completed. Total keys inserted: $TOTAL_KEYS"
+        echo "Cluster DBSIZE:"
         redis-cli -c -h $REDIS_HOST -p 6379 DBSIZE
-        sleep 30
+        
+        # 라운드 간 대기
+        WAIT_TIME=$([ "$AGGRESSIVE" = "true" ] && echo "10" || echo "60")
+        echo "Waiting ${WAIT_TIME} seconds before next round..."
+        sleep $WAIT_TIME
       done
   restartPolicy: Never

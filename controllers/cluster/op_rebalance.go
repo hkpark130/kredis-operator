@@ -134,9 +134,9 @@ func (cm *ClusterManager) executeRebalancePhase(ctx context.Context, kredis *cac
 			delta.ClusterState = string(cachev1alpha1.ClusterStateRunning)
 
 			// Update LastScaleTime only when fully complete
+			// Note: LastScaleType is already set by autoscaler, so we don't overwrite it here
 			now := time.Now()
 			delta.LastScaleTime = &now
-			delta.LastScaleType = "masters-up"
 		}
 
 		// Cleanup completed Jobs

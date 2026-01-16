@@ -25,12 +25,6 @@ data:
         static_configs:
           - targets: ['localhost:9090']
 
-      # Redis Exporter 메트릭 (kredis-operator에서 생성한 서비스)
-      - job_name: 'redis-exporter'
-        static_configs:
-          - targets: ['kredis-sample-metrics.kredis-operator-system:9121']
-        metrics_path: /metrics
-
       # Kubernetes Service Discovery (annotation 기반 자동 디스커버리)
       - job_name: 'kubernetes-services'
         kubernetes_sd_configs:
@@ -41,11 +35,11 @@ data:
             action: keep
             regex: true
           # 포트 설정
-          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_port]
+          - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
             action: replace
             target_label: __address__
-            regex: (.+)
-            replacement: ${1}
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: ${1}:${2}
           # 메트릭 경로 설정
           - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
             action: replace

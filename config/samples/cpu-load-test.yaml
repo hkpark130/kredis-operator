@@ -1,80 +1,91 @@
 ---
-# CPU Load Test - 레플리카 노드에 읽기 부하 생성 (지속적)
-# 레플리카에 GET 등 읽기 요청을 보냄 (READONLY 모드)
+# CPU Load Test - 블랙프라이데이 읽기 부하 시뮬레이션
+# 슬레이브 노드들에 직접 READONLY GET 요청 (고성능 버전)
 apiVersion: v1
-kind: Pod
+kind: ConfigMap
 metadata:
-  name: redis-cpu-load-replica
+  name: cpu-load-test-script
   namespace: kredis-operator-system
-spec:
-  containers:
-  - name: load-test
-    image: redis:7.0
-    command:
-    - /bin/bash
-    - -c
-    - |
-      echo "Starting CONTINUOUS CPU load test on REPLICAS..."
-      REDIS_HOST="kredis-sample-slave.kredis-operator-system.svc.cluster.local"
-      
-      echo "Cluster nodes (slaves):"
-      redis-cli -c -h $REDIS_HOST -p 6379 CLUSTER NODES | grep slave | head -5
-      
-      # 먼저 마스터에 테스트 데이터 생성
-      echo "Preparing test data on masters..."
-      MASTER_HOST="kredis-sample-master.kredis-operator-system.svc.cluster.local"
-      for i in $(seq 1 10000); do
-        redis-cli -c -h $MASTER_HOST -p 6379 SET "readtest:$i" "value_$i" > /dev/null
-      done
-      echo "Test data prepared: 10000 keys"
-      
-      ROUND=0
+data:
+  load-test.sh: |
+    #!/bin/bash
+    set -e
+    
+    SLAVE_HOST="kredis-sample-slave.kredis-operator-system.svc.cluster.local"
+    MASTER_HOST="kredis-sample-master.kredis-operator-system.svc.cluster.local"
+    PORT=6379
+    
+    echo "=== Black Friday Read Load Test ==="
+    echo "Target: $SLAVE_HOST:$PORT"
+    echo "Worker ID: $WORKER_ID"
+    
+    # 마스터에 테스트 키 생성
+    echo "Setting test key on master..."
+    redis-cli -h $MASTER_HOST -p $PORT -c SET loadtest "blackfriday" > /dev/null 2>&1 || true
+    sleep 2
+    
+    echo "Starting high-performance READONLY GET load..."
+    
+    # 고성능 워커 함수 - 각각 별도 프로세스로 실행
+    worker() {
       while true; do
-        ROUND=$((ROUND + 1))
-        echo ""
-        echo "========== REPLICA BENCHMARK ROUND $ROUND =========="
-        
-        # 레플리카에서 읽기 부하
-        # redis-benchmark는 READONLY를 직접 지원하지 않으므로 직접 구현
-        for i in $(seq 1 500000); do
-          # 각 레플리카에 READONLY 후 GET
-          redis-cli -h $REDIS_HOST -p 6379 READONLY > /dev/null 2>&1
-          redis-cli -h $REDIS_HOST -p 6379 GET "readtest:$((i % 10000 + 1))" > /dev/null 2>&1
-          
-          if [ $((i % 50000)) -eq 0 ]; then
-            echo "Read $i keys from replicas..."
-          fi
-        done
-        
-        echo "Round $ROUND completed. Starting next round..."
+        # yes 명령으로 빠르게 GET 명령 생성 (쉘 루프보다 100배 빠름)
+        # head로 10만개로 제한, 파이프라인으로 전송
+        {
+          echo "READONLY"
+          yes "GET loadtest" | head -n 100000
+        } | redis-cli -h $SLAVE_HOST -p $PORT > /dev/null 2>&1
       done
-  restartPolicy: Never
+    }
+    
+    # 10개의 병렬 워커 실행 (각 Pod당)
+    echo "Starting 10 parallel workers..."
+    for i in $(seq 1 10); do
+      worker &
+    done
+    
+    # 워커들이 끝날 때까지 대기
+    wait
 ---
-# CPU Load Test - 레플리카에 추가 읽기 부하 (redis-benchmark 사용)
-# 참고: --cluster 모드에서 GET은 마스터로 리다이렉트되지만, 부하 자체는 생성됨
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: redis-cpu-load-replica-2
+  name: cpu-load-test
   namespace: kredis-operator-system
+  labels:
+    app: cpu-load-test
 spec:
-  containers:
-  - name: load-test
-    image: redis:7.0
-    command:
-    - /bin/bash
-    - -c
-    - |
-      echo "Starting CPU load test worker 2 on cluster (mixed)..."
-      REDIS_HOST="kredis-sample.kredis-operator-system.svc.cluster.local"
-      
-      while true; do
-        # GET 위주의 읽기 부하 (일부는 마스터로 리다이렉트됨)
-        redis-benchmark -h $REDIS_HOST -p 6379 \
-          -c 200 -n 3500000 \
-          -t get \
-          -d 512 \
-          --cluster \
-          -q
-      done
-  restartPolicy: Never
+  replicas: 5
+  selector:
+    matchLabels:
+      app: cpu-load-test
+  template:
+    metadata:
+      labels:
+        app: cpu-load-test
+    spec:
+      containers:
+      - name: load-generator
+        image: redis:7.0
+        command: ["/bin/bash", "/scripts/load-test.sh"]
+        env:
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "128Mi"
+          limits:
+            cpu: "1000m"
+            memory: "256Mi"
+      volumes:
+      - name: script
+        configMap:
+          name: cpu-load-test-script
+          defaultMode: 0755
+      restartPolicy: Always

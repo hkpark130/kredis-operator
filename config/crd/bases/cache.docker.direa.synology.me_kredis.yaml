@@ -132,14 +132,19 @@ spec:
                     format: int32
                     type: integer
                 type: object
+              basePort:
+                description: Base Port for Redis
+                format: int32
+                type: integer
               exporter:
                 description: Exporter configuration for Prometheus metrics
                 properties:
                   enabled:
-                    description: Enabled enables redis-exporter sidecar for Prometheus metrics
+                    description: Enabled enables redis-exporter sidecar for Prometheus
+                      metrics
                     type: boolean
                   image:
-                    default: "bitnami/redis-exporter:latest"
+                    default: bitnami/redis-exporter:latest
                     description: Image is the redis-exporter container image
                     type: string
                   port:
@@ -148,10 +153,6 @@ spec:
                     format: int32
                     type: integer
                 type: object
-              basePort:
-                description: Base Port for Redis
-                format: int32
-                type: integer
               image:
                 description: Redis container image
                 type: string

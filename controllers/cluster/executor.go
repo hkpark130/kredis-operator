@@ -211,13 +211,13 @@ func (pe *PodExecutor) RepairCluster(ctx context.Context, pod corev1.Pod, port i
 	logger.Info("Repairing cluster", "pod", pod.Name)
 
 	nodeAddr := fmt.Sprintf("%s:%d", pod.Status.PodIP, port)
-	command := []string{
-		"redis-cli",
-		"--cluster",
-		"fix",
-		nodeAddr,
-		"--cluster-yes",
-	}
+	// redis-cli --cluster fix with --cluster-yes handles all confirmations automatically
+	command := []string{"redis-cli", "--cluster", "fix", nodeAddr, "--cluster-yes"}
+
+	logger.V(1).Info("Running redis-cli --cluster fix",
+		"pod", pod.Name,
+		"nodeAddr", nodeAddr,
+		"command", strings.Join(command, " "))
 
 	if _, err := pe.ExecuteCommand(ctx, pod, command); err != nil {
 		return fmt.Errorf("failed to repair cluster: %w", err)

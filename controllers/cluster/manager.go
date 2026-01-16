@@ -162,8 +162,24 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 			"currentTime", time.Now().Unix())
 		return OperationScale
 	}
+	if strings.Contains(lastOp, "scale-repair-done") {
+		// 클러스터 repair 후 스케일 재시도
+		logger.Info("Scale repair done - will retry scaling",
+			"lastOperation", lastOp,
+			"currentTime", time.Now().Unix())
+		return OperationScale
+	}
 	if strings.Contains(lastOp, "scale-failed") {
-		// 스케일 실패 후 재시도 - unknown 노드가 있을 수 있음
+		// 스케일 실패 후 - 먼저 fail 노드가 있는지 확인하고 heal 우선
+		for _, node := range clusterState {
+			if strings.Contains(node.Status, "fail") {
+				logger.Info("Scale failed with failed nodes - initiating heal first",
+					"lastOperation", lastOp,
+					"failedNode", node.PodName)
+				return OperationHeal
+			}
+		}
+		// fail 노드 없으면 스케일 재시도
 		logger.Info("Scale failed previously - will retry scaling",
 			"lastOperation", lastOp,
 			"currentTime", time.Now().Unix())
@@ -205,12 +221,24 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 		ourPodsSet[pod.Name] = struct{}{}
 	}
 
+	// Count how many unique nodes are known by all pods
+	// A pod is considered part of a REAL cluster only if it knows about OTHER nodes
+	// (not just itself). When a new Redis pod starts in cluster mode, it only knows itself.
+	uniqueNodeIDs := make(map[string]struct{})
+	for _, node := range clusterState {
+		if node.NodeID != "" {
+			uniqueNodeIDs[node.NodeID] = struct{}{}
+		}
+	}
+	isRealCluster := len(uniqueNodeIDs) > 1 // Real cluster has multiple nodes knowing each other
+
 	for _, node := range clusterState {
 		// A node is considered a cluster member if:
 		// 1. It's one of our pods (in the current pod list)
 		// 2. It has a valid NodeID (actually joined the cluster)
 		// 3. It has a known role (master/slave, not "unknown")
-		if _, isOurs := ourPodsSet[node.PodName]; isOurs && node.NodeID != "" && node.Role != "unknown" && node.Role != "" {
+		// 4. IMPORTANT: The cluster has more than 1 unique node ID (real cluster, not just isolated pods)
+		if _, isOurs := ourPodsSet[node.PodName]; isOurs && node.NodeID != "" && node.Role != "unknown" && node.Role != "" && isRealCluster {
 			clusterMembers = append(clusterMembers, node)
 			if node.Role == "master" {
 				masterNodes = append(masterNodes, node)
@@ -230,6 +258,24 @@ func (cm *ClusterManager) determineRequiredOperation(ctx context.Context, kredis
 
 	// Scenario 1: No functional cluster exists.
 	if !clusterExists {
+		// Safety guard: If this Kredis was previously created, NEVER re-run create/reset automatically.
+		// Transient exec failures or temporary cluster health issues must not trigger destructive resets.
+		if kredis.Status.LastScaleType == "create" {
+			logger.Info("Cluster existence check returned false, but cluster was previously created - skipping create to avoid data loss",
+				"lastScaleType", kredis.Status.LastScaleType,
+				"lastOperation", kredis.Status.LastClusterOperation)
+			return ""
+		}
+
+		// If we have evidence of cluster members (node IDs) but health check failed,
+		// prefer heal over destructive re-create.
+		if len(clusterMembers) > 0 {
+			logger.Info("Cluster members exist but health/existence check failed - initiating heal instead of create",
+				"clusterMembers", len(clusterMembers),
+				"lastOperation", kredis.Status.LastClusterOperation)
+			return OperationHeal
+		}
+
 		// All pods must be ready before we can attempt to create the cluster.
 		if len(pods) == int(cm.getExpectedPodCount(kredis)) {
 			logger.Info("No existing functional cluster found, and all pods are ready. Will create cluster.")
@@ -354,9 +400,10 @@ func (cm *ClusterManager) isClusterAlreadyExists(ctx context.Context, kredis *ca
 	// This prevents new unjoined pods (e.g., pod-0) from being selected over existing cluster members.
 	queryPod := cm.findQueryPod(pods, clusterState, port)
 	if queryPod == nil {
-		// Not an error, just means we can't check yet.
-		logger.Info("No ready pods available to check cluster existence")
-		return false, nil
+		// IMPORTANT: Treat as inconclusive, not "cluster does not exist".
+		// A transient exec failure must not trigger destructive create/reset.
+		logger.Info("No ready pods available to check cluster existence (inconclusive)")
+		return false, fmt.Errorf("no ready Redis pod available to check cluster existence")
 	}
 
 	// 1. Check cluster health (cluster_state:ok)
@@ -405,7 +452,16 @@ func (cm *ClusterManager) getKredisPods(ctx context.Context, kredis *cachev1alph
 	if err := cm.List(ctx, podList, client.InNamespace(kredis.Namespace), labelSelector); err != nil {
 		return nil, err
 	}
-	pods := podList.Items
+
+	// Filter out terminating pods (DeletionTimestamp != nil)
+	// This prevents race conditions during scale-down where deleted pods
+	// are still visible but should not be considered for cluster operations
+	var pods []corev1.Pod
+	for _, pod := range podList.Items {
+		if pod.DeletionTimestamp == nil {
+			pods = append(pods, pod)
+		}
+	}
 
 	// Sort pods for correct master-slave pairing:
 	// Order: 0-0, 1-0, 2-0, 0-1, 1-1, 2-1 (masters first, then replicas in same master order)
@@ -668,9 +724,22 @@ func (cm *ClusterManager) getActualMasterCount(ctx context.Context, pods []corev
 }
 
 func (cm *ClusterManager) checkAllMastersHaveSlots(ctx context.Context, commandPod corev1.Pod, port int32) (bool, error) {
+	masterCount, mastersWithSlots, err := cm.countMastersWithSlots(ctx, commandPod, port)
+	if err != nil {
+		return false, err
+	}
+	if masterCount == 0 {
+		return false, nil
+	}
+	return masterCount == mastersWithSlots, nil
+}
+
+// countMastersWithSlots returns (totalMasters, mastersWithSlots, error)
+// This is useful for determining if rebalance is needed based on expected master count
+func (cm *ClusterManager) countMastersWithSlots(ctx context.Context, commandPod corev1.Pod, port int32) (int, int, error) {
 	result, err := cm.PodExecutor.ExecuteRedisCommand(ctx, commandPod, port, "cluster", "nodes")
 	if err != nil {
-		return false, fmt.Errorf("failed to get cluster nodes for slot check: %w", err)
+		return 0, 0, fmt.Errorf("failed to get cluster nodes for slot check: %w", err)
 	}
 	lines := strings.Split(result.Stdout, "\n")
 	masterCount := 0
@@ -688,10 +757,7 @@ func (cm *ClusterManager) checkAllMastersHaveSlots(ctx context.Context, commandP
 			}
 		}
 	}
-	if masterCount == 0 {
-		return false, nil
-	}
-	return masterCount == mastersWithSlots, nil
+	return masterCount, mastersWithSlots, nil
 }
 
 // filterNewPods returns pods that are NOT yet part of the Redis cluster.

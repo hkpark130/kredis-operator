@@ -97,7 +97,7 @@ data:
           "pluginVersion": "10.0.0",
           "targets": [
             {
-              "expr": "redis_connected_clients",
+              "expr": "redis_connected_clients{job=\"kubernetes-pods\"}",
               "legendFormat": "{{pod_name}}",
               "refId": "A"
             }
@@ -141,7 +141,7 @@ data:
           "pluginVersion": "10.0.0",
           "targets": [
             {
-              "expr": "redis_memory_used_bytes",
+              "expr": "redis_memory_used_bytes{job=\"kubernetes-pods\"}",
               "legendFormat": "{{pod_name}}",
               "refId": "A"
             }
@@ -193,7 +193,7 @@ data:
           },
           "targets": [
             {
-              "expr": "rate(redis_commands_processed_total[1m])",
+              "expr": "rate(redis_commands_processed_total{job=\"kubernetes-pods\"}[1m])",
               "legendFormat": "{{pod_name}}",
               "refId": "A"
             }
@@ -245,7 +245,7 @@ data:
           },
           "targets": [
             {
-              "expr": "redis_memory_used_bytes",
+              "expr": "redis_memory_used_bytes{job=\"kubernetes-pods\"}",
               "legendFormat": "{{pod_name}}",
               "refId": "A"
             }
@@ -291,7 +291,7 @@ data:
           "pluginVersion": "10.0.0",
           "targets": [
             {
-              "expr": "redis_up",
+              "expr": "redis_up{job=\"kubernetes-pods\"}",
               "legendFormat": "{{pod_name}}",
               "refId": "A"
             }
@@ -332,7 +332,7 @@ data:
           },
           "targets": [
             {
-              "expr": "redis_db_keys",
+              "expr": "redis_db_keys{job=\"kubernetes-pods\"}",
               "legendFormat": "{{pod_name}} - {{db}}",
               "refId": "A"
             }
@@ -347,23 +347,35 @@ data:
           },
           "fieldConfig": {
             "defaults": {
-              "color": { "mode": "palette-classic" },
+              "color": { "mode": "thresholds" },
               "mappings": [],
               "thresholds": {
                 "mode": "absolute",
-                "steps": [{ "color": "green", "value": null }]
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 16384 }
+                ]
               },
               "unit": "short"
             },
-            "overrides": []
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "Fail Slots" },
+                "properties": [{ "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }]
+              },
+              {
+                "matcher": { "id": "byName", "options": "PFail Slots" },
+                "properties": [{ "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }] } }]
+              }
+            ]
           },
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
           "id": 7,
           "options": {
             "colorMode": "value",
-            "graphMode": "area",
+            "graphMode": "none",
             "justifyMode": "auto",
-            "orientation": "auto",
+            "orientation": "horizontal",
             "reduceOptions": {
               "calcs": ["lastNotNull"],
               "fields": "",
@@ -373,17 +385,32 @@ data:
           },
           "targets": [
             {
-              "expr": "redis_cluster_slots_assigned",
+              "expr": "max(redis_cluster_slots_assigned{job=\"kubernetes-pods\"})",
               "legendFormat": "Assigned Slots",
               "refId": "A"
             },
             {
-              "expr": "redis_cluster_slots_ok",
+              "expr": "max(redis_cluster_slots_ok{job=\"kubernetes-pods\"})",
               "legendFormat": "OK Slots",
               "refId": "B"
+            },
+            {
+              "expr": "max(redis_cluster_slots_fail{job=\"kubernetes-pods\"})",
+              "legendFormat": "Fail Slots",
+              "refId": "C"
+            },
+            {
+              "expr": "max(redis_cluster_slots_pfail{job=\"kubernetes-pods\"})",
+              "legendFormat": "PFail Slots",
+              "refId": "D"
+            },
+            {
+              "expr": "count(redis_up{job=\"kubernetes-pods\"} == 1 and on(pod_name) redis_cluster_role{job=\"kubernetes-pods\"} == 1)",
+              "legendFormat": "Master Nodes",
+              "refId": "E"
             }
           ],
-          "title": "Cluster Slots",
+          "title": "Cluster Slots Status",
           "type": "stat"
         }
       ],

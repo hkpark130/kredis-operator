@@ -152,6 +152,34 @@ func (r *KredisReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}
 
+	// #region agent log
+	{
+		// Autoscaling gate visibility: helps debug why autoscaling doesn't trigger under load.
+		// We log only when autoscaling is enabled to keep volume reasonable.
+		if kredis.Spec.Autoscaling.Enabled {
+			logger.Info("agent_debug",
+				"sessionId", "debug-session",
+				"runId", "run1",
+				"hypothesisId", "A1",
+				"location", "controllers/kredis_controller.go:Reconcile",
+				"message", "autoscaling gate check",
+				"data", map[string]interface{}{
+					"clusterReady":       clusterReady,
+					"autoscalerNil":      r.Autoscaler == nil,
+					"statusClusterState": kredis.Status.ClusterState,
+					"statusLastOp":       kredis.Status.LastClusterOperation,
+					"lastScaleType":      kredis.Status.LastScaleType,
+					"readyReplicas":      kredis.Status.ReadyReplicas,
+					"replicas":           kredis.Status.Replicas,
+					"specMasters":        kredis.Spec.Masters,
+					"specReplicas":       kredis.Spec.Replicas,
+				},
+				"timestamp", time.Now().UnixMilli(),
+			)
+		}
+	}
+	// #endregion
+
 	// 4. Evaluate autoscaling if cluster is stable
 	if clusterReady && r.Autoscaler != nil && kredis.Spec.Autoscaling.Enabled {
 		pods, err := r.getKredisPods(ctx, kredis)
@@ -598,7 +626,18 @@ func (r *KredisReconciler) getKredisPods(ctx context.Context, kredis *cachev1alp
 	if err := r.List(ctx, podList, listOpts...); err != nil {
 		return nil, err
 	}
-	return podList.Items, nil
+
+	// Filter out terminating pods (DeletionTimestamp != nil)
+	// This prevents race conditions during scale-down where deleted pods
+	// are still visible but should not be considered for pod reconciliation
+	var activePods []corev1.Pod
+	for _, pod := range podList.Items {
+		if pod.DeletionTimestamp == nil {
+			activePods = append(activePods, pod)
+		}
+	}
+
+	return activePods, nil
 }
 
 // cleanupKredisResources cleans up all resources associated with a Kredis instance

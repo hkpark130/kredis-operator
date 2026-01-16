@@ -113,7 +113,7 @@ func main() {
 	}
 
 	// Create autoscaler
-	autoscaler := cluster.NewAutoscaler(mgr.GetClient(), metricsClientset)
+	autoscaler := cluster.NewAutoscaler(mgr.GetClient(), metricsClientset, podExecutor)
 
 	if err = (&controllers.KredisReconciler{
 		Client:         mgr.GetClient(),
